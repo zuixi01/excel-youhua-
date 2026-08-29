@@ -21,6 +21,17 @@ from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.workbook import inspect_workbook
 
 
+def _python_cpu_calibration_seconds() -> float:
+    """Measure the current runner's single-process Python throughput."""
+    value = 0
+    started = time.process_time()
+    for index in range(10_000_000):
+        value = (value * 1_664_525 + index + 1_013_904_223) & 0xFFFFFFFF
+    elapsed = time.process_time() - started
+    assert value == 4_094_895_424 and elapsed > 0
+    return elapsed
+
+
 @pytest.mark.performance
 def test_configured_workbook_baseline(tmp_path):
     if os.environ.get("RUN_PERFORMANCE") != "1":
@@ -171,6 +182,7 @@ def test_maximum_standard_comparison_baseline(tmp_path):
     for index in range(record_count):
         standard.append({"id": f"R{index:06d}"})
 
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
     process = psutil.Process()
     baseline_rss = process.memory_info().rss
     peak_rss = [baseline_rss]
@@ -215,8 +227,9 @@ def test_maximum_standard_comparison_baseline(tmp_path):
         write_differences_jsonl(report.differences, jsonl_path)
         elapsed = time.perf_counter() - started
         cpu_finished = process.cpu_times()
+        cpu_seconds = (cpu_finished.user + cpu_finished.system) - (cpu_started.user + cpu_started.system)
         metrics = {
-            "benchmark_version": 3,
+            "benchmark_version": 4,
             "standard_records": record_count,
             "excel_rows": excel_rows,
             "matched_records": result.summary.matched_records,
@@ -229,7 +242,9 @@ def test_maximum_standard_comparison_baseline(tmp_path):
             "compare_seconds": round(compared - inspected, 3),
             "report_seconds": round(elapsed - (compared - started), 3),
             "render_seconds": 0,
-            "cpu_seconds": round((cpu_finished.user + cpu_finished.system) - (cpu_started.user + cpu_started.system), 3),
+            "cpu_calibration_seconds": round(cpu_calibration_seconds, 6),
+            "cpu_seconds": round(cpu_seconds, 3),
+            "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3),
             "elapsed_seconds": round(elapsed, 3),
             "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2),
             "report_bytes": report_path.stat().st_size,
@@ -243,8 +258,7 @@ def test_maximum_standard_comparison_baseline(tmp_path):
         assert result.summary.differences == record_count - excel_rows
         expected_join = "polars_partitioned" if record_count + excel_rows >= int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000")) else "python_in_memory"
         assert result.join_backends == [expected_join]
-        expected_record_storage = "disk_standard_records" if expected_join == "polars_partitioned" else "memory_standard_records"
-        assert result.report_only and result.storage_backends == ["disk_differences", expected_record_storage]
+        assert result.report_only and result.storage_backends == ["disk_differences", "disk_standard_records"]
         with jsonl_path.open("r", encoding="utf-8") as handle:
             assert sum(1 for _line in handle) == result.summary.differences
         assert elapsed <= float(os.environ.get("PERF_LARGE_STANDARD_MAX_SECONDS", "900"))
@@ -319,6 +333,7 @@ def test_maximum_managed_service_pipeline_baseline(tmp_path):
         def render(self, source, destination, workbook, rules, comparison, report_payload):
             raise AssertionError("maximum managed pipeline must switch to report-only mode")
 
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
     process = psutil.Process()
     baseline_rss = process.memory_info().rss
     peak_rss = [baseline_rss]
@@ -344,8 +359,9 @@ def test_maximum_managed_service_pipeline_baseline(tmp_path):
         html_path = service.artifact(job_id, "html")
         with jsonl_path.open("r", encoding="utf-8") as handle:
             jsonl_lines = sum(1 for _line in handle)
+        cpu_seconds = time.process_time() - cpu_started
         metrics = {
-            "benchmark_version": 3,
+            "benchmark_version": 4,
             "standard_records": record_count,
             "excel_rows": excel_rows,
             "page_size": page_size,
@@ -354,7 +370,9 @@ def test_maximum_managed_service_pipeline_baseline(tmp_path):
             "missing_records": status["summary"]["missing_records"],
             "differences": status["summary"]["differences"],
             "mode": status.get("mode"),
-            "cpu_seconds": round(time.process_time() - cpu_started, 3),
+            "cpu_calibration_seconds": round(cpu_calibration_seconds, 6),
+            "cpu_seconds": round(cpu_seconds, 3),
+            "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3),
             "elapsed_seconds": round(elapsed, 3),
             "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2),
             "report_bytes": report_path.stat().st_size,

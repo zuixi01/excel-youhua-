@@ -233,10 +233,10 @@ jobs:
           REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-maximum-standard --dir performance-reference
-          if jq -e '.benchmark_version == 3' performance-reference/performance-maximum-standard.json >/dev/null; then
+          if jq -e '.benchmark_version == 4 and has("normalized_cpu_units")' performance-reference/performance-maximum-standard.json >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 3 maximum-standard reference." >&2
+            echo "A release requires a benchmark-version 4 normalized maximum-standard reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -257,7 +257,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-maximum-standard.json
           --reference performance-reference/performance-maximum-standard.json
-          --time-metric cpu_seconds
+          --time-metric normalized_cpu_units
           --max-time-ratio 0.25
           --time-slack-seconds 10
           --max-memory-ratio 0.25
@@ -308,10 +308,10 @@ jobs:
           REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-maximum-managed-service --dir performance-reference
-          if jq -e '.benchmark_version == 3' performance-reference/performance-maximum-managed-service.json >/dev/null; then
+          if jq -e '.benchmark_version == 4 and has("normalized_cpu_units")' performance-reference/performance-maximum-managed-service.json >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 3 maximum managed-service reference." >&2
+            echo "A release requires a benchmark-version 4 normalized maximum managed-service reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -332,7 +332,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-maximum-managed-service.json
           --reference performance-reference/performance-maximum-managed-service.json
-          --time-metric cpu_seconds
+          --time-metric normalized_cpu_units
           --max-time-ratio 0.25
           --time-slack-seconds 15
           --max-memory-ratio 0.25
