@@ -352,6 +352,27 @@ def test_standard_validation_is_chunked_and_checks_uniqueness_across_chunks():
         rows.close()
 
 
+@pytest.mark.parametrize("equivalent_values", [("1.0", "1.00"), ("0", "-0")])
+def test_standard_decimal_uniqueness_uses_normalized_numeric_equality(equivalent_values):
+    rules = RuleSet.model_validate({
+        "schema_id": "decimal-unique", "schema_version": "1.0.0", "name": "Decimal unique",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "decimal", "validation": {"unique": True}},
+            ],
+        }],
+    })
+    rows = [
+        {"id": "E1", "amount": equivalent_values[0]},
+        {"id": "E2", "amount": equivalent_values[1]},
+    ]
+
+    with pytest.raises(ValueError, match=r"data\.amount is not unique at record 2"):
+        StandardDataValidator(chunk_size=1).validate({"data": rows}, rules)
+
+
 def test_field_statistics_use_per_sheet_and_per_issue_denominators(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "field-statistics", "schema_version": "1.0.0", "name": "Field statistics",

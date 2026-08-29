@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import json
 from decimal import Decimal
 from typing import Any, Sequence
 
@@ -175,23 +174,17 @@ class StandardDataValidator:
         for rule in sheet.columns:
             if not rule.validation.unique:
                 continue
-            observed: set[str] = set()
+            observed: set[Any] = set()
             for row_index, row in enumerate(rows, start=1):
                 if StandardDataValidator._skip_empty_primary_key_row(row, sheet):
                     continue
                 parsed = parse_value(row.get(rule.name), rule)
                 if parsed.normalized is None:
                     continue
-                token = json.dumps(
-                    {"type": rule.type.value, "value": parsed.normalized},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                )
-                if token in observed:
+                normalized = parsed.normalized
+                if normalized in observed:
                     raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id}.{rule.name} is not unique at record {row_index}")
-                observed.add(token)
+                observed.add(normalized)
 
     @staticmethod
     def _skip_empty_primary_key_row(row: dict[str, Any], sheet: SheetRule) -> bool:
