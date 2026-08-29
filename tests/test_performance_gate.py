@@ -5,7 +5,7 @@ from excel_auditor.performance_gate import MetricLimit, PerformanceGateError, co
 
 def _workbook(elapsed=10.0, memory=100.0, **overrides):
     payload = {
-        "benchmark_version": 2,
+        "benchmark_version": 3,
         "rows": 10_000,
         "columns": 50,
         "sheets": 1,
@@ -45,6 +45,6 @@ def test_performance_gate_refuses_mismatched_or_invalid_reference():
     with pytest.raises(PerformanceGateError, match="scenarios do not match"):
         compare_performance(_workbook(rows=20_000), _workbook(), [MetricLimit("elapsed_seconds", 0.25, 5.0)])
     with pytest.raises(PerformanceGateError, match="benchmark_version"):
-        compare_performance(_workbook(benchmark_version=2), _workbook(benchmark_version=1), [MetricLimit("elapsed_seconds", 0.25, 5.0)])
+        compare_performance(_workbook(benchmark_version=3), _workbook(benchmark_version=2), [MetricLimit("elapsed_seconds", 0.25, 5.0)])
     with pytest.raises(PerformanceGateError, match="must be positive"):
         compare_performance(_workbook(), _workbook(elapsed=0), [MetricLimit("elapsed_seconds", 0.25, 5.0)])

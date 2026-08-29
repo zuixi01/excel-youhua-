@@ -87,10 +87,10 @@ jobs:
           RESULT: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}.json
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir performance-reference
-          if jq -e '.benchmark_version == 2' "performance-reference/$RESULT" >/dev/null; then
+          if jq -e '.benchmark_version == 3' "performance-reference/$RESULT" >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 2 performance reference." >&2
+            echo "A release requires a benchmark-version 3 performance reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -115,6 +115,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current "$RESULT"
           --reference "performance-reference/$RESULT"
+          --time-metric cpu_seconds
           --max-time-ratio 0.25
           --time-slack-seconds 5
           --max-memory-ratio 0.25
@@ -160,10 +161,10 @@ jobs:
           REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-http-pagination --dir performance-reference
-          if jq -e '.benchmark_version == 2' performance-reference/performance-http-pagination.json >/dev/null; then
+          if jq -e '.benchmark_version == 3' performance-reference/performance-http-pagination.json >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 2 pagination reference." >&2
+            echo "A release requires a benchmark-version 3 pagination reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -183,6 +184,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-http-pagination.json
           --reference performance-reference/performance-http-pagination.json
+          --time-metric cpu_seconds
           --max-time-ratio 0.50
           --time-slack-seconds 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -231,10 +233,10 @@ jobs:
           REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-maximum-standard --dir performance-reference
-          if jq -e '.benchmark_version == 2' performance-reference/performance-maximum-standard.json >/dev/null; then
+          if jq -e '.benchmark_version == 3' performance-reference/performance-maximum-standard.json >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 2 maximum-standard reference." >&2
+            echo "A release requires a benchmark-version 3 maximum-standard reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -255,6 +257,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-maximum-standard.json
           --reference performance-reference/performance-maximum-standard.json
+          --time-metric cpu_seconds
           --max-time-ratio 0.25
           --time-slack-seconds 10
           --max-memory-ratio 0.25

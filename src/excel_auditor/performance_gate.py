@@ -83,12 +83,13 @@ def main() -> int:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--max-time-ratio", type=float, default=0.25)
     parser.add_argument("--time-slack-seconds", type=float, default=5.0)
+    parser.add_argument("--time-metric", choices=("elapsed_seconds", "cpu_seconds"), default="elapsed_seconds")
     parser.add_argument("--max-memory-ratio", type=float)
     parser.add_argument("--memory-slack-mib", type=float, default=64.0)
     args = parser.parse_args()
     if args.max_time_ratio < 0 or args.time_slack_seconds < 0:
         parser.error("time ratio and slack must be non-negative")
-    limits = [MetricLimit("elapsed_seconds", args.max_time_ratio, args.time_slack_seconds)]
+    limits = [MetricLimit(args.time_metric, args.max_time_ratio, args.time_slack_seconds)]
     if args.max_memory_ratio is not None:
         if args.max_memory_ratio < 0 or args.memory_slack_mib < 0:
             parser.error("memory ratio and slack must be non-negative")
