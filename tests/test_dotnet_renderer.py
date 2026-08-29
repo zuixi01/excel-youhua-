@@ -744,6 +744,7 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     sheet["A3"]._hyperlink = Hyperlink(ref="A3", location="'结构'!B2", display="jump")
     book.defined_names.add(DefinedName("DataRange", attr_text="'结构'!$A$1:$C$3"))
     book.defined_names.add(DefinedName("LocalRange", attr_text="$A$1:$C$3", localSheetId=0))
+    book.defined_names.add(DefinedName("ZZZ9999999", attr_text="'结构'!$A$2"))
     other = book.create_sheet("汇总")
     other["A1"] = "=结构!B2+'结构'!C2"
     other["A2"] = "=B1"
@@ -752,6 +753,7 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     cross_validation.add("A1")
     other.add_data_validation(cross_validation)
     sheet["G2"] = "=汇总!B1+结构!B2"
+    sheet["G3"] = "=log10(b3)+ZZZ9999999"
     book.save(source)
     manifest_path.write_text(json.dumps({
         "manifest_version": "1.0", "job_id": "job_ranges", "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -779,6 +781,7 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     assert result_sheet["F2"].value == '=IF(C2="B1",D2,0)'
     assert result_sheet["F3"].value == '=IF(C3="C2",D3,0)'
     assert result_sheet["H2"].value == "=汇总!B1+结构!C2"
+    assert result_sheet["H3"].value == "=log10(C3)+ZZZ9999999"
     assert rendered["汇总"]["A1"].value == "=结构!C2+'结构'!D2"
     assert rendered["汇总"]["A2"].value == "=B1"
     cross_sheet = rendered["汇总"]
@@ -852,6 +855,31 @@ def test_dotnet_renderer_rejects_unsafe_complex_formula_insertions(tmp_path):
     failure = json.loads(completed.stderr)
     assert failure["error_code"] == "UNSUPPORTED_FEATURE"
     assert "complex" in failure["message"]
+    assert not output.exists()
+
+
+def test_dotnet_renderer_rejects_formula_reference_shift_beyond_xfd(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "xfd-formula.xlsx", tmp_path / "xfd-formula-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Formula"])
+    sheet["A2"] = "=XFD1"
+    book.save(source)
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0", "job_id": "job_xfd_formula", "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{"type": "insert_column", "sheet": "Data", "before": "A", "canonical_field": "id", "header_row": 1, "header_value": "ID", "fill_color": "D9EAD3"}],
+    }), encoding="utf-8")
+
+    completed = subprocess.run([command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)], capture_output=True, text=True, check=False)
+
+    assert completed.returncode != 0
+    failure = json.loads(completed.stderr)
+    assert failure["error_code"] == "UNSUPPORTED_FEATURE"
+    assert "beyond XFD" in failure["message"]
     assert not output.exists()
 
 

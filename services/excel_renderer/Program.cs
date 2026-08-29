@@ -687,9 +687,10 @@ static string ExpandTableRangeForInsertedColumn(string reference, int target)
 
 static string ShiftFormulaForInsertedColumn(string formula, string currentSheetName, string targetSheetName, int target)
 {
-    const string pattern = @"(?<![A-Z0-9_\]\[])(?:(?<sheet>'(?:[^']|'')+'|[^'""\s!+\-*/^&=(),;:{}\[\]]+)!)?(?<reference>\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)(?![A-Z0-9_])";
+    const string pattern = @"(?i)(?<![A-Z0-9_\]\[])(?:(?<sheet>'(?:[^']|'')+'|[^'""\s!+\-*/^&=(),;:{}\[\]]+)!)?(?<reference>\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)(?![A-Z0-9_]|\s*\()";
     return ReplaceOutsideStringLiterals(formula, pattern, match =>
     {
+        if (!IsValidFormulaReference(match.Groups["reference"].Value)) return match.Value;
         var qualifier = match.Groups["sheet"];
         if (!qualifier.Success)
             return String.Equals(currentSheetName, targetSheetName, StringComparison.OrdinalIgnoreCase)
@@ -708,9 +709,20 @@ static string ShiftQualifiedFormula(string formula, string sheetName, int target
 {
     var quoted = "'" + sheetName.Replace("'", "''") + "'!";
     var plain = sheetName + "!";
-    var pattern = $@"(?<sheet>{Regex.Escape(quoted)}|{Regex.Escape(plain)})(?<reference>\$?[A-Z]{{1,3}}\$?\d+(?::\$?[A-Z]{{1,3}}\$?\d+)?)";
-    return ReplaceOutsideStringLiterals(formula, pattern, match => match.Groups["sheet"].Value + ShiftRange(match.Groups["reference"].Value, target));
+    var pattern = $@"(?i)(?<sheet>{Regex.Escape(quoted)}|{Regex.Escape(plain)})(?<reference>\$?[A-Z]{{1,3}}\$?\d+(?::\$?[A-Z]{{1,3}}\$?\d+)?)(?![A-Z0-9_]|\s*\()";
+    return ReplaceOutsideStringLiterals(formula, pattern, match => IsValidFormulaReference(match.Groups["reference"].Value)
+        ? match.Groups["sheet"].Value + ShiftRange(match.Groups["reference"].Value, target)
+        : match.Value);
 }
+
+static bool IsValidFormulaReference(string reference) => reference.Split(':', 2).All(item =>
+{
+    var match = Regex.Match(item.Replace("$", "", StringComparison.Ordinal), @"^(?<column>[A-Z]{1,3})(?<row>[1-9][0-9]*)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    return match.Success
+        && ColumnNumber(match.Groups["column"].Value) <= 16384
+        && UInt32.TryParse(match.Groups["row"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var row)
+        && row <= 1048576u;
+});
 
 static string ReplaceOutsideStringLiterals(string formula, string pattern, MatchEvaluator evaluator)
 {
@@ -720,7 +732,7 @@ static string ReplaceOutsideStringLiterals(string formula, string pattern, Match
     while (index < formula.Length)
     {
         if (formula[index] != '"') { index++; continue; }
-        output.Append(Regex.Replace(formula[chunkStart..index], pattern, evaluator));
+        output.Append(Regex.Replace(formula[chunkStart..index], pattern, evaluator, RegexOptions.CultureInvariant));
         var literalStart = index++;
         while (index < formula.Length)
         {
@@ -732,7 +744,7 @@ static string ReplaceOutsideStringLiterals(string formula, string pattern, Match
         output.Append(formula[literalStart..index]);
         chunkStart = index;
     }
-    output.Append(Regex.Replace(formula[chunkStart..], pattern, evaluator));
+    output.Append(Regex.Replace(formula[chunkStart..], pattern, evaluator, RegexOptions.CultureInvariant));
     return output.ToString();
 }
 
@@ -750,10 +762,12 @@ static string ShiftRange(string reference, int target)
 
 static string ShiftCellReference(string reference, int target, bool force = false)
 {
-    var match = Regex.Match(reference, @"^(?<absolute>\$?)(?<column>[A-Z]{1,3})(?<row>\$?\d+)?$");
+    var match = Regex.Match(reference, @"^(?<absolute>\$?)(?<column>[A-Z]{1,3})(?<row>\$?\d+)?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     if (!match.Success) return reference;
     var column = ColumnNumber(match.Groups["column"].Value);
     if (!force && column < target) return reference;
+    if (column >= 16384)
+        throw new InvalidDataException("UNSUPPORTED_FEATURE: column insertion would shift a cell reference beyond XFD");
     return match.Groups["absolute"].Value + ColumnName(column + 1) + match.Groups["row"].Value;
 }
 
