@@ -67,3 +67,18 @@ def test_cli_accepts_normalized_cpu_metric(tmp_path, monkeypatch):
         "--time-metric", "normalized_cpu_units",
     ])
     assert main() == 0
+
+
+def test_performance_gate_checks_uploaded_standard_identity():
+    current = {
+        "benchmark_version": 4,
+        "source_format": "json_upload",
+        "standard_records": 500_000,
+        "normalized_cpu_units": 10.0,
+    }
+    with pytest.raises(PerformanceGateError, match="source_format"):
+        compare_performance(
+            current,
+            {**current, "source_format": "csv_upload"},
+            [MetricLimit("normalized_cpu_units", 0.25, 5.0)],
+        )

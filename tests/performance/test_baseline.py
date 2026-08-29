@@ -16,7 +16,9 @@ from excel_auditor.reporting import write_differences_jsonl, write_json_report
 from excel_auditor.models import StandardSourceConfig
 from excel_auditor.rendering import ExcelRenderer
 from excel_auditor.service import AuditService
-from excel_auditor.snapshots import SpilledRecords
+from excel_auditor.pandera_adapter import StandardDataValidator
+from excel_auditor.snapshots import SpilledRecords, create_snapshot
+from excel_auditor.standard_files import load_standard_file
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.workbook import inspect_workbook
 
@@ -400,3 +402,90 @@ def test_maximum_managed_service_pipeline_baseline(tmp_path):
     finally:
         stopped.set()
         sampler.join()
+
+
+@pytest.mark.performance
+def test_maximum_uploaded_json_pipeline_baseline(tmp_path):
+    if os.environ.get("PERF_RUN_LARGE_UPLOAD") != "1":
+        pytest.skip("set PERF_RUN_LARGE_UPLOAD=1 to execute the maximum uploaded JSON pipeline")
+    record_count = int(os.environ.get("PERF_UPLOAD_STANDARD_RECORDS", "500000"))
+    spill_after = int(os.environ.get("PERF_UPLOAD_SPILL_AFTER_RECORDS", "100000"))
+    rules = RuleSet.model_validate({
+        "schema_id": "maximum-uploaded-standard",
+        "schema_version": "1.0.0",
+        "name": "Maximum uploaded standard",
+        "workbook": {"max_standard_records": record_count},
+        "sheets": [{
+            "id": "data",
+            "name": "Data",
+            "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    upload_path = tmp_path / "maximum-upload.json"
+    with upload_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write('{"data":[')
+        for index in range(record_count):
+            if index:
+                handle.write(",")
+            handle.write(f'{{"id":"R{index:06d}"}}')
+        handle.write("]}")
+
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
+    process = psutil.Process()
+    baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stopped = threading.Event()
+
+    def sample_memory():
+        while not stopped.wait(0.02):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
+    started = time.perf_counter()
+    cpu_started = time.process_time()
+    standard = None
+    try:
+        standard = load_standard_file(upload_path, rules, spill_after_records=spill_after)
+        loaded = time.perf_counter()
+        StandardDataValidator().validate(standard, rules)
+        validated = time.perf_counter()
+        snapshot = create_snapshot(standard, tmp_path / "snapshot", {"upload_format": "json"})
+        elapsed = time.perf_counter() - started
+        cpu_seconds = time.process_time() - cpu_started
+        rows = standard["data"]
+        metrics = {
+            "benchmark_version": 4,
+            "source_format": "json_upload",
+            "standard_records": record_count,
+            "record_storage": "disk_spill" if isinstance(rows, SpilledRecords) else "memory",
+            "load_seconds": round(loaded - started, 3),
+            "validate_seconds": round(validated - loaded, 3),
+            "snapshot_seconds": round(elapsed - (validated - started), 3),
+            "cpu_calibration_seconds": round(cpu_calibration_seconds, 6),
+            "cpu_seconds": round(cpu_seconds, 3),
+            "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3),
+            "elapsed_seconds": round(elapsed, 3),
+            "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2),
+            "upload_bytes": upload_path.stat().st_size,
+            "snapshot_bytes": snapshot.path.stat().st_size,
+            "snapshot_records": snapshot.record_count,
+            "snapshot_sha256": snapshot.sha256,
+        }
+        print(metrics)
+        if output := os.environ.get("PERF_UPLOAD_RESULT_PATH"):
+            Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        assert isinstance(rows, SpilledRecords) and len(rows) == record_count
+        assert rows[0]["id"] == "R000000" and rows[-1]["id"] == f"R{record_count - 1:06d}"
+        assert snapshot.record_count == record_count and len(snapshot.sha256) == 64
+        assert elapsed <= float(os.environ.get("PERF_UPLOAD_MAX_SECONDS", "300"))
+        assert metrics["peak_rss_delta_mib"] <= float(os.environ.get("PERF_UPLOAD_MAX_RSS_MIB", "1024"))
+    finally:
+        stopped.set()
+        sampler.join()
+        if standard is not None:
+            for rows in standard.values():
+                close = getattr(rows, "close", None)
+                if close is not None:
+                    close()

@@ -58,6 +58,33 @@ if require_auth and not token_registry:
     raise RuntimeError("production authentication is required but no API token is configured")
 
 
+async def _stage_standard_upload(upload: UploadFile, size_limit: int) -> tuple[Path, int]:
+    incoming = DATA_ROOT / "incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(prefix="standard-", suffix=".upload", dir=incoming)
+    path = Path(raw_path)
+    total = 0
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            while chunk := await upload.read(1024 * 1024):
+                total += len(chunk)
+                if total > size_limit:
+                    raise HTTPException(413, "STANDARD_DATA_INVALID: payload too large")
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return path, total
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _update_hash_from_file(digest: hashlib._Hash, path: Path) -> None:
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+
+
 @app.middleware("http")
 async def bearer_auth(request: Request, call_next):
     trace_id = request.headers.get("x-request-id") or uuid.uuid4().hex
@@ -330,17 +357,16 @@ async def create_comparison(
     if excel_suffix not in {".xlsx", ".xlsm"}:
         raise HTTPException(415, "FILE_UNSUPPORTED_FORMAT")
     standard_content: bytes | None = None
+    staged_standard_path: Path | None = None
     standard_suffix: str | None = None
     if standard_data is not None and standard_json is not None:
         raise HTTPException(422, "standard_data and standard_json are mutually exclusive")
     if standard_data is not None:
         standard_limit = rules.workbook.max_standard_upload_mib * 1024 * 1024
-        standard_content = await standard_data.read(standard_limit + 1)
-        if len(standard_content) > standard_limit:
-            raise HTTPException(413, "STANDARD_DATA_INVALID: payload too large")
         standard_suffix = Path(standard_data.filename or "standard.json").suffix.lower()
         if standard_suffix not in {".json", ".csv"}:
             raise HTTPException(415, "STANDARD_DATA_INVALID: only JSON and CSV uploads are supported")
+        staged_standard_path, _ = await _stage_standard_upload(standard_data, standard_limit)
     elif standard_json is not None:
         encoded = standard_json.encode("utf-8")
         if len(encoded) > rules.workbook.max_standard_upload_mib * 1024 * 1024:
@@ -355,39 +381,49 @@ async def create_comparison(
         standard_suffix = ".json"
     elif rules.standard_source.type != "managed_http":
         raise HTTPException(422, "standard_data is required for upload-based rules")
-    fingerprint = hashlib.sha256()
-    fingerprint.update(rules.content_sha256.encode("ascii"))
-    fingerprint.update(json.dumps(parsed_parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    fingerprint.update(excel_suffix.encode("ascii"))
-    fingerprint.update(excel_content)
-    if standard_content is not None:
-        fingerprint.update((standard_suffix or "").encode("ascii"))
-        fingerprint.update(standard_content)
     try:
+        fingerprint = hashlib.sha256()
+        fingerprint.update(rules.content_sha256.encode("ascii"))
+        fingerprint.update(json.dumps(parsed_parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        fingerprint.update(excel_suffix.encode("ascii"))
+        fingerprint.update(excel_content)
+        if staged_standard_path is not None:
+            fingerprint.update((standard_suffix or "").encode("ascii"))
+            _update_hash_from_file(fingerprint, staged_standard_path)
+        elif standard_content is not None:
+            fingerprint.update((standard_suffix or "").encode("ascii"))
+            fingerprint.update(standard_content)
         job_id, replayed = service.create_or_get_job(idempotency_key, fingerprint.hexdigest(), request.state.tenant_id, request.state.user_id, request.state.trace_id)
+        if replayed:
+            current = service.status(job_id)
+            return JSONResponse(status_code=200, content={"job_id": job_id, "status": current["status"], "schema_id": schema_id, "schema_version": schema_version, "created_at": current["created_at"], "idempotent_replay": True})
+        directory = service.job_directory(job_id)
+        service.record_input_metadata(job_id, excel_file.filename or f"upload{excel_suffix}", len(excel_content))
+        excel_path = directory / f"upload{excel_suffix}"
+        standard_path = None
+        if standard_suffix is not None:
+            standard_path = directory / f"standard{standard_suffix}"
+            if staged_standard_path is not None:
+                staged_standard_path.replace(standard_path)
+                staged_standard_path = None
+            elif standard_content is not None:
+                standard_path.write_bytes(standard_content)
+        excel_path.write_bytes(excel_content)
+        if task_queue:
+            try:
+                task_queue.enqueue(DATA_ROOT, job_id, excel_path, standard_path, rules, parsed_parameters)
+            except Exception as exc:
+                raise HTTPException(503, "task queue is unavailable") from exc
+        else:
+            background_tasks.add_task(service.run, job_id, excel_path, standard_path, rules, parsed_parameters)
+        return {"job_id": job_id, "status": "queued", "schema_id": schema_id, "schema_version": schema_version, "created_at": service.status(job_id)["created_at"]}
     except FileExistsError as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(429 if "TENANT_QUOTA_EXCEEDED" in str(exc) else 422, str(exc)) from exc
-    if replayed:
-        current = service.status(job_id)
-        return JSONResponse(status_code=200, content={"job_id": job_id, "status": current["status"], "schema_id": schema_id, "schema_version": schema_version, "created_at": current["created_at"], "idempotent_replay": True})
-    directory = service.job_directory(job_id)
-    service.record_input_metadata(job_id, excel_file.filename or f"upload{excel_suffix}", len(excel_content))
-    excel_path = directory / f"upload{excel_suffix}"
-    standard_path = None
-    if standard_content is not None and standard_suffix is not None:
-        standard_path = directory / f"standard{standard_suffix}"
-        standard_path.write_bytes(standard_content)
-    excel_path.write_bytes(excel_content)
-    if task_queue:
-        try:
-            task_queue.enqueue(DATA_ROOT, job_id, excel_path, standard_path, rules, parsed_parameters)
-        except Exception as exc:
-            raise HTTPException(503, "task queue is unavailable") from exc
-    else:
-        background_tasks.add_task(service.run, job_id, excel_path, standard_path, rules, parsed_parameters)
-    return {"job_id": job_id, "status": "queued", "schema_id": schema_id, "schema_version": schema_version, "created_at": service.status(job_id)["created_at"]}
+    finally:
+        if staged_standard_path is not None:
+            staged_standard_path.unlink(missing_ok=True)
 
 
 @app.post("/api/v1/comparisons/{job_id}/cancel", status_code=202)

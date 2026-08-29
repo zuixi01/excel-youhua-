@@ -1,9 +1,13 @@
+import asyncio
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
+import pytest
 
 
 def test_publish_create_and_download_api(tmp_path, monkeypatch):
@@ -64,6 +68,7 @@ def test_publish_create_and_download_api(tmp_path, monkeypatch):
         },
     )
     assert conflict.status_code == 409
+    assert not list((api_module.DATA_ROOT / "incoming").iterdir())
     status = client.get(f"/api/v1/comparisons/{job_id}")
     assert status.json()["status"] == "completed", status.text
     artifact = client.get(f"/api/v1/comparisons/{job_id}/artifacts/json")
@@ -92,6 +97,33 @@ def test_publish_create_and_download_api(tmp_path, monkeypatch):
     deleted = client.delete(f"/api/v1/comparisons/{inline_job}")
     assert deleted.status_code == 202 and deleted.json()["deleted_at"]
     assert client.get(f"/api/v1/comparisons/{inline_job}").status_code == 404
+
+
+def test_standard_upload_is_staged_in_bounded_chunks_and_cleans_oversize(tmp_path, monkeypatch):
+    import excel_auditor.api as api_module
+
+    monkeypatch.setattr(api_module, "DATA_ROOT", tmp_path)
+    payload = b"x" * (2 * 1024 * 1024 + 17)
+    upload = UploadFile(filename="standard.json", file=BytesIO(payload))
+    requested_sizes: list[int] = []
+    original_read = upload.read
+
+    async def tracked_read(size: int = -1) -> bytes:
+        requested_sizes.append(size)
+        return await original_read(size)
+
+    monkeypatch.setattr(upload, "read", tracked_read)
+    staged, size = asyncio.run(api_module._stage_standard_upload(upload, len(payload)))
+    assert size == len(payload)
+    assert staged.read_bytes() == payload
+    assert requested_sizes and set(requested_sizes) == {1024 * 1024}
+    staged.unlink()
+
+    oversized = UploadFile(filename="standard.json", file=BytesIO(b"12345"))
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(api_module._stage_standard_upload(oversized, 4))
+    assert raised.value.status_code == 413
+    assert not list((tmp_path / "incoming").iterdir())
 
 
 def test_bearer_auth_can_be_required(tmp_path, monkeypatch):

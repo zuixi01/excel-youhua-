@@ -16,6 +16,7 @@ This project uses the following direct dependencies. Version locks are maintaine
 | Uvicorn | 0.52.4 | BSD-3-Clause | https://github.com/encode/uvicorn | ASGI server |
 | python-multipart | 0.0.32 | Apache-2.0 | https://github.com/Kludex/python-multipart | Multipart upload parsing |
 | HTTPX | 0.28.1 | BSD-3-Clause | https://github.com/encode/httpx | API tests and managed HTTP adapter foundation |
+| ijson | 3.5.1 | BSD-3-Clause | https://github.com/ICRAR/ijson | Bounded-memory JSON standard-data parsing |
 | SQLAlchemy | 2.0.52 | MIT | https://github.com/sqlalchemy/sqlalchemy | PostgreSQL persistence layer |
 | Psycopg | 3.3.4 | LGPL-3.0 with exceptions | https://github.com/psycopg/psycopg | PostgreSQL driver |
 | Redis | 8.1.0 | MIT | https://github.com/redis/redis-py | Redis client |

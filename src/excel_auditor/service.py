@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import csv
 from contextlib import contextmanager
 import hashlib
 import os
@@ -22,6 +21,7 @@ from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopment
 from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
+from .standard_files import load_standard_file
 from .persistence import DatabaseRepository
 from .storage import ArtifactStore
 from .ids import new_ulid
@@ -538,20 +538,7 @@ def _tenant_quota_lock(root: Path, tenant_id: str):
 
 
 def _load_standard(path: Path, rules: RuleSet) -> dict[str, Sequence[dict[str, Any]]]:
-    if path.suffix.lower() == ".csv":
-        if len(rules.sheets) != 1:
-            raise ValueError("STANDARD_DATA_INVALID: CSV input requires exactly one configured sheet")
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            payload: Any = {rules.sheets[0].id: list(csv.DictReader(handle))}
-    else:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    if isinstance(payload, list):
-        if len(rules.sheets) != 1:
-            raise ValueError("STANDARD_DATA_INVALID: list input requires exactly one configured sheet")
-        payload = {rules.sheets[0].id: payload}
-    if not isinstance(payload, dict):
-        raise ValueError("STANDARD_DATA_INVALID: root must be an object or array")
-    return _canonicalize_standard(payload, rules)
+    return load_standard_file(path, rules, spill_after_records=_standard_spill_threshold(rules))
 
 
 def _sha256(path: Path) -> str:

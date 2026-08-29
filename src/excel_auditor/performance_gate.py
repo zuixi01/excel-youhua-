@@ -54,8 +54,11 @@ def _validate_scenario_identity(current: dict[str, Any], reference: dict[str, An
     workbook_keys = ("rows", "columns", "sheets", "density", "difference_rate")
     http_keys = ("records", "page_size", "pages")
     maximum_standard_keys = ("standard_records", "excel_rows")
+    uploaded_standard_keys = ("standard_records", "source_format")
     if "rows" in current or "rows" in reference:
         scenario_keys = workbook_keys
+    elif "source_format" in current or "source_format" in reference:
+        scenario_keys = uploaded_standard_keys
     elif "standard_records" in current or "standard_records" in reference:
         scenario_keys = maximum_standard_keys
     else:
