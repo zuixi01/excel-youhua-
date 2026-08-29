@@ -219,3 +219,39 @@ def test_only_merged_header_requires_review(tmp_path):
     book.save(path)
     header_merge = inspect_workbook(path, rules)
     assert "Data: merged_header" in header_merge.manual_review_reasons
+
+
+def test_auto_detected_header_drives_formula_and_merge_safety_checks(tmp_path):
+    formula_path = tmp_path / "auto-header-formula.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Report title"])
+    sheet.append(["ID", "Value"])
+    sheet.append(["E1", "=1+1"])
+    book.save(formula_path)
+    rules = RuleSet.model_validate({
+        "schema_id": "auto-header-safety", "schema_version": "1.0.0", "name": "Auto header safety",
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True}, "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value", "compare": {"formula_mode": "formula"}},
+            ],
+        }],
+    })
+    formula_snapshot = inspect_workbook(formula_path, rules)
+    assert "Data: formulas" not in formula_snapshot.manual_review_reasons
+    formula_snapshot.close()
+
+    merged_path = tmp_path / "auto-header-merged.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Report title"])
+    sheet.append(["ID", "Value"])
+    sheet.merge_cells("A2:B2")
+    book.save(merged_path)
+    merged_snapshot = inspect_workbook(merged_path, rules)
+    assert "Data: merged_header" in merged_snapshot.manual_review_reasons
+    merged_snapshot.close()

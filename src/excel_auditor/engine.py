@@ -24,7 +24,7 @@ from .normalization import ParsedValue, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
-from .workbook import SheetSnapshot, WorkbookSnapshot
+from .workbook import SheetSnapshot, WorkbookSnapshot, locate_header_row
 from .validators import run_validator
 from .ids import new_ulid
 
@@ -173,7 +173,7 @@ def compare_workbook(
             continue
         consumed_sheets.add(actual_name)
         snapshot = workbook.sheets[actual_name]
-        header_row, header_problem = _locate_header_row(sheet_rule, snapshot)
+        header_row, header_problem = locate_header_row(sheet_rule, snapshot)
         if header_problem:
             differences.append(_difference(DifferenceType.HEADER_NOT_FOUND, sheet_rule, header_problem, sheet_name=actual_name, severity="error"))
             manual_review_reasons.append(f"{actual_name}: header_not_found_or_ambiguous")
@@ -285,31 +285,6 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
                 repair_status="planned" if action == "insert_and_mark_green" else "not_requested",
             ))
     return result
-
-
-def _locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, str | None]:
-    if not sheet.header.auto_detect:
-        if sheet.header.row > len(snapshot.rows):
-            return sheet.header.row, f"指定表头行 {sheet.header.row} 超出工作表范围"
-        return sheet.header.row, None
-    exact: dict[str, str] = {}
-    for column in sheet.columns:
-        for candidate in [column.name, column.title, *column.aliases]:
-            exact[normalize_header(candidate)] = column.name
-    candidates: list[tuple[int, int]] = []
-    for row_number, values in snapshot.rows[:50]:
-        matched = {exact[value] for value in map(normalize_header, values) if value in exact}
-        if (sheet.primary_key_mode == "fields" and set(sheet.primary_key) <= matched) or (
-            sheet.primary_key_mode == "row_number" and matched
-        ):
-            candidates.append((len(matched), row_number))
-    if not candidates:
-        return sheet.header.row, "未找到包含完整主键的候选表头行"
-    best_score = max(score for score, _row in candidates)
-    best_rows = [row for score, row in candidates if score == best_score]
-    if len(best_rows) != 1:
-        return best_rows[0], f"表头自动定位存在并列候选行：{best_rows}"
-    return best_rows[0], None
 
 
 def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str, int, int]:

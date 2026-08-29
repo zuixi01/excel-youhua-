@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence, overload
 
 from openpyxl import load_workbook
 
-from .models import RuleSet
+from .models import RuleSet, SheetRule, normalize_header
 
 
 UNSUPPORTED_PACKAGE_FEATURES = frozenset(
@@ -105,6 +105,32 @@ class WorkbookSnapshot:
             close = getattr(sheet.rows, "close", None)
             if close is not None:
                 close()
+
+
+def locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, str | None]:
+    """Resolve one header row for both safety inspection and comparison."""
+    if not sheet.header.auto_detect:
+        if sheet.header.row > len(snapshot.rows):
+            return sheet.header.row, f"指定表头行 {sheet.header.row} 超出工作表范围"
+        return sheet.header.row, None
+    exact: dict[str, str] = {}
+    for column in sheet.columns:
+        for candidate in [column.name, column.title, *column.aliases]:
+            exact[normalize_header(candidate)] = column.name
+    candidates: list[tuple[int, int]] = []
+    for row_number, values in snapshot.rows[:50]:
+        matched = {exact[value] for value in map(normalize_header, values) if value in exact}
+        if (sheet.primary_key_mode == "fields" and set(sheet.primary_key) <= matched) or (
+            sheet.primary_key_mode == "row_number" and matched
+        ):
+            candidates.append((len(matched), row_number))
+    if not candidates:
+        return sheet.header.row, "未找到包含完整主键的候选表头行"
+    best_score = max(score for score, _row in candidates)
+    best_rows = [row for score, row in candidates if score == best_score]
+    if len(best_rows) != 1:
+        return best_rows[0], f"表头自动定位存在并列候选行：{best_rows}"
+    return best_rows[0], None
 
 
 def sha256_file(path: Path) -> str:
@@ -220,11 +246,6 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             risky.append("protected_sheet")
         if not large_mode and sheet.merged_cells.ranges:
             risky.append("merged_cells")
-            if any(
-                merged.min_row <= matching_rule.header.row <= merged.max_row
-                for merged in sheet.merged_cells.ranges
-            ):
-                risky.append("merged_header")
         if not large_mode and sheet.tables:
             risky.append("excel_tables")
         if not large_mode and sheet.data_validations.count:
@@ -260,13 +281,19 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             rows.append((row_index, values))
         max_row = len(rows)
         max_column = observed_max_column if rows else 0
+        inspection_snapshot = SheetSnapshot(sheet.title, max_row, max_column, rows, set(), risky)
+        resolved_header_row, _header_problem = locate_header_row(matching_rule, inspection_snapshot)
+        if not large_mode and sheet.merged_cells.ranges and any(
+            merged.min_row <= resolved_header_row <= merged.max_row
+            for merged in sheet.merged_cells.ranges
+        ):
+            risky.append("merged_header")
         if has_comments:
             risky.append("existing_comments")
         if has_formulas:
             warnings.append(f"{sheet.title}: formulas_present_not_calculated")
-            header_values = rows[matching_rule.header.row - 1][1] if len(rows) >= matching_rule.header.row else []
+            header_values = rows[resolved_header_row - 1][1] if len(rows) >= resolved_header_row else []
             rule_by_header: dict[str, Any] = {}
-            from .models import normalize_header
 
             for column_rule in matching_rule.columns:
                 for candidate in [column_rule.name, column_rule.title, *column_rule.aliases]:
