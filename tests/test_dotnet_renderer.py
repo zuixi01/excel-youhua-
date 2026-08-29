@@ -360,7 +360,7 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
         },
         "operations": [
             {"type": "set_cell", "sheet": "Data", "cell": "B2", "value": "12.50", "field_type": "decimal", "number_format": "0.00", "fill_color": "D9EAD3"},
-            {"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "score", "header_row": 1, "header_value": "Score", "fill_color": "D9EAD3", "field_type": "decimal", "number_format": "0.00", "formula_template": "=ROW()", "validation": {"type": "decimal", "min": "0", "max": "100", "allow_blank": False}},
+            {"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "score", "header_row": 1, "header_value": "Score", "fill_color": "D9EAD3", "field_type": "decimal", "number_format": "0.00", "formula_template": '=IF(ROW()>0,"https://example.test/a|b","embedded ""quote""")', "validation": {"type": "decimal", "min": "0", "max": "100", "allow_blank": False}},
             {"type": "append_row", "sheet": "Data", "row": 3, "values": [{"cell": "A3", "value": "E2", "field_type": "string"}, {"cell": "C3", "value": "9.75", "field_type": "decimal", "number_format": "0.00"}], "fill_color": "D9EAD3"},
         ],
     }
@@ -369,7 +369,7 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     assert completed.returncode == 0, completed.stderr
     rendered = load_workbook(output, data_only=False)
     data = rendered["Data"]
-    assert data["B2"].value == "=ROW()"
+    assert data["B2"].value == '=IF(ROW()>0,"https://example.test/a|b","embedded ""quote""")'
     assert data["B2"].number_format == "0.00"
     assert data["C2"].value == 12.5 and data["C2"].data_type == "n"
     assert data["C3"].value == 9.75 and data["C3"].data_type == "n"
@@ -505,6 +505,46 @@ def test_dotnet_renderer_rejects_invalid_or_ineffective_manifest_fields(tmp_path
     assert failure["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
     assert message in failure["message"]
     assert not output.exists()
+
+
+def test_dotnet_renderer_rejects_side_effect_formula_templates(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, manifest_path = tmp_path / "input.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID"])
+    book.save(source)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    unsafe_formulas = [
+        "=cmd|'/C calc'!A0",
+        '=EXEC("calc")',
+        '=REGISTER.ID("module","procedure","J")',
+        "=_xlfn.IMAGE(A1)",
+        "=STOCKHISTORY(A1)",
+        '="unterminated',
+    ]
+    for index, formula in enumerate(unsafe_formulas):
+        output = tmp_path / f"unsafe-formula-{index}.xlsx"
+        manifest_path.write_text(json.dumps({
+            "manifest_version": "1.0",
+            "job_id": f"job_unsafe_formula_{index}",
+            "input_sha256": digest,
+            "operations": [{
+                "type": "insert_column", "sheet": "Data", "before": "A", "canonical_field": "value",
+                "header_row": 1, "header_value": "Value", "fill_color": "D9EAD3", "formula_template": formula,
+            }],
+        }), encoding="utf-8")
+        completed = subprocess.run(
+            [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert json.loads(completed.stderr)["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
+        assert not output.exists()
 
 
 def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_values(tmp_path):

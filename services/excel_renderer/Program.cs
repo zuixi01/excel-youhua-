@@ -1278,8 +1278,43 @@ static void ValidateFormulaTemplate(string? formula, string source)
 {
     if (formula is null) return;
     var withoutRowPlaceholder = formula.Replace("{row}", "", StringComparison.Ordinal);
-    if (formula.Length is < 2 or > 512 || !formula.StartsWith('=') || withoutRowPlaceholder.Contains('{') || withoutRowPlaceholder.Contains('}') || Regex.IsMatch(formula, @"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", RegexOptions.IgnoreCase))
+    var formulaCode = FormulaCodeOutsideStringLiterals(formula);
+    if (formula.Length is < 2 or > 512 || !formula.StartsWith('=') || withoutRowPlaceholder.Contains('{') || withoutRowPlaceholder.Contains('}') || formulaCode is null
+        || Regex.IsMatch(formulaCode, @"\[|https?://|\||(?<![A-Z0-9_.])(?:(?:_XLFN|_XLWS|_XLL)\.)?(?:WEBSERVICE|HYPERLINK|RTD|CALL|DDE|EXEC|REGISTER(?:\.ID)?|RUN|IMAGE|STOCKHISTORY)\s*\(", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
         throw new InvalidDataException($"{source} is unsafe or invalid");
+}
+
+static string? FormulaCodeOutsideStringLiterals(string formula)
+{
+    var output = new StringBuilder(formula.Length);
+    var index = 0;
+    while (index < formula.Length)
+    {
+        if (formula[index] != '"')
+        {
+            output.Append(formula[index++]);
+            continue;
+        }
+        output.Append(' ');
+        index++;
+        var closed = false;
+        while (index < formula.Length)
+        {
+            output.Append(' ');
+            if (formula[index] != '"') { index++; continue; }
+            if (index + 1 < formula.Length && formula[index + 1] == '"')
+            {
+                output.Append(' ');
+                index += 2;
+                continue;
+            }
+            index++;
+            closed = true;
+            break;
+        }
+        if (!closed) return null;
+    }
+    return output.ToString();
 }
 
 static void ValidateFieldType(string? fieldType)

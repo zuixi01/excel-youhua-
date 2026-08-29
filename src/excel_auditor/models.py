@@ -18,6 +18,42 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+_FORBIDDEN_FORMULA_CODE = re.compile(
+    r"\[|https?://|\||(?<![A-Z0-9_.])(?:(?:_XLFN|_XLWS|_XLL)\.)?"
+    r"(?:WEBSERVICE|HYPERLINK|RTD|CALL|DDE|EXEC|REGISTER(?:\.ID)?|RUN|IMAGE|STOCKHISTORY)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _formula_code_outside_string_literals(formula: str) -> str | None:
+    """Return formula code with Excel string literals blanked, or None for an unclosed literal."""
+    output: list[str] = []
+    index = 0
+    while index < len(formula):
+        if formula[index] != '"':
+            output.append(formula[index])
+            index += 1
+            continue
+        output.append(" ")
+        index += 1
+        closed = False
+        while index < len(formula):
+            output.append(" ")
+            if formula[index] != '"':
+                index += 1
+                continue
+            if index + 1 < len(formula) and formula[index + 1] == '"':
+                output.append(" ")
+                index += 2
+                continue
+            index += 1
+            closed = True
+            break
+        if not closed:
+            return None
+    return "".join(output)
+
+
 class FieldType(str, Enum):
     STRING = "string"
     INTEGER = "integer"
@@ -358,7 +394,8 @@ class ColumnRule(StrictModel):
                 raise ValueError(f"formula_template for {self.name!r} cannot be combined with fill_static_default")
             if len(formula) > 512 or not formula.startswith("="):
                 raise ValueError(f"formula_template for {self.name!r} must start with '=' and be at most 512 characters")
-            if re.search(r"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", formula, re.IGNORECASE):
+            formula_code = _formula_code_outside_string_literals(formula)
+            if formula_code is None or _FORBIDDEN_FORMULA_CODE.search(formula_code):
                 raise ValueError(f"formula_template for {self.name!r} contains an external or forbidden function")
             without_row_placeholder = formula.replace("{row}", "")
             if "{" in without_row_placeholder or "}" in without_row_placeholder:

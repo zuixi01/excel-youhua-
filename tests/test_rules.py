@@ -246,6 +246,27 @@ def test_formula_templates_require_formula_text_mode_and_exclude_static_defaults
     with pytest.raises(ValidationError, match=r"only permits the \{row\} placeholder"):
         RuleSet.model_validate(payload)
 
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    amount = payload["sheets"][0]["columns"][2]
+    amount["compare"]["formula_mode"] = "formula"
+    amount["formula_template"] = '=IF(A{row}>0,"https://example.test/a|b","embedded ""quote""")'
+    assert RuleSet.model_validate(payload).sheets[0].columns[2].formula_template == amount["formula_template"]
+
+    for unsafe_formula in [
+        "=cmd|'/C calc'!A0",
+        '=EXEC("calc")',
+        '=REGISTER.ID("module","procedure","J")',
+        "=_xlfn.IMAGE(A1)",
+        "=STOCKHISTORY(A1)",
+        '="unterminated',
+    ]:
+        payload = load_rules(EXAMPLE).model_dump(mode="json")
+        amount = payload["sheets"][0]["columns"][2]
+        amount["compare"]["formula_mode"] = "formula"
+        amount["formula_template"] = unsafe_formula
+        with pytest.raises(ValidationError, match="external or forbidden function"):
+            RuleSet.model_validate(payload)
+
 
 def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
