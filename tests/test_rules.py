@@ -78,6 +78,36 @@ def test_cross_field_rule_must_reference_existing_fields():
         RuleSet.model_validate(payload)
 
 
+def test_builtin_cross_field_rules_have_strict_typed_parameter_contracts():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["cross_field_rules"] = [{
+        "rule_id": "misspelled", "validator": "conditional_required",
+        "params": {"when_feild": "department", "equals": "技术部", "required_field": "salary"},
+    }]
+    with pytest.raises(ValidationError, match="parameters must match its contract"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["cross_field_rules"] = [{
+        "rule_id": "bad-enum", "validator": "conditional_required",
+        "params": {"when_field": "department", "equals": "不存在", "required_field": "salary"},
+    }]
+    with pytest.raises(ValidationError, match="invalid equals value"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    rule = {"rule_id": "order", "validator": "date_order", "params": {"start_field": "hire_date", "end_field": "employee_name"}}
+    payload["sheets"][0]["cross_field_rules"] = [rule]
+    with pytest.raises(ValidationError, match="requires date fields of the same type"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    rule = {"rule_id": "same", "validator": "date_order", "params": {"start_field": "hire_date", "end_field": "hire_date"}}
+    payload["sheets"][0]["cross_field_rules"] = [rule, rule]
+    with pytest.raises(ValidationError, match="duplicate cross-field rule id"):
+        RuleSet.model_validate(payload)
+
+
 def test_cross_field_validator_must_be_registered_by_trusted_code():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["cross_field_rules"] = [{"rule_id": "custom", "validator": "not_registered", "params": {}}]

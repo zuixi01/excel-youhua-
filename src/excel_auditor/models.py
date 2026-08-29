@@ -364,7 +364,7 @@ class SheetActions(StrictModel):
 
 
 class CrossFieldRule(StrictModel):
-    rule_id: str
+    rule_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     validator: str
     params: dict[str, Any]
     severity: Literal["info", "warning", "error"] = "error"
@@ -377,6 +377,28 @@ class CrossFieldRule(StrictModel):
         if value not in validator_names():
             raise ValueError(f"unregistered cross-field validator: {value}")
         return value
+
+    @model_validator(mode="after")
+    def valid_builtin_parameters(self) -> "CrossFieldRule":
+        builtin_contracts = {
+            "conditional_required": {"when_field", "equals", "required_field"},
+            "date_order": {"start_field", "end_field"},
+        }
+        expected = builtin_contracts.get(self.validator)
+        if expected is None:
+            return self
+        actual = set(self.params)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unknown = sorted(actual - expected)
+            raise ValueError(
+                f"{self.validator} parameters must match its contract; missing={missing}, unknown={unknown}"
+            )
+        for parameter in (name for name in expected if name.endswith("_field")):
+            value = self.params[parameter]
+            if not isinstance(value, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", value) is None:
+                raise ValueError(f"{self.validator} parameter {parameter} must be a canonical field name")
+        return self
 
 
 class SheetRule(StrictModel):
@@ -448,6 +470,25 @@ class SheetRule(StrictModel):
             missing_references = referenced - set(names)
             if missing_references:
                 raise ValueError(f"cross-field rule {cross_rule.rule_id!r} references missing fields: {sorted(missing_references)}")
+            if cross_rule.validator == "conditional_required":
+                when_rule = by_name[cross_rule.params["when_field"]]
+                from .normalization import parse_value
+
+                expected = parse_value(cross_rule.params["equals"], when_rule)
+                if not expected.valid:
+                    raise ValueError(
+                        f"cross-field rule {cross_rule.rule_id!r} has an invalid equals value: {expected.error}"
+                    )
+            if cross_rule.validator == "date_order":
+                start_rule = by_name[cross_rule.params["start_field"]]
+                end_rule = by_name[cross_rule.params["end_field"]]
+                if start_rule.type not in {FieldType.DATE, FieldType.DATETIME} or end_rule.type != start_rule.type:
+                    raise ValueError(
+                        f"cross-field rule {cross_rule.rule_id!r} requires date fields of the same type"
+                    )
+        cross_rule_ids = [rule.rule_id for rule in self.cross_field_rules]
+        if len(cross_rule_ids) != len(set(cross_rule_ids)):
+            raise ValueError(f"duplicate cross-field rule id in sheet {self.id!r}")
         normalized: dict[str, str] = {}
         for column in self.columns:
             for raw in [column.name, column.title, *column.aliases]:
