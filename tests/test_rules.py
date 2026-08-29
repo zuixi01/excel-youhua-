@@ -359,6 +359,18 @@ def test_conflicting_validation_and_type_specific_options_are_rejected():
         RuleSet.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "parse_format",
+    ["YYYY-MM-DD", "yyyy-MM", "yyyy-MM-dd zzz", "yyyy-%m-%d", "yyyy-MM-ddTHH:mm:ssZ"],
+)
+def test_parse_formats_reject_unknown_tokens_or_missing_date_components(parse_format):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][3]["parse_formats"] = [parse_format]
+
+    with pytest.raises(ValidationError, match="date format|unsupported date format token"):
+        RuleSet.model_validate(payload)
+
+
 def test_enum_aliases_and_static_repair_defaults_must_satisfy_the_rule():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["columns"][4]["enum_aliases"]["未知"] = "不存在"

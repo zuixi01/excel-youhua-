@@ -78,6 +78,13 @@ def test_datetime_timezone_and_precision_are_applied():
     naive = ColumnRule.model_validate({"name": "event_at", "title": "时间", "type": "datetime"})
     assert not parse_value("2026-08-28T10:30:00", naive).valid
 
+    custom = ColumnRule.model_validate({
+        "name": "event_at", "title": "Time", "type": "datetime",
+        "parse_formats": ["yyyy-MM-ddTHH:mm:ss"],
+        "compare": {"mode": "datetime", "timezone": "UTC"},
+    })
+    assert parse_value("2026-08-28T10:30:00", custom).normalized.isoformat() == "2026-08-28T10:30:00+00:00"
+
 
 def test_datetime_rejects_ambiguous_and_nonexistent_dst_local_times_without_offset():
     rule = ColumnRule.model_validate({

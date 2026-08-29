@@ -24,6 +24,48 @@ _FORBIDDEN_FORMULA_CODE = re.compile(
     re.IGNORECASE,
 )
 
+_DATETIME_FORMAT_TOKENS = {
+    "yyyy": ("%Y", "year"),
+    "MM": ("%m", "month"),
+    "dd": ("%d", "day"),
+    "HH": ("%H", "hour"),
+    "mm": ("%M", "minute"),
+    "ss": ("%S", "second"),
+    "M": ("%m", "month"),
+    "d": ("%d", "day"),
+}
+
+
+def to_python_datetime_format(value: str) -> str:
+    """Compile the documented date tokens and reject silently ineffective formats."""
+    output: list[str] = []
+    components: set[str] = set()
+    index = 0
+    ordered_tokens = sorted(_DATETIME_FORMAT_TOKENS, key=len, reverse=True)
+    while index < len(value):
+        token = next((candidate for candidate in ordered_tokens if value.startswith(candidate, index)), None)
+        if token is not None:
+            replacement, component = _DATETIME_FORMAT_TOKENS[token]
+            output.append(replacement)
+            components.add(component)
+            index += len(token)
+            continue
+        character = value[index]
+        if character == "%" or (character.isascii() and character.isalpha() and character != "T"):
+            raise ValueError(f"unsupported date format token near {value[index:]!r}")
+        output.append(character)
+        index += 1
+    missing = {"year", "month", "day"} - components
+    if missing:
+        raise ValueError(f"date format must include year, month and day; missing={sorted(missing)}")
+    compiled = "".join(output)
+    sample = datetime(2004, 2, 29, 23, 58, 57)
+    try:
+        datetime.strptime(sample.strftime(compiled), compiled)
+    except ValueError as exc:
+        raise ValueError(f"invalid date format: {value!r}") from exc
+    return compiled
+
 
 def _formula_code_outside_string_literals(formula: str) -> str | None:
     """Return formula code with Excel string literals blanked, or None for an unclosed literal."""
@@ -344,6 +386,8 @@ class ColumnRule(StrictModel):
             raise ValueError(f"datetime precision is incompatible with {self.type.value}")
         if self.parse_formats and self.type not in {FieldType.DATE, FieldType.DATETIME}:
             raise ValueError(f"parse_formats are incompatible with {self.type.value}")
+        for parse_format in self.parse_formats:
+            to_python_datetime_format(parse_format)
         textual = self.type in {
             FieldType.STRING,
             FieldType.PHONE,

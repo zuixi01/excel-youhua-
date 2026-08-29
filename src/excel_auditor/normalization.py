@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from openpyxl.utils.datetime import from_excel
 
-from .models import ColumnRule, FieldType
+from .models import ColumnRule, FieldType, to_python_datetime_format
 from .strict_serialization import dump_json_exact, load_json_strict
 
 
@@ -169,7 +169,7 @@ def _parse_date(value: Any, formats: list[str]) -> date:
     if isinstance(value, date):
         return value
     text = str(value).strip()
-    python_formats = [_to_python_format(item) for item in formats]
+    python_formats = [to_python_datetime_format(item) for item in formats]
     for fmt in [*python_formats, "%Y-%m-%d", "%Y/%m/%d"]:
         try:
             return datetime.strptime(text, fmt).date()
@@ -184,7 +184,7 @@ def _parse_datetime(value: Any, formats: list[str], timezone_name: str | None, a
     else:
         text = str(value).strip()
         parsed = None
-        for fmt in [_to_python_format(item) for item in formats]:
+        for fmt in [to_python_datetime_format(item) for item in formats]:
             try:
                 parsed = datetime.strptime(text, fmt)
                 break
@@ -241,12 +241,6 @@ def normalized_uniqueness_key(parsed: ParsedValue, rule: ColumnRule) -> tuple[st
     if rule.type == FieldType.DATETIME and isinstance(value, datetime) and value.tzinfo is not None:
         value = value.astimezone(timezone.utc)
     return rule.type.value, value
-
-
-def _to_python_format(value: str) -> str:
-    tokens = {"yyyy": "%Y", "MM": "%m", "dd": "%d", "HH": "%H", "mm": "%M", "ss": "%S", "M": "%m", "d": "%d"}
-    pattern = re.compile("|".join(sorted(tokens, key=len, reverse=True)))
-    return pattern.sub(lambda match: tokens[match.group(0)], value)
 
 
 def values_equal(left: ParsedValue, right: ParsedValue, rule: ColumnRule) -> bool:
