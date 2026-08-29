@@ -1203,13 +1203,15 @@ static void ValidateManifest(RenderManifest manifest)
         else if (operation.Name is not null || operation.SourceJson is not null) throw new InvalidDataException($"{operation.Type} contains report-only fields");
         if (operation.Type is not ("set_cell" or "set_cell_after_insert" or "insert_column") && (operation.Value is not null || operation.FieldType is not null || operation.NumberFormat is not null))
             throw new InvalidDataException($"{operation.Type} contains typed-cell-only fields");
+        if (operation.Type is not ("set_cell" or "set_cell_after_insert") && operation.Timezone is not null)
+            throw new InvalidDataException($"{operation.Type} contains typed-value-only timezone");
         if (operation.Type == "insert_column" && operation.Value is not null) throw new InvalidDataException("insert_column must not declare value");
         ValidateFieldType(operation.FieldType);
         ValidateNumberFormat(operation.NumberFormat);
         if (operation.Type is "set_cell" or "set_cell_after_insert")
         {
             if (operation.FieldType is null) throw new InvalidDataException($"{operation.Type} requires field_type");
-            ValidateTypedValue(operation.Value, operation.FieldType);
+            ValidateTypedValue(operation.Value, operation.FieldType, operation.Timezone);
         }
         if ((operation.Type is "mark_cell" or "mark_row" or "set_cell" or "set_cell_after_insert" or "append_row") && String.IsNullOrWhiteSpace(operation.FillColor)) throw new InvalidDataException($"{operation.Type} requires fill_color");
         if (!String.IsNullOrWhiteSpace(operation.FillColor) && !Regex.IsMatch(operation.FillColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("fill color must be six hexadecimal digits");
@@ -1242,10 +1244,12 @@ static void ValidateAppendValues(RenderOperation operation)
         ValidateFieldType(value.FieldType);
         ValidateNumberFormat(value.NumberFormat);
         ValidateFormulaTemplate(value.FormulaTemplate, "append_row formula_template");
+        if (value.FormulaTemplate is not null && value.Timezone is not null)
+            throw new InvalidDataException("append_row formula values must not declare timezone");
         if (value.FormulaTemplate is null)
         {
             if (value.FieldType is null) throw new InvalidDataException("append_row values require field_type");
-            ValidateTypedValue(value.Value, value.FieldType);
+            ValidateTypedValue(value.Value, value.FieldType, value.Timezone);
         }
     }
 }
@@ -1324,8 +1328,11 @@ static void ValidateFieldType(string? fieldType)
     if (!known.Contains(fieldType)) throw new InvalidDataException($"unknown field_type: {fieldType}");
 }
 
-static void ValidateTypedValue(JsonElement? value, string fieldType)
+static void ValidateTypedValue(JsonElement? value, string fieldType, string? timezoneName = null)
 {
+    if (timezoneName is not null && fieldType != "datetime") throw new InvalidDataException("timezone is only valid for datetime values");
+    if (timezoneName is not null && (String.IsNullOrWhiteSpace(timezoneName) || timezoneName.Length > 255 || timezoneName.Any(Char.IsControl)))
+        throw new InvalidDataException("datetime timezone is invalid");
     if (value is null || value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return;
     var kind = value.Value.ValueKind;
     if (fieldType is "integer" or "decimal")
@@ -1337,8 +1344,9 @@ static void ValidateTypedValue(JsonElement? value, string fieldType)
     }
     if (fieldType is "date" or "datetime")
     {
-        if (kind != JsonValueKind.String || !DateTimeOffset.TryParse(value.Value.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out _))
+        if (kind != JsonValueKind.String || !DateTimeOffset.TryParse(value.Value.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out var timestamp))
             throw new InvalidDataException($"{fieldType} values must be ISO date/time strings");
+        if (fieldType == "datetime" && timezoneName is not null) ValidateDatetimeTimezone(timestamp, timezoneName);
         return;
     }
     if (fieldType == "boolean")
@@ -1347,6 +1355,42 @@ static void ValidateTypedValue(JsonElement? value, string fieldType)
         return;
     }
     if (kind != JsonValueKind.String) throw new InvalidDataException($"{fieldType} values must be JSON strings");
+}
+
+static void ValidateDatetimeTimezone(DateTimeOffset timestamp, string timezoneName)
+{
+    var target = ResolveTimeZone(timezoneName);
+    var wallTime = DateTime.SpecifyKind(timestamp.DateTime, DateTimeKind.Unspecified);
+    if (target.IsInvalidTime(wallTime)) throw new InvalidDataException("datetime is nonexistent in the declared timezone");
+    if (target.IsAmbiguousTime(wallTime)) throw new InvalidDataException("datetime is ambiguous in the declared timezone and cannot be preserved by Excel");
+    if (target.GetUtcOffset(wallTime) != timestamp.Offset) throw new InvalidDataException("datetime offset does not match the declared timezone");
+}
+
+static TimeZoneInfo ResolveTimeZone(string timezoneName)
+{
+    try
+    {
+        return TimeZoneInfo.FindSystemTimeZoneById(timezoneName);
+    }
+    catch (Exception exception) when (exception is TimeZoneNotFoundException or InvalidTimeZoneException)
+    {
+        string? platformId = null;
+        var converted = OperatingSystem.IsWindows()
+            ? TimeZoneInfo.TryConvertIanaIdToWindowsId(timezoneName, out platformId)
+            : TimeZoneInfo.TryConvertWindowsIdToIanaId(timezoneName, out platformId);
+        if (converted && platformId is not null)
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(platformId);
+            }
+            catch (Exception convertedException) when (convertedException is TimeZoneNotFoundException or InvalidTimeZoneException)
+            {
+                // Fall through to the stable manifest error below.
+            }
+        }
+    }
+    throw new InvalidDataException("datetime timezone is unknown");
 }
 
 static bool IsExcelSafeNumericText(string text, bool requireInteger)
@@ -1424,8 +1468,8 @@ sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 
 sealed record RenderManifest(string ManifestVersion, string JobId, string InputSha256, List<RenderOperation> Operations, RenderMetadata? Metadata);
 sealed record RenderMetadata(string? SchemaId, string? SchemaVersion, string? SchemaSha256, string? StandardSnapshotId, string? StandardSha256, string? ResultSha256);
-sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate, uint? DataStartRow, List<uint>? FormulaRows);
-sealed record RenderValue(string? Cell, JsonElement? Value, string? FieldType, string? NumberFormat, string? FormulaTemplate);
+sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate, uint? DataStartRow, List<uint>? FormulaRows, string? Timezone);
+sealed record RenderValue(string? Cell, JsonElement? Value, string? FieldType, string? NumberFormat, string? FormulaTemplate, string? Timezone);
 sealed record RenderValidation(string? Type, List<string>? Values, string? Min, string? Max, bool AllowBlank = true);
 sealed record OperationResult(int OperationIndex, string Type, string? DifferenceId, string Status, string? ErrorCode, string? Message);
 static class JsonOptions { public static readonly JsonSerializerOptions Default = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow }; }

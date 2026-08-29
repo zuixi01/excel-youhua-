@@ -844,19 +844,34 @@ def _manifest(
         if repair.type == "set_cell":
             repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
             header_rename = repair.rule_id.endswith(".rename_confirmed_alias")
-            repair_operations[-1].update({"field_type": "string" if header_rename else column_rule.type.value if column_rule else "string", "number_format": None if header_rename else _number_format(column_rule)})
+            repair_operations[-1].update({
+                "field_type": "string" if header_rename else column_rule.type.value if column_rule else "string",
+                "number_format": None if header_rename else _number_format(column_rule),
+                "timezone": None if header_rename else _datetime_timezone(column_rule),
+            })
         elif repair.type == "set_field":
             column = final_columns_by_sheet.get(repair.sheet_id, {}).get(repair.canonical_field or "")
             if column is None or repair.excel_row is None:
                 raise ValueError(f"RENDER_FAILED: repaired field has no final column: {repair.canonical_field}")
             repair_operations.append({"type": "set_cell_after_insert", "sheet": repair.sheet_name, "cell": f"{_column_letter(column)}{repair.excel_row}", "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
-            repair_operations[-1].update({"field_type": column_rule.type.value if column_rule else None, "number_format": _number_format(column_rule)})
+            repair_operations[-1].update({
+                "field_type": column_rule.type.value if column_rule else None,
+                "number_format": _number_format(column_rule),
+                "timezone": _datetime_timezone(column_rule),
+            })
         elif repair.type == "append_record":
             values = []
             for column in sheets_by_id[repair.sheet_id].columns:
                 position = final_columns_by_sheet.get(repair.sheet_id, {}).get(column.name)
                 if position is not None:
-                    values.append({"cell": f"{_column_letter(position)}{repair.excel_row}", "value": (repair.values or {}).get(column.name), "field_type": column.type.value, "number_format": _number_format(column), "formula_template": column.formula_template})
+                    values.append({
+                        "cell": f"{_column_letter(position)}{repair.excel_row}",
+                        "value": (repair.values or {}).get(column.name),
+                        "field_type": column.type.value,
+                        "number_format": _number_format(column),
+                        "timezone": None if column.formula_template else _datetime_timezone(column),
+                        "formula_template": column.formula_template,
+                    })
             repair_operations.append({"type": "append_row", "sheet": repair.sheet_name, "row": repair.excel_row, "values": values, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
     operations = [*mark_operations, *insert_operations, *repair_operations]
     operations.append({"type": "add_or_replace_report_sheet", "name": "核验报告", "source_json": "report.json"})
@@ -887,6 +902,12 @@ def _number_format(column: Any | None) -> str | None:
         "date": "yyyy-mm-dd",
         "datetime": "yyyy-mm-dd hh:mm:ss",
     }.get(column.type.value)
+
+
+def _datetime_timezone(column: Any | None) -> str | None:
+    if column is None or column.type.value != "datetime":
+        return None
+    return column.compare.timezone
 
 
 def _excel_validation(column: Any) -> dict[str, Any] | None:
@@ -922,7 +943,7 @@ def _redact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             operation.pop("value")
             operation["value_redacted"] = True
         if "values" in operation:
-            operation["values"] = [{"cell": item.get("cell"), "field_type": item.get("field_type"), "number_format": item.get("number_format"), "formula_template": item.get("formula_template"), "value_redacted": True} for item in operation["values"]]
+            operation["values"] = [{"cell": item.get("cell"), "field_type": item.get("field_type"), "number_format": item.get("number_format"), "timezone": item.get("timezone"), "formula_template": item.get("formula_template"), "value_redacted": True} for item in operation["values"]]
     return redacted
 
 

@@ -468,6 +468,11 @@ def test_dotnet_renderer_writes_dates_using_the_workbook_epoch(tmp_path, epoch, 
         ("numeric-underflow", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1e-309", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
         ("numeric-overflow", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1e308", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
         ("numeric-boolean", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": True, "field_type": "decimal", "fill_color": "D9EAD3"}], None, "must be JSON numbers or numeric strings"),
+        ("ambiguous-datetime", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "2024-11-03T01:30:00-04:00", "field_type": "datetime", "timezone": "America/New_York", "fill_color": "D9EAD3"}], None, "ambiguous in the declared timezone"),
+        ("nonexistent-datetime", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "2024-03-10T02:30:00-05:00", "field_type": "datetime", "timezone": "America/New_York", "fill_color": "D9EAD3"}], None, "nonexistent in the declared timezone"),
+        ("datetime-offset-mismatch", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "2026-08-30T12:00:00Z", "field_type": "datetime", "timezone": "Asia/Shanghai", "fill_color": "D9EAD3"}], None, "offset does not match"),
+        ("timezone-on-string", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "text", "field_type": "string", "timezone": "UTC", "fill_color": "D9EAD3"}], None, "only valid for datetime"),
+        ("ambiguous-append-datetime", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [{"cell": "A2", "value": "2024-11-03T01:30:00-05:00", "field_type": "datetime", "timezone": "America/New_York"}], "fill_color": "D9EAD3"}], None, "ambiguous in the declared timezone"),
         ("reserved-report-name", [{"type": "add_or_replace_report_sheet", "name": "__ExcelAuditorMetadata", "source_json": "report.json"}], None, "non-reserved name"),
         ("ignored-field", [{"type": "mark_cell", "sheet": "Data", "cell": "A1", "before": "B", "fill_color": "D9EAD3"}], None, "insert_column-only fields"),
         ("invalid-metadata-hash", [], {"schema_sha256": "not-a-hash"}, "must be SHA-256"),
@@ -828,6 +833,25 @@ def test_service_blocks_lossy_dst_repairs_but_writes_unambiguous_datetimes(tmp_p
     assert written.value == datetime(2024, 11, 3, 3, 30)
     assert written.data_type == "d"
     rendered.close()
+    public_manifest = json.loads(safe_service.artifact(safe_job, "manifest").read_text(encoding="utf-8"))
+    datetime_operation = next(item for item in public_manifest["operations"] if item["type"] == "set_cell")
+    assert datetime_operation["timezone"] == "America/New_York"
+
+    safe_append_service, safe_append_job = run_case(
+        "dst-safe-append",
+        [],
+        [{"id": "E3", "event_at": "2024-11-03T03:30:00-05:00"}],
+    )
+    safe_append_status = safe_append_service.status(safe_append_job)
+    assert safe_append_status["status"] == "completed", safe_append_status
+    assert safe_append_status["summary"]["repairs_applied"] == 1
+    rendered = load_workbook(safe_append_service.artifact(safe_append_job, "excel"), data_only=False)
+    assert rendered["Data"]["B2"].value == datetime(2024, 11, 3, 3, 30)
+    rendered.close()
+    public_manifest = json.loads(safe_append_service.artifact(safe_append_job, "manifest").read_text(encoding="utf-8"))
+    append_operation = next(item for item in public_manifest["operations"] if item["type"] == "append_row")
+    event_value = next(item for item in append_operation["values"] if item["cell"] == "B2")
+    assert event_value["timezone"] == "America/New_York"
 
 
 def test_service_renames_numeric_column_alias_as_a_string_header(tmp_path):
