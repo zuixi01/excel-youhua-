@@ -95,6 +95,23 @@
     "record_storage": "disk_spill",
     "transport_note": "Deterministic MockTransport isolates pagination and payload processing; production network latency is measured separately through per-page metadata and metrics."
   },
+  "maximum_uploaded_json_pipeline": {
+    "source_format": "json_upload",
+    "standard_records": 500000,
+    "record_storage": "disk_spill",
+    "load_seconds": 2.084,
+    "validate_seconds": 9.625,
+    "snapshot_seconds": 3.349,
+    "cpu_calibration_seconds": 1.21352,
+    "cpu_seconds": 15.149,
+    "normalized_cpu_units": 12.483,
+    "elapsed_seconds": 15.058,
+    "peak_rss_delta_mib": 132.49,
+    "upload_bytes": 8500010,
+    "snapshot_bytes": 23000000,
+    "snapshot_records": 500000,
+    "snapshot_sha256": "f0b56f2b91ad14a4f555a5cda347c799e2ddc2c93428b99165d4336331ac1d43"
+  },
   "maximum_standard_comparison": {
     "standard_records": 500000,
     "excel_rows": 99999,
