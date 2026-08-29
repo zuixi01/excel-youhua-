@@ -1,4 +1,5 @@
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -6,7 +7,7 @@ from openpyxl import Workbook, load_workbook
 
 from excel_auditor.rules import load_rules
 from excel_auditor.models import RuleSet
-from excel_auditor.rendering import ExcelRenderer, OpenPyxlDevelopmentRenderer
+from excel_auditor.rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer
 from excel_auditor.service import AuditService
 
 
@@ -765,6 +766,72 @@ def test_explicit_auto_repairs_are_applied_and_public_manifest_is_redacted(tmp_p
     assert redacted_repairs and all(operation["comment_values_redacted"] is True for operation in redacted_repairs)
     assert all("原值和标准值已脱敏" in operation["comment"] for operation in redacted_repairs)
     assert any("规则：amount.overwrite_mismatch" in operation["comment"] for operation in redacted_repairs)
+
+
+def test_higher_priority_invalid_cell_is_not_overwritten_by_extra_row_mark(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "color-priority", "schema_version": "1.0.0", "name": "Color priority",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "decimal", "validation": {"min": "0"}},
+            ],
+        }],
+    })
+    excel, standard = tmp_path / "color-priority.xlsx", tmp_path / "color-priority.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["EXTRA", "-1"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": []}), encoding="utf-8")
+    matched_excel, matched_standard = tmp_path / "color-priority-matched.xlsx", tmp_path / "color-priority-matched.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["E1", "-1"])
+    book.save(matched_excel)
+    matched_standard.write_text(json.dumps({"data": [{"id": "E1", "amount": "5"}]}), encoding="utf-8")
+    renderers = [("development", OpenPyxlDevelopmentRenderer())]
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if command:
+        renderers.append(("production", DotNetOpenXmlRenderer(Path(command))))
+
+    for name, renderer in renderers:
+        service = AuditService(tmp_path / f"color-priority-{name}", renderer=renderer)
+        job_id = service.create_job()
+        service.run(job_id, excel, standard, rules)
+        status = service.status(job_id)
+        assert status["status"] == "completed", status
+        report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+        assert {item["type"] for item in report["differences"]} == {"EXTRA_RECORD", "VALIDATION_ERROR"}
+        rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+        result = rendered["Data"]
+        assert result["A2"].fill.fgColor.rgb.endswith(rules.colors.extra)
+        assert result["B2"].fill.fgColor.rgb.endswith(rules.colors.invalid)
+        assert "最小值" in result["B2"].comment.text
+        rendered.close()
+        manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
+        marks = [operation for operation in manifest["operations"] if operation["type"] in {"mark_row", "mark_cell"}]
+        assert [operation["type"] for operation in marks] == ["mark_row", "mark_cell"]
+
+        matched_service = AuditService(tmp_path / f"color-priority-matched-{name}", renderer=renderer)
+        matched_job = matched_service.create_job()
+        matched_service.run(matched_job, matched_excel, matched_standard, rules)
+        matched_status = matched_service.status(matched_job)
+        assert matched_status["status"] == "completed", matched_status
+        matched_rendered = load_workbook(matched_service.artifact(matched_job, "excel"), data_only=False)
+        matched_cell = matched_rendered["Data"]["B2"]
+        assert matched_cell.fill.fgColor.rgb.endswith(rules.colors.invalid)
+        assert "最小值" in matched_cell.comment.text
+        assert "字段值与标准数据不一致" in matched_cell.comment.text
+        matched_rendered.close()
+        matched_manifest = json.loads(matched_service.artifact(matched_job, "manifest").read_text(encoding="utf-8"))
+        matched_marks = [operation for operation in matched_manifest["operations"] if operation["type"] == "mark_cell"]
+        assert len(matched_marks) == 1 and matched_marks[0]["cell"] == "B2"
 
 
 def test_soft_delete_delays_then_purges_terminal_job(tmp_path, monkeypatch):

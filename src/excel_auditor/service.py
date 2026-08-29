@@ -17,7 +17,13 @@ from typing import Any, Sequence
 
 from .engine import compare_workbook
 from .models import AuditReport, RuleSet
-from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer, _repair_provenance_comment
+from .rendering import (
+    DotNetOpenXmlRenderer,
+    ExcelRenderer,
+    OpenPyxlDevelopmentRenderer,
+    RENDER_ACTION_PRIORITY,
+    _repair_provenance_comment,
+)
 from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
@@ -798,21 +804,13 @@ def _manifest(
                     columns[name] = position + 1
             columns[column.name] = before_index
         final_columns_by_sheet[sheet.id] = columns
-    mark_priority = {
-        "mark_purple": 1,
-        "mark_row_purple": 1,
-        "mark_yellow": 2,
-        "mark_orange": 3,
-        "mark_red": 4,
-        "mark_row_red": 4,
-    }
     mark_targets: dict[tuple[str, str], dict[str, Any]] = {}
     for item in sorted(report.differences, key=lambda value: value.difference_id):
         if item.render_action.startswith("mark_row"):
-            candidate = {"type": "mark_row", "sheet": item.sheet_name, "row": item.excel_row, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": mark_priority[item.render_action]}
+            candidate = {"type": "mark_row", "sheet": item.sheet_name, "row": item.excel_row, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": RENDER_ACTION_PRIORITY[item.render_action]}
             key = (item.sheet_name, f"row:{item.excel_row}")
         elif item.render_action in color_by_action:
-            candidate = {"type": "mark_cell", "sheet": item.sheet_name, "cell": item.cell, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": mark_priority[item.render_action]}
+            candidate = {"type": "mark_cell", "sheet": item.sheet_name, "cell": item.cell, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": RENDER_ACTION_PRIORITY[item.render_action]}
             key = (item.sheet_name, f"cell:{item.cell}")
         else:
             continue

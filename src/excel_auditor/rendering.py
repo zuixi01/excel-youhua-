@@ -26,6 +26,16 @@ from .models import Difference, DifferenceType, RuleSet
 from .workbook import WorkbookSnapshot, sha256_file
 
 
+RENDER_ACTION_PRIORITY = {
+    "mark_red": 1,
+    "mark_row_red": 1,
+    "mark_yellow": 2,
+    "mark_orange": 3,
+    "mark_purple": 4,
+    "mark_row_purple": 4,
+}
+
+
 @dataclass
 class RenderResult:
     output_path: Path
@@ -61,23 +71,34 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             "mark_row_purple": rules.colors.ambiguous,
         }
         differences_by_id = {item.difference_id: item for item in comparison.differences}
-        for difference in comparison.differences:
+        renderable_differences = [
+            difference for difference in comparison.differences
+            if difference.render_action in color_by_action
+        ]
+        for difference in sorted(
+            renderable_differences,
+            key=lambda item: (
+                RENDER_ACTION_PRIORITY[item.render_action],
+                item.sheet_name,
+                item.excel_row or 0,
+                item.cell or "",
+                item.difference_id,
+            ),
+        ):
             if difference.sheet_name not in book.sheetnames:
                 continue
             sheet = book[difference.sheet_name]
             color = color_by_action.get(difference.render_action)
-            if not color:
-                continue
             fill = PatternFill("solid", fgColor=color)
             if difference.cell:
                 cell = sheet[difference.cell]
                 cell.fill = fill
-                cell.comment = Comment(_comment(difference), "Excel Auditor")
+                _set_audit_comment(cell, _comment(difference))
                 operation_count += 1
             elif difference.excel_row:
                 for cell in sheet[difference.excel_row]:
                     cell.fill = fill
-                sheet.cell(difference.excel_row, 1).comment = Comment(_comment(difference), "Excel Auditor")
+                _set_audit_comment(sheet.cell(difference.excel_row, 1), _comment(difference))
                 operation_count += 1
         for repair in comparison.repairs:
             if repair.type != "set_cell" or repair.sheet_name not in book.sheetnames or not repair.cell:
@@ -369,6 +390,12 @@ def _comment(item: Difference) -> str:
     if item.rule_id:
         parts.append(f"规则：{item.rule_id}")
     return "；".join(parts)[:32000]
+
+
+def _set_audit_comment(cell: Any, text: str) -> None:
+    if cell.comment is not None and cell.comment.author == "Excel Auditor":
+        text = f"{cell.comment.text} | {text}"[:32000]
+    cell.comment = Comment(text, "Excel Auditor")
 
 
 def _repair_provenance_comment(prefix: str, rule_id: str, difference: Difference | None) -> str:
