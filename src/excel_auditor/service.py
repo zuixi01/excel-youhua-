@@ -744,6 +744,12 @@ def _manifest(
     final_columns_by_sheet: dict[str, dict[str, int]] = {}
     for sheet in rules.sheets:
         columns = dict(mapped_by_sheet.get(sheet.id, {}))
+        resolved_header_row = (comparison.resolved_header_rows_by_sheet or {}).get(sheet.id, sheet.header.row)
+        data_start_row = (comparison.data_start_rows_by_sheet or {}).get(
+            sheet.id,
+            sheet.data_region.start_row or resolved_header_row + 1,
+        )
+        formula_rows = (comparison.formula_rows_by_sheet or {}).get(sheet.id, [])
         missing = {
             item.canonical_field: item
             for item in report.differences
@@ -765,13 +771,15 @@ def _manifest(
                 "sheet": item.sheet_name,
                 "before": _column_letter(before_index),
                 "canonical_field": item.canonical_field,
-                "header_row": sheet.header.row,
+                "header_row": resolved_header_row,
+                "data_start_row": data_start_row,
                 "header_value": column.title,
                 "fill_color": rules.colors.inserted,
                 "field_type": column.type.value,
                 "number_format": _number_format(column),
                 "validation": _excel_validation(column),
                 "formula_template": column.formula_template,
+                "formula_rows": formula_rows if column.formula_template else None,
                 "comment": f"缺失表头；由规则 {rules.schema_id}@{rules.schema_version} 的 {column.name}.missing_column 插入",
                 "difference_id": item.difference_id,
             })

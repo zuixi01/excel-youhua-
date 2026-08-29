@@ -41,6 +41,9 @@ class ComparisonResult:
     storage_backends: list[str] | None = None
     matched_records_by_sheet: dict[str, int] | None = None
     validated_records_by_sheet: dict[str, int] | None = None
+    resolved_header_rows_by_sheet: dict[str, int] | None = None
+    data_start_rows_by_sheet: dict[str, int] | None = None
+    formula_rows_by_sheet: dict[str, list[int]] | None = None
 
     def close(self) -> None:
         for sequence in (self.differences, self.repairs):
@@ -150,6 +153,9 @@ def compare_workbook(
     storage_backends: list[str] = []
     matched_records_by_sheet: dict[str, int] = {}
     validated_records_by_sheet: dict[str, int] = {}
+    resolved_header_rows_by_sheet: dict[str, int] = {}
+    data_start_rows_by_sheet: dict[str, int] = {}
+    formula_rows_by_sheet: dict[str, list[int]] = {}
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
         matching_names = [name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets]
@@ -191,6 +197,8 @@ def compare_workbook(
         # Keep the stable rule id, but carry the physical worksheet name through
         # every difference and render operation when a configured alias matched.
         actual_sheet_rule = sheet_rule.model_copy(update={"name": actual_name, "header": sheet_rule.header.model_copy(update={"row": header_row})})
+        resolved_header_rows_by_sheet[sheet_rule.id] = header_row
+        data_start_rows_by_sheet[sheet_rule.id] = sheet_rule.data_region.start_row or header_row + 1
         mappings, canonical_columns = map_headers(actual_sheet_rule, snapshot)
         all_mappings.extend(mappings)
         differences.extend(_header_differences(actual_sheet_rule, mappings, canonical_columns, repairs))
@@ -199,7 +207,7 @@ def compare_workbook(
         ):
             continue
         sheet_standard = standard.get(sheet_rule.id, standard.get(sheet_rule.name, []))
-        join_backend, record_storage, matched_count, validated_count = _compare_records(
+        join_backend, record_storage, matched_count, validated_count, formula_rows = _compare_records(
             actual_sheet_rule,
             snapshot,
             canonical_columns,
@@ -213,6 +221,7 @@ def compare_workbook(
         storage_backends.append(record_storage)
         matched_records_by_sheet[sheet_rule.id] = matched_count
         validated_records_by_sheet[sheet_rule.id] = validated_count
+        formula_rows_by_sheet[sheet_rule.id] = formula_rows
     for extra_name in set(workbook.sheets) - consumed_sheets:
         pseudo = rules.sheets[0]
         differences.append(_difference(DifferenceType.EXTRA_SHEET, pseudo, f"存在规则未声明的工作表：{extra_name}", sheet_name=extra_name, severity="warning"))
@@ -235,6 +244,11 @@ def compare_workbook(
         for item in differences
         if item.rule_id == "missing_record.formula_template_required"
     }))
+    manual_review_reasons.extend(sorted({
+        f"{item.sheet_name}: formula_template_mismatch:{item.canonical_field}"
+        for item in differences
+        if item.rule_id and item.rule_id.endswith(".formula_template_mismatch")
+    }))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -252,6 +266,9 @@ def compare_workbook(
         storage_backends=sorted(set(storage_backends)),
         matched_records_by_sheet=matched_records_by_sheet,
         validated_records_by_sheet=validated_records_by_sheet,
+        resolved_header_rows_by_sheet=resolved_header_rows_by_sheet,
+        data_start_rows_by_sheet=data_start_rows_by_sheet,
+        formula_rows_by_sheet=formula_rows_by_sheet,
     )
 
 
@@ -301,17 +318,19 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
     return result
 
 
-def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary, excel_epoch: Any) -> tuple[str, str, int, int]:
+def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary, excel_epoch: Any) -> tuple[str, str, int, int, list[int]]:
     rules_by_name = {column.name: column for column in sheet.columns}
     start_row = sheet.data_region.start_row or sheet.header.row + 1
     excel_records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
     excel_duplicates: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+    formula_target_rows: list[int] = []
     for row_number, values in snapshot.rows[start_row - 1 :]:
         if row_number in snapshot.hidden_rows and not sheet.data_region.include_hidden_rows:
             continue
         record = {name: values[index - 1] for name, index in columns.items() if index <= len(values) and values[index - 1] not in {None, ""}}
         if all(value is None or value == "" for value in record.values()):
             continue
+        formula_target_rows.append(row_number)
         formula_key_fields = [
             name
             for name in sheet.primary_key
@@ -509,6 +528,23 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             if col_index is None:
                 if not _should_insert_missing(sheet, rule):
                     continue
+                if rule.formula_template is not None:
+                    if name in standard_record:
+                        expected_formula = rule.formula_template.replace("{row}", str(row_number))
+                        if standard_record.get(name) != expected_formula:
+                            differences.append(_difference(
+                                DifferenceType.VALUE_MISMATCH,
+                                sheet,
+                                "标准公式与受信任公式模板在目标行展开后的文本不一致",
+                                excel_row=row_number,
+                                canonical_field=name,
+                                business_key=_business_key(key, sheet),
+                                standard_raw_value=_safe_value(standard_record.get(name), rule),
+                                standard_normalized_value=_safe_value(expected_formula, rule),
+                                rule_id=f"{name}.formula_template_mismatch",
+                                render_action="report_only",
+                            ))
+                    continue
                 right = parse_value(standard_record.get(name), rule)
                 repair_value = None
                 write_value = None
@@ -644,6 +680,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         "disk_standard_records" if use_disk_records else "memory_standard_records",
         len(matched_keys),
         len(excel_records),
+        formula_target_rows,
     )
 
 

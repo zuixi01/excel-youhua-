@@ -226,6 +226,20 @@ def test_rule_rejects_aliases_and_enum_values_unreachable_after_normalization():
     assert RuleSet.model_validate(payload).sheets[0].columns[4].enum_values == ["Active"]
 
 
+def test_formula_templates_require_formula_text_mode_and_exclude_static_defaults():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["formula_template"] = "={row}*2"
+    with pytest.raises(ValidationError, match="requires compare.formula_mode=formula"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    amount = payload["sheets"][0]["columns"][2]
+    amount["compare"]["formula_mode"] = "formula"
+    amount.update({"formula_template": "={row}*2", "fill_static_default": True, "static_default": "1"})
+    with pytest.raises(ValidationError, match="cannot be combined with fill_static_default"):
+        RuleSet.model_validate(payload)
+
+
 def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["columns"][2]["compare"]["absolute_tolerance"] = 0.1

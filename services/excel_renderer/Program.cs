@@ -248,12 +248,14 @@ static void InsertColumn(WorkbookPart workbookPart, RenderOperation operation, D
         .Where(item => item.CellReference?.Value != reference).OrderBy(item => Math.Abs(ColumnNumber(CellColumn(item.CellReference?.Value ?? "A")) - target)).FirstOrDefault();
     header.StyleIndex = FillStyle(workbookPart, adjacentHeader?.StyleIndex ?? header.StyleIndex, operation.FillColor!, null, styleCache);
     var lastRow = sheetData.Elements<Row>().Select(item => item.RowIndex?.Value ?? 0u).DefaultIfEmpty(0u).Max();
-    for (var rowIndex = (operation.HeaderRow ?? 1u) + 1u; rowIndex <= lastRow; rowIndex++)
+    var firstDataRow = operation.DataStartRow ?? (operation.HeaderRow ?? 1u) + 1u;
+    var formulaRows = operation.FormulaRows?.ToHashSet();
+    for (var rowIndex = firstDataRow; rowIndex <= lastRow; rowIndex++)
     {
         var dataCell = FindOrCreateCell(worksheetPart, ColumnName(target) + rowIndex);
         var adjacent = FindNearestStyledCell(worksheetPart, rowIndex, target);
         dataCell.StyleIndex = FillStyle(workbookPart, adjacent?.StyleIndex ?? dataCell.StyleIndex, "", operation.NumberFormat, styleCache);
-        if (!String.IsNullOrWhiteSpace(operation.FormulaTemplate))
+        if (!String.IsNullOrWhiteSpace(operation.FormulaTemplate) && (formulaRows is null || formulaRows.Contains(rowIndex)))
         {
             var formula = operation.FormulaTemplate.Replace("{row}", rowIndex.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal).TrimStart('=');
             dataCell.CellFormula = new CellFormula(formula.TrimStart('='));
@@ -262,7 +264,7 @@ static void InsertColumn(WorkbookPart workbookPart, RenderOperation operation, D
             dataCell.InlineString = null;
         }
     }
-    ApplyColumnValidation(worksheet, operation, target, lastRow);
+    ApplyColumnValidation(worksheet, operation, target, firstDataRow, lastRow);
     if (!String.IsNullOrWhiteSpace(operation.Comment)) AddOrReplaceComment(worksheetPart, reference, operation.Comment!);
     RecalculateDimension(worksheet);
     worksheet.Save();
@@ -275,11 +277,11 @@ static Cell? FindNearestStyledCell(WorksheetPart worksheetPart, uint rowIndex, i
         .OrderBy(item => Math.Abs(ColumnNumber(CellColumn(item.CellReference?.Value ?? "A")) - targetColumn)).FirstOrDefault();
 }
 
-static void ApplyColumnValidation(Worksheet worksheet, RenderOperation operation, int targetColumn, uint lastRow)
+static void ApplyColumnValidation(Worksheet worksheet, RenderOperation operation, int targetColumn, uint firstDataRow, uint lastRow)
 {
-    if (operation.Validation is null || lastRow <= (operation.HeaderRow ?? 1u)) return;
+    if (operation.Validation is null || lastRow < firstDataRow) return;
     var validation = operation.Validation;
-    var dataValidation = new DataValidation { AllowBlank = validation.AllowBlank, SequenceOfReferences = new ListValue<StringValue> { InnerText = $"{ColumnName(targetColumn)}{(operation.HeaderRow ?? 1u) + 1}:{ColumnName(targetColumn)}{lastRow}" } };
+    var dataValidation = new DataValidation { AllowBlank = validation.AllowBlank, SequenceOfReferences = new ListValue<StringValue> { InnerText = $"{ColumnName(targetColumn)}{firstDataRow}:{ColumnName(targetColumn)}{lastRow}" } };
     if (validation.Type == "list" && validation.Values is { Count: > 0 })
     {
         var list = String.Join(",", validation.Values.Select(value => value.Replace("\"", "\"\"")));
@@ -1013,6 +1015,8 @@ static void ValidateManifest(RenderManifest manifest)
         if ((operation.Type is "mark_cell" or "set_cell" or "set_cell_after_insert") && String.IsNullOrWhiteSpace(operation.Cell)) throw new InvalidDataException($"{operation.Type} requires cell");
         if ((operation.Type is "mark_row" or "append_row") && operation.Row is null) throw new InvalidDataException($"{operation.Type} requires row");
         if (operation.Type == "insert_column" && ((String.IsNullOrWhiteSpace(operation.Before) == String.IsNullOrWhiteSpace(operation.After)) || operation.HeaderRow is null || String.IsNullOrWhiteSpace(operation.FillColor))) throw new InvalidDataException("insert_column requires exactly one of before/after, plus header_row and fill_color");
+        if (operation.Type == "insert_column" && operation.DataStartRow is not null && operation.DataStartRow <= operation.HeaderRow) throw new InvalidDataException("insert_column data_start_row must be after header_row");
+        if (operation.Type == "insert_column" && operation.FormulaRows?.Any(row => row < (operation.DataStartRow ?? (operation.HeaderRow ?? 1u) + 1u) || row > 1048576u) == true) throw new InvalidDataException("insert_column formula_rows must be valid data rows");
         if (operation.Type == "add_or_replace_report_sheet" && (String.IsNullOrWhiteSpace(operation.Name) || String.IsNullOrWhiteSpace(operation.SourceJson))) throw new InvalidDataException("report operation requires name and source_json");
         if (!String.IsNullOrWhiteSpace(operation.FillColor) && !Regex.IsMatch(operation.FillColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("fill color must be six hexadecimal digits");
     }
@@ -1036,7 +1040,7 @@ sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 
 sealed record RenderManifest(string ManifestVersion, string JobId, string InputSha256, List<RenderOperation> Operations, RenderMetadata? Metadata);
 sealed record RenderMetadata(string? SchemaId, string? SchemaVersion, string? SchemaSha256, string? StandardSnapshotId, string? StandardSha256, string? ResultSha256);
-sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate);
+sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate, uint? DataStartRow, List<uint>? FormulaRows);
 sealed record RenderValue(string? Cell, JsonElement? Value, string? FieldType, string? NumberFormat, string? FormulaTemplate);
 sealed record RenderValidation(string? Type, List<string>? Values, string? Min, string? Max, bool AllowBlank = true);
 sealed record OperationResult(int OperationIndex, string Type, string? DifferenceId, string Status, string? ErrorCode, string? Message);

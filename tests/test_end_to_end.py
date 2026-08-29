@@ -257,6 +257,77 @@ def test_formula_record_append_requires_a_matching_trusted_template(tmp_path):
     rendered.close()
 
 
+def test_missing_formula_column_uses_resolved_header_and_exact_data_rows(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "formula-column", "schema_version": "1.0.0", "name": "Formula column",
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True},
+            "data_region": {"start_row": 5}, "primary_key": ["id"],
+            "actions": {"fill_empty_from_standard": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "calc", "title": "Calc", "type": "decimal",
+                    "compare": {"mode": "numeric", "formula_mode": "formula"},
+                    "missing_column_action": "insert", "formula_template": "={row}*2",
+                },
+            ],
+        }],
+    })
+    excel = tmp_path / "formula-column.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "Report title"
+    sheet["A3"] = "ID"
+    sheet["A4"] = "Preamble"
+    sheet["A5"] = "E1"
+    sheet["A7"] = "E2"
+    book.save(excel)
+    standard = tmp_path / "formula-column.json"
+    standard.write_text(json.dumps({"data": [
+        {"id": "E1", "calc": "=5*2"},
+        {"id": "E2", "calc": "=7*2"},
+    ]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "formula-column-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["repairs_applied"] == 1
+    manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
+    insert = next(item for item in manifest["operations"] if item["type"] == "insert_column")
+    assert insert["header_row"] == 3
+    assert insert["data_start_row"] == 5
+    assert insert["formula_rows"] == [5, 7]
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    data = rendered["Data"]
+    assert data["B3"].value == "Calc"
+    assert data["B4"].value is None
+    assert data["B5"].value == "=5*2"
+    assert data["B6"].value is None
+    assert data["B7"].value == "=7*2"
+    rendered.close()
+
+    mismatch_standard = tmp_path / "formula-column-mismatch.json"
+    mismatch_standard.write_text(json.dumps({"data": [
+        {"id": "E1", "calc": "=5*2"},
+        {"id": "E2", "calc": "=999"},
+    ]}), encoding="utf-8")
+    mismatch_service = AuditService(tmp_path / "formula-column-mismatch-runtime")
+    mismatch_job = mismatch_service.create_job()
+    mismatch_service.run(mismatch_job, excel, mismatch_standard, rules)
+    mismatch_status = mismatch_service.status(mismatch_job)
+    assert mismatch_status["status"] == "manual_review"
+    assert "excel" not in mismatch_status["artifacts"]
+    mismatch_report = json.loads(mismatch_service.artifact(mismatch_job, "json").read_text(encoding="utf-8"))
+    mismatch = next(item for item in mismatch_report["differences"] if item["rule_id"] == "calc.formula_template_mismatch")
+    assert mismatch["excel_row"] == 7
+    assert mismatch["standard_raw_value"] == "=999"
+    assert mismatch["standard_normalized_value"] == "=7*2"
+
+
 def test_missing_formula_cache_routes_to_manual_review(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "formula-cache", "schema_version": "1.0.0", "name": "Formula Cache",

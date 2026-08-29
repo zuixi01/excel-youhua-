@@ -352,6 +352,10 @@ class ColumnRule(StrictModel):
                 raise ValueError(f"boolean true/false aliases overlap for {self.name!r}")
         if self.formula_template is not None:
             formula = self.formula_template
+            if self.compare.formula_mode != "formula":
+                raise ValueError(f"formula_template for {self.name!r} requires compare.formula_mode=formula")
+            if self.fill_static_default:
+                raise ValueError(f"formula_template for {self.name!r} cannot be combined with fill_static_default")
             if len(formula) > 512 or not formula.startswith("="):
                 raise ValueError(f"formula_template for {self.name!r} must start with '=' and be at most 512 characters")
             if re.search(r"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", formula, re.IGNORECASE):
