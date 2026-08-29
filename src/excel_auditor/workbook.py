@@ -43,6 +43,8 @@ UNSUPPORTED_SHEET_FEATURES = frozenset(
     }
 )
 
+AUTO_HEADER_SCAN_ROWS = 50
+
 
 class WorkbookSafetyError(ValueError):
     pass
@@ -121,7 +123,7 @@ def locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, s
         for candidate in [column.name, column.title, *column.aliases]:
             exact[normalize_header(candidate)] = column.name
     candidates: list[tuple[int, int]] = []
-    for row_number, values in snapshot.rows[:50]:
+    for row_number, values in snapshot.rows[:AUTO_HEADER_SCAN_ROWS]:
         matched = {exact[value] for value in map(normalize_header, values) if value in exact}
         if (sheet.primary_key_mode == "fields" and set(sheet.primary_key) <= matched) or (
             sheet.primary_key_mode == "row_number" and matched
@@ -231,8 +233,17 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         raise WorkbookSafetyError("WORKBOOK_PROTECTED")
     for sheet in book.worksheets:
         matching_rule = sheet_rule_for_name(rules, sheet.title)
-        data_start_row = matching_rule.data_region.start_row or matching_rule.header.row + 1
-        row_limit = rules.workbook.max_rows_per_sheet + data_start_row - 1
+        configured_data_start = matching_rule.data_region.start_row
+        if configured_data_start is not None:
+            preliminary_data_start = configured_data_start
+        elif matching_rule.header.auto_detect:
+            # Header discovery is bounded to the first 50 rows. Permit that
+            # bounded prefix while reading, then enforce the exact limit once
+            # the physical header row has been resolved below.
+            preliminary_data_start = AUTO_HEADER_SCAN_ROWS + 1
+        else:
+            preliminary_data_start = matching_rule.header.row + 1
+        row_limit = rules.workbook.max_rows_per_sheet + preliminary_data_start - 1
         max_row, max_column = sheet.max_row, sheet.max_column
         if (max_row is not None and max_row > row_limit) or (max_column is not None and max_column > rules.workbook.max_columns_per_sheet):
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")
@@ -286,6 +297,18 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         max_column = observed_max_column if rows else 0
         inspection_snapshot = SheetSnapshot(sheet.title, max_row, max_column, rows, set(), risky)
         resolved_header_row, _header_problem = locate_header_row(matching_rule, inspection_snapshot)
+        actual_data_start = configured_data_start or resolved_header_row + 1
+        actual_row_limit = rules.workbook.max_rows_per_sheet + actual_data_start - 1
+        if max_row > actual_row_limit:
+            close_rows = getattr(rows, "close", None)
+            if close_rows is not None:
+                close_rows()
+            for existing_snapshot in snapshots.values():
+                close_existing_rows = getattr(existing_snapshot.rows, "close", None)
+                if close_existing_rows is not None:
+                    close_existing_rows()
+            book.close()
+            raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")
         if not large_mode and sheet.merged_cells.ranges and any(
             merged.min_row <= resolved_header_row <= merged.max_row
             for merged in sheet.merged_cells.ranges

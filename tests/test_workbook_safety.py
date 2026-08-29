@@ -184,6 +184,36 @@ def test_row_limit_is_counted_from_the_configured_data_start(tmp_path):
         inspect_workbook(path, rules)
 
 
+@pytest.mark.parametrize("max_in_memory_cells", [10_000, 1])
+def test_row_limit_is_counted_from_the_auto_detected_header(tmp_path, max_in_memory_cells):
+    path = tmp_path / f"auto-header-limit-{max_in_memory_cells}.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "Report title"
+    sheet["A3"] = "ID"
+    sheet["A4"] = "E1"
+    sheet["A5"] = "E2"
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "auto-header-limit", "schema_version": "1.0.0", "name": "Auto header limit",
+        "workbook": {"max_rows_per_sheet": 2},
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True},
+            "primary_key": ["id"], "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules, max_in_memory_cells=max_in_memory_cells)
+    assert snapshot.sheets["Data"].max_row == 5
+    snapshot.close()
+
+    sheet["A6"] = "E3"
+    book.save(path)
+    with pytest.raises(WorkbookSafetyError, match="FILE_LIMIT_EXCEEDED"):
+        inspect_workbook(path, rules, max_in_memory_cells=max_in_memory_cells)
+
+
 def test_only_merged_header_requires_review(tmp_path):
     path = tmp_path / "merged.xlsx"
     book = Workbook()
