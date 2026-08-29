@@ -224,6 +224,113 @@ def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     assert not long_output.exists()
 
 
+def test_dotnet_renderer_preserves_existing_note_vml_geometry_during_mark_and_insert(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "custom-note.xlsx", tmp_path / "custom-note-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["E1", 99])
+    sheet["A2"].comment = Comment("second note", "Bob")
+    sheet["B2"].comment = Comment("user note", "Alice")
+    book.save(source)
+
+    customized = tmp_path / "customized-note.xlsx"
+    with zipfile.ZipFile(source) as archive:
+        members = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    vml_name = next(info.filename for info, _data in members if info.filename.endswith(".vml"))
+    vml_namespace = "{urn:schemas-microsoft-com:vml}"
+    excel_namespace = "{urn:schemas-microsoft-com:office:excel}"
+    rewritten_members = []
+    for info, data in members:
+        if info.filename == vml_name:
+            root = ElementTree.fromstring(data)
+            shapes = root.findall(f".//{vml_namespace}shape")
+            shape = next(item for item in shapes if item.find(f".//{excel_namespace}Row").text == "1" and item.find(f".//{excel_namespace}Column").text == "0")
+            shape.set("style", "position:absolute;margin-left:17pt;margin-top:19pt;width:222pt;height:111pt;z-index:7;visibility:visible")
+            shape.set("fillcolor", "#abcdef")
+            client_data = shape.find(f".//{excel_namespace}ClientData")
+            anchor = shape.find(f".//{excel_namespace}Anchor")
+            row = shape.find(f".//{excel_namespace}Row")
+            column = shape.find(f".//{excel_namespace}Column")
+            assert client_data is not None and row is not None and column is not None
+            if anchor is None:
+                anchor = ElementTree.Element(f"{excel_namespace}Anchor")
+                client_data.insert(2, anchor)
+            anchor.text, row.text, column.text = "0, 7, 1, 3, 4, 9, 6, 4", "1", "0"
+            data = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+        rewritten_members.append((info, data))
+    with zipfile.ZipFile(customized, "w") as archive:
+        for info, data in rewritten_members:
+            archive.writestr(info, data)
+    customized.replace(source)
+
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_custom_note",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [
+            {"type": "mark_cell", "sheet": "Data", "cell": "A2", "fill_color": "FFE599", "comment": "audit note"},
+            {"type": "insert_column", "sheet": "Data", "before": "A", "canonical_field": "name", "header_row": 1, "header_value": "Name", "fill_color": "D9EAD3", "comment": "inserted header"},
+        ],
+    }), encoding="utf-8")
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    rendered = load_workbook(output)
+    preserved_comment = rendered["Data"]["B2"].comment
+    assert preserved_comment is not None
+    assert preserved_comment.author == "Bob"
+    assert preserved_comment.text == "second note\n\n[Excel Auditor]\naudit note"
+    assert rendered["Data"]["C2"].comment.author == "Alice"
+    assert rendered["Data"]["C2"].comment.text == "user note"
+    assert rendered["Data"]["A1"].comment.text == "inserted header"
+    rendered.close()
+
+    with zipfile.ZipFile(output) as archive:
+        root = ElementTree.fromstring(archive.read(vml_name))
+    shapes = root.findall(f".//{vml_namespace}shape")
+    assert len(shapes) == 3
+    preserved_shape = next(shape for shape in shapes if shape.get("fillcolor") == "#abcdef")
+    assert preserved_shape.get("style") == "position:absolute;margin-left:17pt;margin-top:19pt;width:222pt;height:111pt;z-index:7;visibility:visible"
+    assert preserved_shape.get("fillcolor") == "#abcdef"
+    assert preserved_shape.find(f".//{excel_namespace}Anchor").text == "1, 7, 1, 3, 5, 9, 6, 4"
+    assert preserved_shape.find(f".//{excel_namespace}Row").text == "1"
+    assert preserved_shape.find(f".//{excel_namespace}Column").text == "1"
+    assert sum("width:108pt;height:59pt" in (shape.get("style") or "") for shape in shapes) == 1
+
+    malformed_source, malformed_output = tmp_path / "malformed-note.xlsx", tmp_path / "malformed-note-output.xlsx"
+    with zipfile.ZipFile(source) as archive:
+        members = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    with zipfile.ZipFile(malformed_source, "w") as archive:
+        for info, data in members:
+            if info.filename == vml_name:
+                malformed_root = ElementTree.fromstring(data)
+                malformed_root.find(f".//{excel_namespace}Anchor").text = "not-a-valid-anchor"
+                data = ElementTree.tostring(malformed_root, encoding="utf-8", xml_declaration=True)
+            archive.writestr(info, data)
+    malformed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    malformed_manifest["job_id"] = "job_malformed_note"
+    malformed_manifest["input_sha256"] = hashlib.sha256(malformed_source.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(malformed_manifest), encoding="utf-8")
+    rejected = subprocess.run(
+        [command, "--input", str(malformed_source), "--output", str(malformed_output), "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert json.loads(rejected.stderr)["error_code"] == "UNSUPPORTED_FEATURE"
+    assert not malformed_output.exists()
+
+
 def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_rejects_unknown_ops(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:

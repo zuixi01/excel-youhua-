@@ -806,16 +806,14 @@ static void AddOrReplaceComment(WorksheetPart worksheetPart, string reference, s
         {
             outputText = MergeAuditCommentText(existingText, text);
         }
-        existing.Remove();
     }
     if (outputText.Length > 32767)
         throw new InvalidDataException("UNSUPPORTED_FEATURE: existing comment leaves insufficient room for an audit comment without data loss");
-    list.Append(new Comment
-    {
-        Reference = reference,
-        AuthorId = outputAuthorId,
-        CommentText = new CommentText(new Run(new Text(outputText) { Space = SpaceProcessingModeValues.Preserve }))
-    });
+    var outputComment = existing ?? new Comment();
+    outputComment.Reference = reference;
+    outputComment.AuthorId = outputAuthorId;
+    outputComment.CommentText = new CommentText(new Run(new Text(outputText) { Space = SpaceProcessingModeValues.Preserve }));
+    if (existing is null) list.Append(outputComment);
     commentsPart.Comments.Save();
     RebuildCommentVml(worksheetPart);
 }
@@ -832,6 +830,10 @@ static void RebuildCommentVml(WorksheetPart worksheetPart)
 {
     var comments = worksheetPart.WorksheetCommentsPart?.Comments?.CommentList?.Elements<Comment>().ToList() ?? [];
     var vmlPart = worksheetPart.VmlDrawingParts.FirstOrDefault();
+    XNamespace v = "urn:schemas-microsoft-com:vml";
+    XNamespace o = "urn:schemas-microsoft-com:office:office";
+    XNamespace x = "urn:schemas-microsoft-com:office:excel";
+    XDocument document;
     if (vmlPart is not null)
     {
         using var existingStream = vmlPart.GetStream(FileMode.Open, FileAccess.Read);
@@ -839,51 +841,135 @@ static void RebuildCommentVml(WorksheetPart worksheetPart)
         var existingXml = reader.ReadToEnd();
         try
         {
-            XNamespace existingVml = "urn:schemas-microsoft-com:vml";
-            XNamespace existingExcel = "urn:schemas-microsoft-com:office:excel";
-            var document = XDocument.Parse(existingXml, LoadOptions.PreserveWhitespace);
-            var unsafeShape = document.Descendants(existingVml + "shape").Any(shape =>
+            document = XDocument.Parse(existingXml, LoadOptions.PreserveWhitespace);
+            var unsafeShape = document.Descendants(v + "shape").Any(shape =>
             {
-                var clientData = shape.Descendants(existingExcel + "ClientData").FirstOrDefault();
+                var clientData = shape.Descendants(x + "ClientData").FirstOrDefault();
                 return clientData is null || !StringComparer.OrdinalIgnoreCase.Equals((string?)clientData.Attribute("ObjectType"), "Note");
             });
-            if (unsafeShape || document.Descendants(existingExcel + "Macro").Any())
-                throw new InvalidDataException("legacy VML shapes or controls cannot be safely rewritten");
+            if (unsafeShape || document.Descendants(x + "Macro").Any())
+                throw new InvalidDataException("UNSUPPORTED_FEATURE: legacy VML shapes or controls cannot be safely rewritten");
         }
         catch (System.Xml.XmlException exception)
         {
-            throw new InvalidDataException("legacy VML cannot be parsed safely", exception);
+            throw new InvalidDataException("UNSUPPORTED_FEATURE: legacy VML cannot be parsed safely", exception);
         }
     }
-    if (vmlPart is null)
+    else
     {
         vmlPart = worksheetPart.AddNewPart<VmlDrawingPart>();
         var worksheet = worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing");
         worksheet.Append(new LegacyDrawing { Id = worksheetPart.GetIdOfPart(vmlPart) });
+        document = CreateCommentVmlDocument(v, o, x);
     }
-    XNamespace v = "urn:schemas-microsoft-com:vml";
-    XNamespace o = "urn:schemas-microsoft-com:office:office";
-    XNamespace x = "urn:schemas-microsoft-com:office:excel";
-    var root = new XElement("xml",
+
+    var root = document.Root ?? throw new InvalidDataException("UNSUPPORTED_FEATURE: legacy VML has no document element");
+    var shapes = root.Descendants(v + "shape").ToList();
+    if (shapes.Count > comments.Count)
+        throw new InvalidDataException("UNSUPPORTED_FEATURE: comment VML contains more Note shapes than comments");
+    for (var index = 0; index < shapes.Count; index++)
+        MoveExistingCommentShape(shapes[index], comments[index], x);
+
+    if (comments.Count > shapes.Count)
+    {
+        EnsureCommentShapeType(root, v, o);
+        var nextShapeId = Math.Max(1025, shapes.Select(shape => ParseCommentShapeId((string?)shape.Attribute("id"))).DefaultIfEmpty(1024).Max() + 1);
+        foreach (var comment in comments.Skip(shapes.Count))
+            root.Add(CreateDefaultCommentShape(comment, nextShapeId++, v, o, x));
+    }
+
+    using var stream = new MemoryStream();
+    document.Save(stream, SaveOptions.DisableFormatting);
+    stream.Position = 0;
+    vmlPart.FeedData(stream);
+}
+
+static XDocument CreateCommentVmlDocument(XNamespace v, XNamespace o, XNamespace x)
+{
+    return new XDocument(new XElement("xml",
         new XAttribute(XNamespace.Xmlns + "v", v), new XAttribute(XNamespace.Xmlns + "o", o), new XAttribute(XNamespace.Xmlns + "x", x),
         new XElement(o + "shapelayout", new XAttribute(v + "ext", "edit"), new XElement(o + "idmap", new XAttribute(v + "ext", "edit"), new XAttribute("data", "1"))),
         new XElement(v + "shapetype", new XAttribute("id", "_x0000_t202"), new XAttribute("coordsize", "21600,21600"), new XAttribute(o + "spt", "202"), new XAttribute("path", "m,l,21600r21600,l21600,xe"),
-            new XElement(v + "stroke", new XAttribute("joinstyle", "miter")), new XElement(v + "path", new XAttribute("gradientshapeok", "t"), new XAttribute(o + "connecttype", "rect"))));
-    var shapeId = 1025;
-    foreach (var comment in comments)
+            new XElement(v + "stroke", new XAttribute("joinstyle", "miter")), new XElement(v + "path", new XAttribute("gradientshapeok", "t"), new XAttribute(o + "connecttype", "rect")))));
+}
+
+static void EnsureCommentShapeType(XElement root, XNamespace v, XNamespace o)
+{
+    if (root.Elements(v + "shapetype").Any(item => StringComparer.Ordinal.Equals((string?)item.Attribute("id"), "_x0000_t202"))) return;
+    var shapeType = new XElement(v + "shapetype", new XAttribute("id", "_x0000_t202"), new XAttribute("coordsize", "21600,21600"), new XAttribute(o + "spt", "202"), new XAttribute("path", "m,l,21600r21600,l21600,xe"),
+        new XElement(v + "stroke", new XAttribute("joinstyle", "miter")), new XElement(v + "path", new XAttribute("gradientshapeok", "t"), new XAttribute(o + "connecttype", "rect")));
+    var firstShape = root.Elements(v + "shape").FirstOrDefault();
+    if (firstShape is null) root.Add(shapeType);
+    else firstShape.AddBeforeSelf(shapeType);
+}
+
+static int ParseCommentShapeId(string? identifier)
+{
+    var match = Regex.Match(identifier ?? "", @"^_x0000_s(?<id>\d+)$", RegexOptions.CultureInvariant);
+    return match.Success && Int32.TryParse(match.Groups["id"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var value) ? value : 0;
+}
+
+static void MoveExistingCommentShape(XElement shape, Comment comment, XNamespace x)
+{
+    var clientData = shape.Descendants(x + "ClientData").SingleOrDefault()
+        ?? throw new InvalidDataException("UNSUPPORTED_FEATURE: Note shape is missing ClientData");
+    var rowElement = clientData.Elements(x + "Row").SingleOrDefault();
+    var columnElement = clientData.Elements(x + "Column").SingleOrDefault();
+    if (rowElement is null || columnElement is null
+        || !Int32.TryParse(rowElement.Value.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var previousRow)
+        || !Int32.TryParse(columnElement.Value.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var previousColumn))
+        throw new InvalidDataException("UNSUPPORTED_FEATURE: Note shape coordinates cannot be safely interpreted");
+
+    var (row, column) = ZeroBasedCommentCoordinates(comment);
+    var anchor = clientData.Elements(x + "Anchor").SingleOrDefault();
+    if (anchor is null)
     {
-        var reference = comment.Reference?.Value ?? "A1";
-        var row = UInt32.Parse(new string(reference.Where(Char.IsDigit).ToArray())) - 1u;
-        var column = (uint)ColumnNumber(CellColumn(reference)) - 1u;
-        root.Add(new XElement(v + "shape", new XAttribute("id", $"_x0000_s{shapeId++}"), new XAttribute("type", "#_x0000_t202"), new XAttribute("style", "position:absolute;margin-left:80pt;margin-top:5pt;width:108pt;height:59pt;z-index:1;visibility:hidden"), new XAttribute("fillcolor", "#ffffe1"), new XAttribute(o + "insetmode", "auto"),
-            new XElement(v + "fill", new XAttribute("color2", "#ffffe1")), new XElement(v + "shadow", new XAttribute("on", "t"), new XAttribute("color", "black"), new XAttribute("obscured", "t")), new XElement(v + "path", new XAttribute(o + "connecttype", "none")),
-            new XElement(v + "textbox", new XAttribute("style", "mso-direction-alt:auto"), new XElement("div", new XAttribute("style", "text-align:left"))),
-            new XElement(x + "ClientData", new XAttribute("ObjectType", "Note"), new XElement(x + "MoveWithCells"), new XElement(x + "SizeWithCells"), new XElement(x + "Anchor", $"{column}, 15, {row}, 2, {column + 3}, 15, {row + 4}, 4"), new XElement(x + "AutoFill", "False"), new XElement(x + "Row", row), new XElement(x + "Column", column))));
+        anchor = new XElement(x + "Anchor", DefaultCommentAnchor(row, column));
+        columnElement.AddBeforeSelf(anchor);
     }
-    using var stream = new MemoryStream();
-    new XDocument(root).Save(stream, SaveOptions.DisableFormatting);
-    stream.Position = 0;
-    vmlPart.FeedData(stream);
+    else
+    {
+        var values = anchor.Value.Split(',').Select(item => item.Trim()).ToArray();
+        if (values.Length != 8 || values.Any(item => !Int32.TryParse(item, NumberStyles.Integer, CultureInfo.InvariantCulture, out _)))
+            throw new InvalidDataException("UNSUPPORTED_FEATURE: Note shape anchor cannot be safely interpreted");
+        var positions = values.Select(item => Int32.Parse(item, CultureInfo.InvariantCulture)).ToArray();
+        var columnDelta = checked(column - previousColumn);
+        var rowDelta = checked(row - previousRow);
+        var shiftedStartColumn = (long)positions[0] + columnDelta;
+        var shiftedEndColumn = (long)positions[4] + columnDelta;
+        var shiftedStartRow = (long)positions[2] + rowDelta;
+        var shiftedEndRow = (long)positions[6] + rowDelta;
+        if (shiftedStartColumn < 0 || shiftedStartColumn > Int32.MaxValue || shiftedEndColumn < 0 || shiftedEndColumn > Int32.MaxValue
+            || shiftedStartRow < 0 || shiftedStartRow > Int32.MaxValue || shiftedEndRow < 0 || shiftedEndRow > Int32.MaxValue)
+            throw new InvalidDataException("UNSUPPORTED_FEATURE: Note shape anchor would move outside the worksheet");
+        positions[0] = (int)shiftedStartColumn;
+        positions[4] = (int)shiftedEndColumn;
+        positions[2] = (int)shiftedStartRow;
+        positions[6] = (int)shiftedEndRow;
+        anchor.Value = String.Join(", ", positions.Select(item => item.ToString(CultureInfo.InvariantCulture)));
+    }
+    rowElement.Value = row.ToString(CultureInfo.InvariantCulture);
+    columnElement.Value = column.ToString(CultureInfo.InvariantCulture);
+}
+
+static XElement CreateDefaultCommentShape(Comment comment, int shapeId, XNamespace v, XNamespace o, XNamespace x)
+{
+    var (row, column) = ZeroBasedCommentCoordinates(comment);
+    return new XElement(v + "shape", new XAttribute("id", $"_x0000_s{shapeId}"), new XAttribute("type", "#_x0000_t202"), new XAttribute("style", "position:absolute;margin-left:80pt;margin-top:5pt;width:108pt;height:59pt;z-index:1;visibility:hidden"), new XAttribute("fillcolor", "#ffffe1"), new XAttribute(o + "insetmode", "auto"),
+        new XElement(v + "fill", new XAttribute("color2", "#ffffe1")), new XElement(v + "shadow", new XAttribute("on", "t"), new XAttribute("color", "black"), new XAttribute("obscured", "t")), new XElement(v + "path", new XAttribute(o + "connecttype", "none")),
+        new XElement(v + "textbox", new XAttribute("style", "mso-direction-alt:auto"), new XElement("div", new XAttribute("style", "text-align:left"))),
+        new XElement(x + "ClientData", new XAttribute("ObjectType", "Note"), new XElement(x + "MoveWithCells"), new XElement(x + "SizeWithCells"), new XElement(x + "Anchor", DefaultCommentAnchor(row, column)), new XElement(x + "AutoFill", "False"), new XElement(x + "Row", row), new XElement(x + "Column", column)));
+}
+
+static (int Row, int Column) ZeroBasedCommentCoordinates(Comment comment)
+{
+    var reference = comment.Reference?.Value ?? throw new InvalidDataException("comment reference is missing");
+    return (checked((int)UInt32.Parse(new string(reference.Where(Char.IsDigit).ToArray()), CultureInfo.InvariantCulture) - 1), ColumnNumber(CellColumn(reference)) - 1);
+}
+
+static string DefaultCommentAnchor(int row, int column)
+{
+    return $"{column}, 15, {row}, 2, {column + 3}, 15, {row + 4}, 4";
 }
 
 static WorksheetPart Worksheet(WorkbookPart workbookPart, string name)
