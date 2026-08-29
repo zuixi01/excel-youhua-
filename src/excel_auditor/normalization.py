@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from openpyxl.utils.datetime import from_excel
+
 from .models import ColumnRule, FieldType
 
 
@@ -135,6 +137,18 @@ def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
         raise ValueError(f"unsupported type: {rule.type}")
     except (ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
         return ParsedValue(value, None, False, str(exc))
+
+
+def parse_excel_value(value: Any, rule: ColumnRule, epoch: datetime) -> ParsedValue:
+    """Parse an Excel cell value, interpreting numeric date serials by workbook epoch."""
+    if rule.type not in {FieldType.DATE, FieldType.DATETIME} or isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return parse_value(value, rule)
+    try:
+        converted = from_excel(float(value), epoch=epoch)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return ParsedValue(value, None, False, f"invalid Excel date serial: {exc}")
+    parsed = parse_value(converted, rule)
+    return ParsedValue(value, parsed.normalized, parsed.valid, parsed.error)
 
 
 def _parse_date(value: Any, formats: list[str]) -> date:

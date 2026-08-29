@@ -20,7 +20,7 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, is_formula_text, parse_row_number, parse_value, values_equal
+from .normalization import ParsedValue, is_formula_text, parse_excel_value, parse_row_number, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
@@ -199,7 +199,16 @@ def compare_workbook(
         ):
             continue
         sheet_standard = standard.get(sheet_rule.id, standard.get(sheet_rule.name, []))
-        join_backend, record_storage, matched_count, validated_count = _compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary)
+        join_backend, record_storage, matched_count, validated_count = _compare_records(
+            actual_sheet_rule,
+            snapshot,
+            canonical_columns,
+            sheet_standard,
+            differences,
+            repairs,
+            summary,
+            workbook.excel_epoch,
+        )
         join_backends.append(join_backend)
         storage_backends.append(record_storage)
         matched_records_by_sheet[sheet_rule.id] = matched_count
@@ -292,7 +301,7 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
     return result
 
 
-def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str, int, int]:
+def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary, excel_epoch: Any) -> tuple[str, str, int, int]:
     rules_by_name = {column.name: column for column in sheet.columns}
     start_row = sheet.data_region.start_row or sheet.header.row + 1
     excel_records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
@@ -323,7 +332,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     render_action="mark_purple",
                 ))
             continue
-        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number)
+        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number, excel_epoch=excel_epoch)
         if not key_valid:
             if sheet.empty_primary_key_action == "skip_row":
                 continue
@@ -345,7 +354,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         for row_number in sorted(set(rows)):
             duplicate_action = "mark_row_purple" if sheet.actions.duplicate_key == "mark_purple" else "report_only"
             differences.append(_difference(DifferenceType.DUPLICATE_PRIMARY_KEY, sheet, "Excel 中主键重复，不参与自动匹配", excel_row=row_number, business_key=_business_key(key, sheet), render_action=duplicate_action))
-    _validate_excel_records(sheet, snapshot, columns, excel_records, rules_by_name, differences)
+    _validate_excel_records(sheet, snapshot, columns, excel_records, rules_by_name, differences, excel_epoch)
     join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
     if join_threshold < 1:
         raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
@@ -405,7 +414,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         differences.append(_difference(DifferenceType.EXTRA_RECORD, sheet, "仅 Excel 存在的记录", excel_row=row_number, business_key=_business_key(key, sheet), render_action=extra_action))
         for name, col_index in columns.items():
             rule = rules_by_name[name]
-            parsed = parse_value(record.get(name), rule)
+            parsed = parse_excel_value(record.get(name), rule, excel_epoch)
             if parsed.valid and parsed.normalized is None and rule.fill_static_default:
                 cell = f"{get_column_letter(col_index)}{row_number}"
                 difference = _difference(
@@ -561,7 +570,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 left_raw = snapshot.cached_values.get(cell)
             if (left_raw is None or left_raw == "") and (right_raw is None or right_raw == "") and not rule.fill_static_default:
                 continue
-            left = parse_value(left_raw, rule)
+            left = parse_excel_value(left_raw, rule, excel_epoch)
             right = parse_value(right_raw, rule)
             if not left.valid:
                 continue
@@ -638,7 +647,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
     )
 
 
-def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:
+def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference], excel_epoch: Any) -> None:
     unique_values: dict[str, dict[Any, list[tuple[int, tuple[Any, ...]]]]] = defaultdict(lambda: defaultdict(list))
     cross_fields = {
         value
@@ -665,7 +674,7 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
                 if name in cross_fields:
                     parsed_record[name] = ParsedValue(raw, None, True)
                 continue
-            parsed = parse_value(raw, rule)
+            parsed = parse_excel_value(raw, rule, excel_epoch)
             parsed_record[name] = parsed
             if not parsed.valid:
                 differences.append(_difference(DifferenceType.INVALID_VALUE, sheet, f"Excel 值无法按 {rule.type.value} 解析：{parsed.error}", cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), rule_id=f"{name}.parse", render_action=sheet.actions.invalid_value))
@@ -696,7 +705,7 @@ def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number
             differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, message, cell=f"{get_column_letter(columns[target])}{row_number}", excel_row=row_number, canonical_field=target, business_key=_business_key(key, sheet), rule_id=rule.rule_id, severity=rule.severity, render_action=sheet.actions.invalid_value))
 
 
-def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any], row_number: Any = None) -> tuple[tuple[Any, ...], bool]:
+def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any], row_number: Any = None, excel_epoch: Any = None) -> tuple[tuple[Any, ...], bool]:
     if sheet.primary_key_mode == "row_number":
         try:
             parsed_row = parse_row_number(row_number)
@@ -705,7 +714,11 @@ def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any]
         return (("row_number", parsed_row),), True
     values: list[Any] = []
     for name in sheet.primary_key:
-        parsed = parse_value(record.get(name), rules_by_name[name])
+        parsed = (
+            parse_excel_value(record.get(name), rules_by_name[name], excel_epoch)
+            if excel_epoch is not None
+            else parse_value(record.get(name), rules_by_name[name])
+        )
         if not parsed.valid or parsed.normalized is None or parsed.normalized == "":
             return tuple(values), False
         values.append((rules_by_name[name].type.value, parsed.normalized))

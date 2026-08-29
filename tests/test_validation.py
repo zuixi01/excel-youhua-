@@ -1,5 +1,8 @@
+from datetime import date, datetime
+
 import pytest
 from openpyxl import Workbook
+from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, to_excel
 
 from excel_auditor.engine import compare_workbook
 from excel_auditor.models import RuleSet
@@ -7,6 +10,42 @@ from excel_auditor.pandera_adapter import StandardDataValidator
 from excel_auditor.service import _field_statistics
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.workbook import inspect_workbook
+
+
+@pytest.mark.parametrize("epoch", [WINDOWS_EPOCH, MAC_EPOCH])
+def test_unformatted_excel_date_serials_use_the_workbook_epoch(tmp_path, epoch):
+    rules = RuleSet.model_validate({
+        "schema_id": "date-epoch", "schema_version": "1.0.0", "name": "Date epoch",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["day"],
+            "columns": [
+                {"name": "id", "title": "ID"},
+                {"name": "day", "title": "Day", "type": "date", "required": True},
+                {"name": "moment", "title": "Moment", "type": "datetime", "compare": {"mode": "datetime", "timezone": "UTC"}},
+            ],
+        }],
+    })
+    path = tmp_path / f"date-epoch-{epoch.year}.xlsx"
+    expected_day = date(2024, 1, 15)
+    expected_moment = datetime(2024, 1, 15, 12, 30)
+    book = Workbook()
+    book.epoch = epoch
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Day", "Moment"])
+    sheet.append(["E1", to_excel(expected_day, epoch), to_excel(expected_moment, epoch)])
+    sheet["B2"].number_format = "General"
+    sheet["C2"].number_format = "General"
+    book.save(path)
+
+    snapshot = inspect_workbook(path, rules)
+    assert snapshot.excel_epoch == epoch
+    result = compare_workbook(snapshot, {"data": [{
+        "id": "E1", "day": "2024-01-15", "moment": "2024-01-15T12:30:00Z",
+    }]}, rules)
+    assert result.summary.matched_records == 1
+    assert result.summary.differences == 0
+    snapshot.close()
 
 
 def test_non_default_sheet_actions_are_honored(tmp_path):

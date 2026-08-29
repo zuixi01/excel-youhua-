@@ -6,12 +6,14 @@ import re
 import tempfile
 import zipfile
 from array import array
+from datetime import datetime
 from xml.parsers import expat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, overload
 
 from openpyxl import load_workbook
+from openpyxl.utils.datetime import WINDOWS_EPOCH
 
 from .models import RuleSet, SheetRule, normalize_header
 
@@ -99,6 +101,7 @@ class WorkbookSnapshot:
     manual_review_reasons: list[str] = field(default_factory=list)
     large_mode: bool = False
     report_only: bool = False
+    excel_epoch: datetime = WINDOWS_EPOCH
 
     def close(self) -> None:
         for sheet in self.sheets.values():
@@ -318,6 +321,7 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             for feature in risky
             if feature in UNSUPPORTED_SHEET_FEATURES
         )
+    excel_epoch = book.epoch
     book.close()
     if cached_value_requests:
         cached_book = load_workbook(path, read_only=True, data_only=True, keep_links=False, keep_vba=path.suffix.lower() == ".xlsm")
@@ -339,7 +343,16 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         cached_book.close()
     if large_mode:
         warnings.append("workbook: large_file_report_only")
-    return WorkbookSnapshot(path, sha256_file(path), snapshots, warnings, manual_review_reasons, large_mode, large_mode)
+    return WorkbookSnapshot(
+        path,
+        sha256_file(path),
+        snapshots,
+        warnings,
+        manual_review_reasons,
+        large_mode,
+        large_mode,
+        excel_epoch,
+    )
 
 
 def sheet_rule_for_name(rules: RuleSet, name: str) -> Any:
