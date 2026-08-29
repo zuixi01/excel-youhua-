@@ -22,7 +22,7 @@
 | 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试；标准记录省略可选字段不会清空 Excel，显式空值才进入授权覆盖 | 业务方修复策略签署 |
 | 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言 | 客户端下载抽验 |
 | 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `e66788d` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 及 JUnit 制品已通过；Excel COM 自动打开/另存、关键宏部件哈希和独立人工签核工具已就绪 | Microsoft Excel 桌面实际运行及人工验收记录 |
-| 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试 | 生产审计抽样 |
+| 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试；最终 JSON 与 Excel 内嵌修复状态逐项一致，隐藏元数据锁定规则/输入/标准哈希及结果内容哈希 | 生产审计抽样 |
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
 | 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；当前本地生产 Renderer 完整回归 `228 passed, 8 skipped`；提交 `b3c04e9` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；9 组表头与 2 组记录/字段/修复人工标注 precision/recall 基准，阈值均为 99% | 本轮核心精度补强的远端 CI；业务标注基准 |
 | 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `e66788d` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |

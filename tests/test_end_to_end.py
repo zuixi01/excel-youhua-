@@ -486,10 +486,28 @@ def test_explicit_auto_repairs_are_applied_and_public_manifest_is_redacted(tmp_p
     assert int(embedded_summary["repairs_planned"]) == 5
     assert int(embedded_summary["repairs_applied"]) == 5
     assert int(embedded_summary["repair_failures"]) == 0
+    embedded_repair_statuses = sorted(
+        row[12]
+        for row in rendered["核验报告"].iter_rows(values_only=True)
+        if len(row) > 12 and row[12] in {"not_requested", "planned", "applied", "failed"}
+    )
+    metadata = {
+        str(row[0]): str(row[1])
+        for row in rendered["__ExcelAuditorMetadata"].iter_rows(min_row=2, values_only=True)
+        if row[0]
+    }
     rendered.close()
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
     repaired = [item for item in report["differences"] if item["repair_status"] == "applied"]
     assert len(repaired) == 5
+    assert embedded_repair_statuses == sorted(item["repair_status"] for item in report["differences"])
+    assert metadata["schema_id"] == report["schema_id"]
+    assert metadata["schema_version"] == report["schema_version"]
+    assert metadata["schema_sha256"] == report["schema_sha256"]
+    assert metadata["standard_snapshot_id"] == report["standard_snapshot_id"]
+    assert metadata["standard_sha256"] == report["standard_sha256"]
+    assert metadata["input_sha256"] == report["input_sha256"]
+    assert len(metadata["result_content_sha256"]) == 64
     public_manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
     serialized = json.dumps(public_manifest, ensure_ascii=False)
     assert "SAFE_TEXT" not in serialized and '"value"' not in serialized
