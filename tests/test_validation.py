@@ -4,6 +4,7 @@ from openpyxl import Workbook
 from excel_auditor.engine import compare_workbook
 from excel_auditor.models import RuleSet
 from excel_auditor.pandera_adapter import StandardDataValidator
+from excel_auditor.service import _field_statistics
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.workbook import inspect_workbook
 
@@ -229,3 +230,51 @@ def test_standard_validation_is_chunked_and_checks_uniqueness_across_chunks():
             StandardDataValidator(chunk_size=2).validate({"data": rows}, rules)
     finally:
         rows.close()
+
+
+def test_field_statistics_use_per_sheet_and_per_issue_denominators(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "field-statistics", "schema_version": "1.0.0", "name": "Field statistics",
+        "sheets": [
+            {"id": "a", "name": "A", "primary_key": ["id"], "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value", "type": "integer"},
+            ]},
+            {"id": "b", "name": "B", "primary_key": ["id"], "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value", "type": "integer"},
+            ]},
+        ],
+    })
+    path = tmp_path / "field-statistics.xlsx"
+    book = Workbook()
+    first = book.active
+    first.title = "A"
+    first.append(["ID", "Value"])
+    first.append(["A1", 1])
+    first.append(["A2", "bad"])
+    second = book.create_sheet("B")
+    second.append(["ID", "Value"])
+    for index in range(1, 4):
+        second.append([f"B{index}", index])
+    book.save(path)
+    standard = {
+        "a": [{"id": "A1", "value": 2}],
+        "b": [{"id": f"B{index}", "value": index} for index in range(1, 4)],
+    }
+
+    result = compare_workbook(inspect_workbook(path, rules), standard, rules)
+    statistics = _field_statistics(result)
+
+    assert result.summary.matched_records == 4
+    assert statistics["a.value"] == {
+        "sheet_id": "a", "canonical_field": "value",
+        "compared_records": 1, "difference_count": 1, "difference_rate": 1.0,
+        "validated_records": 2, "validation_error_count": 1, "validation_error_rate": 0.5,
+    }
+    assert statistics["b.value"]["compared_records"] == 3
+    assert statistics["b.value"]["difference_count"] == 0
+    assert statistics["b.value"]["difference_rate"] == 0.0
+    assert statistics["b.value"]["validation_error_rate"] == 0.0
+    result.report_only = True
+    assert _field_statistics(result) == statistics

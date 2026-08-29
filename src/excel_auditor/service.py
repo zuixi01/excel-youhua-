@@ -552,14 +552,34 @@ def _sha256(path: Path) -> str:
 def _field_statistics(comparison: Any) -> dict[str, dict[str, Any]]:
     if comparison.report_only:
         return _field_statistics_on_disk(comparison)
-    affected: dict[str, set[tuple[str, int | None]]] = {}
+    fields = {
+        (mapping.sheet_id, mapping.canonical_field)
+        for mapping in comparison.mappings
+        if mapping.status == "matched" and mapping.canonical_field
+    }
+    mismatches: dict[tuple[str, str], set[int]] = {}
+    validation_errors: dict[tuple[str, str], set[int]] = {}
     for item in comparison.differences:
-        if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
-            affected.setdefault(item.canonical_field, set()).add((item.sheet_id, item.excel_row))
-    denominator = comparison.summary.matched_records
+        if not item.canonical_field or item.excel_row is None:
+            continue
+        key = (item.sheet_id, item.canonical_field)
+        fields.add(key)
+        if item.type.value == "VALUE_MISMATCH":
+            mismatches.setdefault(key, set()).add(item.excel_row)
+        elif item.type.value in {"INVALID_VALUE", "VALIDATION_ERROR"}:
+            validation_errors.setdefault(key, set()).add(item.excel_row)
+    matched_by_sheet = comparison.matched_records_by_sheet or {}
+    validated_by_sheet = comparison.validated_records_by_sheet or {}
     return {
-        name: {"difference_count": len(rows), "difference_rate": (min(1.0, len(rows) / denominator) if denominator else None)}
-        for name, rows in sorted(affected.items())
+        f"{sheet_id}.{name}": _field_statistic(
+            sheet_id,
+            name,
+            len(mismatches.get((sheet_id, name), set())),
+            len(validation_errors.get((sheet_id, name), set())),
+            matched_by_sheet,
+            validated_by_sheet,
+        )
+        for sheet_id, name in sorted(fields)
     }
 
 
@@ -571,29 +591,64 @@ def _field_statistics_on_disk(comparison: Any) -> dict[str, dict[str, Any]]:
     try:
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA synchronous=OFF")
-        connection.execute(
-            "CREATE TABLE affected (field TEXT NOT NULL, sheet_id TEXT NOT NULL, excel_row INTEGER, UNIQUE(field, sheet_id, excel_row))"
-        )
-        batch: list[tuple[str, str, int | None]] = []
+        connection.execute("CREATE TABLE affected (sheet_id TEXT NOT NULL, field TEXT NOT NULL, kind TEXT NOT NULL, excel_row INTEGER NOT NULL, UNIQUE(sheet_id, field, kind, excel_row))")
+        batch: list[tuple[str, str, str, int]] = []
         for item in comparison.differences:
-            if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
-                batch.append((item.canonical_field, item.sheet_id, item.excel_row))
+            kind = "difference" if item.type.value == "VALUE_MISMATCH" else "validation" if item.type.value in {"INVALID_VALUE", "VALIDATION_ERROR"} else None
+            if item.canonical_field and item.excel_row is not None and kind:
+                batch.append((item.sheet_id, item.canonical_field, kind, item.excel_row))
                 if len(batch) >= 1_000:
-                    connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
+                    connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?, ?)", batch)
                     batch.clear()
         if batch:
-            connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
-        denominator = comparison.summary.matched_records
+            connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?, ?)", batch)
+        counts = {
+            (str(sheet_id), str(field), str(kind)): int(count)
+            for sheet_id, field, kind, count in connection.execute("SELECT sheet_id, field, kind, COUNT(*) FROM affected GROUP BY sheet_id, field, kind")
+        }
+        fields = {
+            (mapping.sheet_id, mapping.canonical_field)
+            for mapping in comparison.mappings
+            if mapping.status == "matched" and mapping.canonical_field
+        } | {(sheet_id, field) for sheet_id, field, _kind in counts}
+        matched_by_sheet = comparison.matched_records_by_sheet or {}
+        validated_by_sheet = comparison.validated_records_by_sheet or {}
         return {
-            str(name): {
-                "difference_count": int(count),
-                "difference_rate": (min(1.0, int(count) / denominator) if denominator else None),
-            }
-            for name, count in connection.execute("SELECT field, COUNT(*) FROM affected GROUP BY field ORDER BY field")
+            f"{sheet_id}.{field}": _field_statistic(
+                sheet_id,
+                field,
+                counts.get((sheet_id, field, "difference"), 0),
+                counts.get((sheet_id, field, "validation"), 0),
+                matched_by_sheet,
+                validated_by_sheet,
+            )
+            for sheet_id, field in sorted(fields)
         }
     finally:
         connection.close()
         path.unlink(missing_ok=True)
+
+
+def _field_statistic(
+    sheet_id: str,
+    field: str,
+    difference_count: int,
+    validation_error_count: int,
+    matched_by_sheet: dict[str, int],
+    validated_by_sheet: dict[str, int],
+) -> dict[str, Any]:
+    matched = matched_by_sheet.get(sheet_id, 0)
+    validated = validated_by_sheet.get(sheet_id, 0)
+    return {
+        "sheet_id": sheet_id,
+        "canonical_field": field,
+        "compared_records": matched,
+        "difference_count": difference_count,
+        "difference_rate": difference_count / matched if matched else None,
+        "validated_records": validated,
+        "validation_error_count": validation_error_count,
+        "validation_error_rate": validation_error_count / validated if validated else None,
+    }
 
 
 def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str, Sequence[dict[str, Any]]]:

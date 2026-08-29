@@ -39,6 +39,8 @@ class ComparisonResult:
     join_backends: list[str] | None = None
     report_only: bool = False
     storage_backends: list[str] | None = None
+    matched_records_by_sheet: dict[str, int] | None = None
+    validated_records_by_sheet: dict[str, int] | None = None
 
     def close(self) -> None:
         for sequence in (self.differences, self.repairs):
@@ -146,6 +148,8 @@ def compare_workbook(
     manual_review_reasons: list[str] = []
     join_backends: list[str] = []
     storage_backends: list[str] = []
+    matched_records_by_sheet: dict[str, int] = {}
+    validated_records_by_sheet: dict[str, int] = {}
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
         matching_names = [name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets]
@@ -185,9 +189,11 @@ def compare_workbook(
         ):
             continue
         sheet_standard = standard.get(sheet_rule.id, standard.get(sheet_rule.name, []))
-        join_backend, record_storage = _compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary)
+        join_backend, record_storage, matched_count, validated_count = _compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary)
         join_backends.append(join_backend)
         storage_backends.append(record_storage)
+        matched_records_by_sheet[sheet_rule.id] = matched_count
+        validated_records_by_sheet[sheet_rule.id] = validated_count
     for extra_name in set(workbook.sheets) - consumed_sheets:
         pseudo = rules.sheets[0]
         differences.append(_difference(DifferenceType.EXTRA_SHEET, pseudo, f"存在规则未声明的工作表：{extra_name}", sheet_name=extra_name, severity="warning"))
@@ -220,6 +226,8 @@ def compare_workbook(
         join_backends,
         report_only=spilled,
         storage_backends=sorted(set(storage_backends)),
+        matched_records_by_sheet=matched_records_by_sheet,
+        validated_records_by_sheet=validated_records_by_sheet,
     )
 
 
@@ -294,7 +302,7 @@ def _locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, 
     return best_rows[0], None
 
 
-def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str]:
+def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str, int, int]:
     rules_by_name = {column.name: column for column in sheet.columns}
     start_row = sheet.data_region.start_row or sheet.header.row + 1
     excel_records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
@@ -598,7 +606,12 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     if isinstance(standard_records, DiskBackedRecordMap):
         standard_records.close()
-    return join_backend, "disk_standard_records" if use_disk_records else "memory_standard_records"
+    return (
+        join_backend,
+        "disk_standard_records" if use_disk_records else "memory_standard_records",
+        len(matched_keys),
+        len(excel_records),
+    )
 
 
 def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:
