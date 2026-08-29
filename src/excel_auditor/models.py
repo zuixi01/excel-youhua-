@@ -144,9 +144,9 @@ class RegexReplacement(StrictModel):
 
 
 class ColumnRule(StrictModel):
-    name: str
-    title: str
-    aliases: list[str] = Field(default_factory=list)
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+    title: str = Field(min_length=1, max_length=255)
+    aliases: list[str] = Field(default_factory=list, max_length=128)
     required: bool = False
     type: FieldType = FieldType.STRING
     normalize: list[str] = Field(default_factory=list)
@@ -161,11 +161,31 @@ class ColumnRule(StrictModel):
     parse_formats: list[str] = Field(default_factory=list)
     format: str | None = None
     formula_template: str | None = None
-    separator: str = ","
+    separator: str = Field(default=",", min_length=1, max_length=16)
     missing_column_action: Literal["insert", "report_only"] | None = None
     fill_static_default: bool = False
     static_default: Any = None
     sensitive: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def non_empty_header_title(cls, value: str) -> str:
+        if not normalize_header(value):
+            raise ValueError("column title must not be blank after normalization")
+        return value
+
+    @field_validator("aliases")
+    @classmethod
+    def valid_header_aliases(cls, values: list[str]) -> list[str]:
+        normalized: set[str] = set()
+        for value in values:
+            if len(value) > 255 or not normalize_header(value):
+                raise ValueError("column alias must be a non-blank header no longer than 255 characters")
+            key = normalize_header(value)
+            if key in normalized:
+                raise ValueError(f"duplicate normalized column alias: {value!r}")
+            normalized.add(key)
+        return values
 
     @model_validator(mode="after")
     def validate_field(self) -> "ColumnRule":
@@ -193,6 +213,26 @@ class ColumnRule(StrictModel):
             FieldType.STRING, FieldType.PHONE, FieldType.ID_CODE, FieldType.POSTAL_CODE, FieldType.FUZZY_STRING
         }:
             raise ValueError(f"string aliases and regex replacements are incompatible with {self.type.value}")
+        if self.value_aliases:
+            from .normalization import apply_normalizers
+
+            def before_value_alias(value: str) -> str:
+                normalized = apply_normalizers(value, self.normalize)
+                text = str(normalized)
+                for replacement in self.regex_replacements:
+                    flags = re.IGNORECASE if replacement.ignore_case else 0
+                    text = re.sub(replacement.pattern, replacement.replacement, text, flags=flags)
+                return text
+
+            for alias, target in self.value_aliases.items():
+                if before_value_alias(alias) != alias:
+                    raise ValueError(
+                        f"value alias {alias!r} for {self.name!r} is unreachable after normalization"
+                    )
+                if before_value_alias(target) != target:
+                    raise ValueError(
+                        f"value alias target {target!r} for {self.name!r} is not a stable normalized value"
+                    )
         compatible_modes = {
             FieldType.STRING: {"exact", "ignore_case"},
             FieldType.PHONE: {"exact", "ignore_case"},
@@ -226,6 +266,19 @@ class ColumnRule(StrictModel):
                 canonical = canonical_by_fold.get(alias.casefold())
                 if canonical is not None and canonical != target:
                     raise ValueError(f"enum aliases for {self.name!r} remap canonical values under ignore_case")
+        if self.type == FieldType.ENUM and self.normalize:
+            from .normalization import apply_normalizers
+
+            def enum_key(value: str) -> str:
+                normalized = str(apply_normalizers(value, self.normalize))
+                return normalized.casefold() if self.compare.mode == "ignore_case" else normalized
+
+            configured_key = (lambda value: value.casefold()) if self.compare.mode == "ignore_case" else (lambda value: value)
+            for value in [*self.enum_values, *self.enum_aliases]:
+                if enum_key(value) != configured_key(value):
+                    raise ValueError(
+                        f"enum value or alias {value!r} for {self.name!r} is unreachable after normalization"
+                    )
         numeric = self.type in {FieldType.INTEGER, FieldType.DECIMAL}
         if (self.validation.min is not None or self.validation.max is not None) and not numeric:
             raise ValueError(f"numeric validation bounds are incompatible with {self.type.value}")
@@ -244,6 +297,8 @@ class ColumnRule(StrictModel):
             raise ValueError(f"allow_naive_datetime is incompatible with {self.type.value}")
         if self.parse_formats and self.type not in {FieldType.DATE, FieldType.DATETIME}:
             raise ValueError(f"parse_formats are incompatible with {self.type.value}")
+        if self.type != FieldType.SET and self.separator != ",":
+            raise ValueError(f"separator is incompatible with {self.type.value}")
         if self.fill_static_default and self.static_default is None:
             raise ValueError(f"field {self.name!r} enables fill_static_default without static_default")
         if self.fill_static_default:
@@ -355,6 +410,10 @@ class SheetRule(StrictModel):
 
     @model_validator(mode="after")
     def validate_sheet(self) -> "SheetRule":
+        physical_names = [self.name, *self.aliases]
+        folded_physical_names = [name.casefold() for name in physical_names]
+        if len(folded_physical_names) != len(set(folded_physical_names)):
+            raise ValueError(f"worksheet {self.id!r} repeats its name or an alias")
         names = [column.name for column in self.columns]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate canonical column in sheet {self.id!r}")

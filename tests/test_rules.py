@@ -129,6 +129,61 @@ def test_unsafe_schema_id_and_cross_sheet_alias_collision_are_rejected():
         RuleSet.model_validate(payload)
 
 
+def test_rule_rejects_ambiguous_or_runtime_invalid_names_and_separators():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["aliases"] = [payload["sheets"][0]["name"]]
+    with pytest.raises(ValidationError, match="repeats its name or an alias"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][0]["name"] = "../employee"
+    with pytest.raises(ValidationError, match="columns.0.name"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["title"] = " \u3000 "
+    with pytest.raises(ValidationError, match="title must not be blank"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["aliases"] = ["员工 姓名", "员工\u3000姓名"]
+    with pytest.raises(ValidationError, match="duplicate normalized column alias"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["separator"] = ";"
+    with pytest.raises(ValidationError, match="separator is incompatible with string"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1].update({"type": "set", "compare": {"mode": "set"}, "separator": ""})
+    with pytest.raises(ValidationError, match="separator"):
+        RuleSet.model_validate(payload)
+
+
+def test_rule_rejects_aliases_and_enum_values_unreachable_after_normalization():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    name = payload["sheets"][0]["columns"][1]
+    name.update({"normalize": ["uppercase"], "value_aliases": {"n/a": "N/A"}})
+    with pytest.raises(ValidationError, match="value alias.*unreachable after normalization"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    name = payload["sheets"][0]["columns"][1]
+    name.update({"normalize": ["trim"], "value_aliases": {"N/A": " canonical "}})
+    with pytest.raises(ValidationError, match="target.*not a stable normalized value"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    department = payload["sheets"][0]["columns"][4]
+    department.update({"normalize": ["uppercase"], "enum_values": ["Active"], "enum_aliases": {}})
+    with pytest.raises(ValidationError, match="enum value.*unreachable after normalization"):
+        RuleSet.model_validate(payload)
+
+    department["compare"] = {"mode": "ignore_case"}
+    assert RuleSet.model_validate(payload).sheets[0].columns[4].enum_values == ["Active"]
+
+
 def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["columns"][2]["compare"]["absolute_tolerance"] = 0.1
