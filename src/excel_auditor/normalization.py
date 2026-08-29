@@ -211,6 +211,21 @@ def _localize_naive_datetime(value: datetime, target: ZoneInfo) -> datetime:
     return candidates[0]
 
 
+def excel_datetime_write_safe(value: datetime, timezone_name: str | None) -> bool:
+    """Return whether an Excel serial can preserve this normalized datetime's instant."""
+    if value.tzinfo is None:
+        return timezone_name is None
+    if timezone_name is None:
+        return True
+    target = ZoneInfo(timezone_name)
+    local_value = value.astimezone(target)
+    try:
+        restored = _localize_naive_datetime(local_value.replace(tzinfo=None), target)
+    except ValueError:
+        return False
+    return restored.astimezone(timezone.utc) == value.astimezone(timezone.utc)
+
+
 def _to_python_format(value: str) -> str:
     tokens = {"yyyy": "%Y", "MM": "%m", "dd": "%d", "HH": "%H", "mm": "%M", "ss": "%S", "M": "%m", "d": "%d"}
     pattern = re.compile("|".join(sorted(tokens, key=len, reverse=True)))

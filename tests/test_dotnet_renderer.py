@@ -725,6 +725,111 @@ def test_service_blocks_lossy_numeric_repairs_but_writes_safe_values(tmp_path):
     rendered.close()
 
 
+def test_service_blocks_lossy_dst_repairs_but_writes_unambiguous_datetimes(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    rules = RuleSet.model_validate({
+        "schema_id": "datetime-write-safety", "schema_version": "1.0.0", "name": "Datetime write safety",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {
+                "overwrite_mismatch": True,
+                "fill_empty_from_standard": True,
+                "missing_record": "append_and_mark_green",
+            },
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "event_at", "title": "Event", "type": "datetime",
+                    "compare": {"mode": "datetime", "timezone": "America/New_York"},
+                },
+            ],
+        }],
+    })
+
+    def run_case(name, rows, standard_rows, case_rules=rules):
+        source, standard = tmp_path / f"{name}.xlsx", tmp_path / f"{name}.json"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Data"
+        sheet.append(["ID", "Event"])
+        for row in rows:
+            sheet.append(row)
+        book.save(source)
+        standard.write_text(json.dumps({"data": standard_rows}), encoding="utf-8")
+        service = AuditService(tmp_path / f"{name}-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+        job_id = service.create_job()
+        service.run(job_id, source, standard, case_rules)
+        return service, job_id
+
+    ambiguous = "2024-11-03T01:30:00-04:00"
+    for name, rows in (
+        ("dst-overwrite", [["E1", "2024-11-03T00:30:00-04:00"]]),
+        ("dst-fill-empty", [["E1", None]]),
+    ):
+        blocked_service, blocked_job = run_case(name, rows, [{"id": "E1", "event_at": ambiguous}])
+        blocked_status = blocked_service.status(blocked_job)
+        assert blocked_status["status"] == "manual_review", blocked_status
+        assert blocked_status["summary"]["repairs_planned"] == 0
+        assert "excel" not in blocked_status["artifacts"]
+        blocked_report = json.loads(blocked_service.artifact(blocked_job, "json").read_text(encoding="utf-8"))
+        assert any(item["rule_id"] == "event_at.excel_write_timezone" for item in blocked_report["differences"])
+
+    append_service, append_job = run_case(
+        "dst-append",
+        [],
+        [{"id": "E2", "event_at": "2024-11-03T01:30:00-05:00"}],
+    )
+    append_status = append_service.status(append_job)
+    assert append_status["status"] == "manual_review", append_status
+    assert append_status["summary"]["repairs_planned"] == 0
+    append_report = json.loads(append_service.artifact(append_job, "json").read_text(encoding="utf-8"))
+    append_rule_ids = {item["rule_id"] for item in append_report["differences"]}
+    assert "event_at.excel_write_timezone" in append_rule_ids
+    assert "missing_record.datetime_write_blocked" in append_rule_ids
+
+    default_rules = RuleSet.model_validate({
+        "schema_id": "datetime-default-safety", "schema_version": "1.0.0", "name": "Datetime default safety",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "event_at", "title": "Event", "type": "datetime",
+                    "compare": {"mode": "datetime", "timezone": "America/New_York"},
+                    "fill_static_default": True,
+                    "static_default": ambiguous,
+                },
+            ],
+        }],
+    })
+    default_service, default_job = run_case(
+        "dst-default",
+        [["E1", None]],
+        [{"id": "E1"}],
+        default_rules,
+    )
+    default_status = default_service.status(default_job)
+    assert default_status["status"] == "manual_review", default_status
+    default_report = json.loads(default_service.artifact(default_job, "json").read_text(encoding="utf-8"))
+    assert any(item["rule_id"] == "event_at.excel_write_timezone" for item in default_report["differences"])
+
+    safe_service, safe_job = run_case(
+        "dst-safe",
+        [["E1", "2024-11-03T00:30:00-04:00"]],
+        [{"id": "E1", "event_at": "2024-11-03T03:30:00-05:00"}],
+    )
+    safe_status = safe_service.status(safe_job)
+    assert safe_status["status"] == "completed", safe_status
+    assert safe_status["summary"]["repairs_applied"] == 1
+    rendered = load_workbook(safe_service.artifact(safe_job, "excel"), data_only=False)
+    written = rendered["Data"]["B2"]
+    assert written.value == datetime(2024, 11, 3, 3, 30)
+    assert written.data_type == "d"
+    rendered.close()
+
+
 def test_service_renames_numeric_column_alias_as_a_string_header(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:

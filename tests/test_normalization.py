@@ -3,7 +3,7 @@ from decimal import Decimal
 from datetime import date
 
 from excel_auditor.models import ColumnRule
-from excel_auditor.normalization import parse_value, values_equal
+from excel_auditor.normalization import excel_datetime_write_safe, parse_value, values_equal
 
 
 def test_decimal_tolerance_boundary():
@@ -77,6 +77,9 @@ def test_datetime_rejects_ambiguous_and_nonexistent_dst_local_times_without_offs
     assert summer_occurrence.valid and winter_occurrence.valid and normal.valid
     assert not values_equal(summer_occurrence, winter_occurrence, rule)
     assert values_equal(summer_occurrence, parse_value("2024-11-03T05:30:00Z", rule), rule)
+    assert not excel_datetime_write_safe(summer_occurrence.normalized, "America/New_York")
+    assert not excel_datetime_write_safe(winter_occurrence.normalized, "America/New_York")
+    assert excel_datetime_write_safe(normal.normalized, "America/New_York")
 
     day_rule = rule.model_copy(update={"compare": rule.compare.model_copy(update={"precision": "day"})})
     assert values_equal(
