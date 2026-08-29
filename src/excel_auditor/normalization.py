@@ -188,12 +188,27 @@ def _parse_datetime(value: Any, formats: list[str], timezone_name: str | None, a
     target = ZoneInfo(timezone_name) if timezone_name else None
     if parsed.tzinfo is None:
         if target is not None:
-            parsed = parsed.replace(tzinfo=target)
+            parsed = _localize_naive_datetime(parsed, target)
         elif not allow_naive:
             raise ValueError("naive datetime requires compare.timezone or allow_naive_datetime=true")
         else:
             return parsed
     return parsed.astimezone(target or timezone.utc)
+
+
+def _localize_naive_datetime(value: datetime, target: ZoneInfo) -> datetime:
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = value.replace(tzinfo=target, fold=fold)
+        round_trip = candidate.astimezone(timezone.utc).astimezone(target).replace(tzinfo=None)
+        if round_trip == value:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError(f"nonexistent local datetime in timezone {target.key}; include an explicit UTC offset")
+    offsets = {candidate.utcoffset() for candidate in candidates}
+    if len(offsets) > 1:
+        raise ValueError(f"ambiguous local datetime in timezone {target.key}; include an explicit UTC offset")
+    return candidates[0]
 
 
 def _to_python_format(value: str) -> str:
@@ -237,7 +252,9 @@ def _truncate_datetime(value: datetime, precision: str) -> datetime | date:
     if precision == "day":
         return value.date()
     if precision == "hour":
-        return value.replace(minute=0, second=0, microsecond=0)
-    if precision == "minute":
-        return value.replace(second=0, microsecond=0)
-    return value.replace(microsecond=0)
+        truncated = value.replace(minute=0, second=0, microsecond=0)
+    elif precision == "minute":
+        truncated = value.replace(second=0, microsecond=0)
+    else:
+        truncated = value.replace(microsecond=0)
+    return truncated.astimezone(timezone.utc) if truncated.tzinfo is not None else truncated

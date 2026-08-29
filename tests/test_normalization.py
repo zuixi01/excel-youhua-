@@ -60,6 +60,32 @@ def test_datetime_timezone_and_precision_are_applied():
     assert not parse_value("2026-08-28T10:30:00", naive).valid
 
 
+def test_datetime_rejects_ambiguous_and_nonexistent_dst_local_times_without_offset():
+    rule = ColumnRule.model_validate({
+        "name": "event_at", "title": "Time", "type": "datetime",
+        "compare": {"mode": "datetime", "timezone": "America/New_York"},
+    })
+
+    nonexistent = parse_value("2024-03-10T02:30:00", rule)
+    ambiguous = parse_value("2024-11-03T01:30:00", rule)
+    assert not nonexistent.valid and "nonexistent local datetime" in (nonexistent.error or "")
+    assert not ambiguous.valid and "ambiguous local datetime" in (ambiguous.error or "")
+
+    summer_occurrence = parse_value("2024-11-03T01:30:00-04:00", rule)
+    winter_occurrence = parse_value("2024-11-03T01:30:00-05:00", rule)
+    normal = parse_value("2024-11-03T03:30:00", rule)
+    assert summer_occurrence.valid and winter_occurrence.valid and normal.valid
+    assert not values_equal(summer_occurrence, winter_occurrence, rule)
+    assert values_equal(summer_occurrence, parse_value("2024-11-03T05:30:00Z", rule), rule)
+
+    day_rule = rule.model_copy(update={"compare": rule.compare.model_copy(update={"precision": "day"})})
+    assert values_equal(
+        parse_value("2024-11-03T01:30:00-04:00", day_rule),
+        parse_value("2024-11-03T01:30:00-05:00", day_rule),
+        day_rule,
+    )
+
+
 def test_boolean_aliases_are_explicit_and_disjoint():
     rule = ColumnRule.model_validate({"name": "enabled", "title": "启用", "type": "boolean", "boolean_true_values": ["启用"], "boolean_false_values": ["停用"]})
     assert parse_value("启用", rule).normalized is True
