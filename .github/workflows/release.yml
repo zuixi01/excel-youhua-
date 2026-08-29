@@ -1,6 +1,11 @@
 name: release-images
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v-prefixed semantic-version tag that resolves to the selected ref
+        required: true
+        type: string
   push:
     tags: ["v*"]
 
@@ -10,16 +15,41 @@ permissions:
   actions: read
 
 jobs:
+  release-identity:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate immutable release identity
+        id: identity
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            RELEASE_TAG="$INPUT_RELEASE_TAG"
+          else
+            RELEASE_TAG="$REF_NAME"
+          fi
+          echo "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   tests:
+    needs: release-identity
     uses: ./.github/workflows/ci.yml
 
   performance:
+    needs: release-identity
     uses: ./.github/workflows/performance.yml
     with:
       require_reference: true
 
   images:
-    needs: [tests, performance]
+    needs: [release-identity, tests, performance]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -87,6 +117,8 @@ jobs:
           docker push ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}
           docker push ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
       - name: Record immutable release and rollback targets
+        env:
+          RELEASE_TAG: ${{ needs.release-identity.outputs.release_tag }}
         run: |
           API_REF="ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}"
           WEB_REF="ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}"
@@ -95,15 +127,21 @@ jobs:
           test "${#API_DIGEST}" -eq 71 && test "${API_DIGEST#sha256:}" != "$API_DIGEST"
           test "${#WEB_DIGEST}" -eq 71 && test "${WEB_DIGEST#sha256:}" != "$WEB_DIGEST"
           jq -n \
+            --arg manifest_version "1.0" \
+            --arg release_tag "$RELEASE_TAG" \
             --arg git_sha "${{ github.sha }}" \
             --arg run_id "${{ github.run_id }}" \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg api "$API_REF@$API_DIGEST" \
             --arg web "$WEB_REF@$WEB_DIGEST" \
             --arg api_sbom "excel-auditor-api-${{ github.sha }}.spdx.json" \
             --arg web_sbom "excel-auditor-web-${{ github.sha }}.spdx.json" \
-            '{git_sha:$git_sha, workflow_run_id:$run_id, images:{api:$api,web:$web}, sboms:{api:$api_sbom,web:$web_sbom}, rollback:"restore IMAGE_TAG or image digest recorded before deployment, then run docker compose pull && docker compose up -d --remove-orphans"}' \
+            '{manifest_version:$manifest_version,release_tag:$release_tag,git_sha:$git_sha,workflow_run_id:$run_id,generated_at:$generated_at,images:{api:$api,web:$web},sboms:{api:$api_sbom,web:$web_sbom},deployment:{compose_file:"deploy/docker-compose.prod.yaml",environment_file:"release.env"}}' \
             > release-manifest.json
+          PYTHONPATH=src python -m excel_auditor.release_manifest release-manifest.json --env-output release.env
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-manifest-${{ github.sha }}
-          path: release-manifest.json
+          path: |
+            release-manifest.json
+            release.env

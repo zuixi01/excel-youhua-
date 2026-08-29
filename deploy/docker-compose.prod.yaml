@@ -1,7 +1,7 @@
 name: excel-auditor
 services:
   api:
-    image: ${REGISTRY:?set REGISTRY}/excel-auditor-api:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    image: ${API_IMAGE:?set API_IMAGE to an immutable tag or digest}
     pull_policy: always
     environment:
       EXCEL_AUDITOR_ENV: production
@@ -23,7 +23,7 @@ services:
       - ${STANDARD_SECRETS_DIR:-./standard-secrets.empty}:/run/secrets/excel-auditor:ro
     restart: unless-stopped
   worker:
-    image: ${REGISTRY:?set REGISTRY}/excel-auditor-api:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    image: ${API_IMAGE:?set API_IMAGE to an immutable tag or digest}
     pull_policy: always
     command: ["excel-auditor-worker"]
     environment:
@@ -51,7 +51,7 @@ services:
       retries: 3
     restart: unless-stopped
   web:
-    image: ${REGISTRY:?set REGISTRY}/excel-auditor-web:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    image: ${WEB_IMAGE:?set WEB_IMAGE to an immutable tag or digest}
     pull_policy: always
     depends_on:
       api:

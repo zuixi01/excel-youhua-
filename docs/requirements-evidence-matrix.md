@@ -26,8 +26,8 @@
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
 | 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地生产 Renderer 完整回归通过；提交 `e66788d` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；小型人工标注 precision/recall | 业务标注基准 |
 | 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `e66788d` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |
-| 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送；生产 Compose 强制 tag | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
-| 18 | 精确回滚版本与命令 | 待外部验收 | `docs/deployment.md`、release manifest 生成逻辑 | 发布前后真实 digest 和一次回滚演练记录 |
+| 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送并验证版本标签指向当前 SHA；生产 Compose 强制 API/Web 独立完整镜像引用 | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
+| 18 | 精确回滚版本与命令 | 待外部验收 | `release_manifest.py` 严格校验 API/Web 独立 digest 并生成 `release.env`；`docs/deployment.md` 使用发布前后环境制品执行精确回滚 | 发布前后真实 digest 和一次回滚演练记录 |
 | 19 | 日志/报告不泄密或未脱敏敏感数据 | 本地已证明 | 掩码、manifest 脱敏、安全错误；Web Bearer 令牌仅存会话且下载走鉴权请求；`test_privacy.py`、`test_startup_security.py` | 生产日志抽检 |
 | 20 | 不支持/不安全场景明确失败或人工审核 | 本地已证明（已知边界） | 严格 manifest、未知操作拒绝；复杂公式/图表/透视/外链插列拒绝；已支持结构只报告而不误拦截；真正不支持的包结构即使配置 `allow/report` 也不可绕过人工审核；模糊/合并表头测试 | 业务真实复杂工作簿扩充 Golden，持续维护边界清单 |
 

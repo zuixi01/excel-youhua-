@@ -25,7 +25,7 @@
 
 ## 尚未取得的完成证据
 
-- Git remote、主 CI、性能、基础设施、LibreOffice 和安全制品证据已经取得；尚未创建版本发布标签，因此还没有由 release 门禁构建并推送的不可变镜像 digest、镜像 SBOM 和 release manifest。
+- Git remote、主 CI、性能、基础设施、LibreOffice 和安全制品证据已经取得；release 门禁现会验证语义版本标签与 Git SHA 的精确对应关系，分别记录 API/Web registry digest，严格校验 manifest 并生成可直接供 Compose 使用的无秘密 `release.env`。尚未创建版本发布标签，因此还没有由该门禁实际构建并推送的不可变镜像 digest、镜像 SBOM 和 release manifest。
 - 当前主机未安装 Microsoft Excel 或 LibreOffice；LibreOffice 已由远程专用作业出具绿色 JUnit 证据，Microsoft Excel 桌面打开验收仍不能伪造。
 - 当前 Docker `desktop-linux` Engine 可响应，但只读前置检查显示可用内存约 2.9 GiB（低于总内存 25% 的安全门槛）、C 盘可用比例约 19%（低于 20%），且已有 11 个其他项目容器运行。按 `AGENTS.md` 已熔断，不启动额外基础设施或构建镜像；最新源码对应镜像的最终重建、容器冒烟和 High/Critical 扫描仍无本机证据，历史镜像结果不能替代。
 - `.xlsm` 现有测试使用固定 VBA 部件验证字节保持，不等同于真实业务宏、数字签名、ActiveX/VML 控件在 Excel 客户端中的验收。
