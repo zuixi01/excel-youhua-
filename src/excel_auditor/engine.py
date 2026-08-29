@@ -395,7 +395,14 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         for row_number in sorted(set(rows)):
             duplicate_action = "mark_row_purple" if sheet.actions.duplicate_key == "mark_purple" else "report_only"
             differences.append(_difference(DifferenceType.DUPLICATE_PRIMARY_KEY, sheet, "Excel 中主键重复，不参与自动匹配", excel_row=row_number, business_key=_business_key(key, sheet), render_action=duplicate_action))
-    _validate_excel_records(sheet, snapshot, columns, excel_records, rules_by_name, differences, excel_epoch)
+    validated_record_count = _validate_excel_records(
+        sheet,
+        snapshot,
+        columns,
+        rules_by_name,
+        differences,
+        excel_epoch,
+    )
     join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
     if join_threshold < 1:
         raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
@@ -767,12 +774,19 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         join_backend,
         "disk_standard_records" if use_disk_records else "memory_standard_records",
         len(matched_keys),
-        len(excel_records),
+        validated_record_count,
         formula_target_rows,
     )
 
 
-def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference], excel_epoch: Any) -> None:
+def _validate_excel_records(
+    sheet: SheetRule,
+    snapshot: SheetSnapshot,
+    columns: dict[str, int],
+    rules_by_name: dict[str, Any],
+    differences: list[Difference],
+    excel_epoch: Any,
+) -> int:
     unique_values: dict[str, dict[Any, list[tuple[int, tuple[Any, ...]]]]] = defaultdict(lambda: defaultdict(list))
     cross_fields = {
         value
@@ -780,9 +794,34 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
         for key, value in cross_rule.params.items()
         if key.endswith("_field") and isinstance(value, str)
     }
-    for key, (row_number, record) in records.items():
+    validated_records = 0
+    start_row = sheet.data_region.start_row or sheet.header.row + 1
+    for row_number, values in snapshot.rows[start_row - 1 :]:
+        if row_number in snapshot.hidden_rows and not sheet.data_region.include_hidden_rows:
+            continue
+        record = {
+            name: values[index - 1]
+            for name, index in columns.items()
+            if index <= len(values) and values[index - 1] not in {None, ""}
+        }
+        if not record:
+            continue
+        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number, excel_epoch=excel_epoch)
+        primary_key_invalid = not key_valid
+        if primary_key_invalid and sheet.empty_primary_key_action == "skip_row":
+            continue
+        validated_records += 1
+        if primary_key_invalid and sheet.empty_primary_key_action == "use_row_number":
+            key = (("row_number_fallback", row_number - start_row + 1),)
+        elif primary_key_invalid:
+            key = tuple()
         parsed_record: dict[str, ParsedValue] = {}
         for name, col_index in columns.items():
+            if primary_key_invalid and name in sheet.primary_key:
+                # EMPTY_PRIMARY_KEY/formula_primary_key already owns the key
+                # failure. Continue validating every non-key field without
+                # emitting a redundant required/parse error for the key cell.
+                continue
             rule = rules_by_name[name]
             raw = record.get(name)
             cell = f"{get_column_letter(col_index)}{row_number}"
@@ -816,6 +855,7 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
                 continue
             for row_number, key in occurrences:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, "字段值不唯一", cell=f"{get_column_letter(columns[name])}{row_number}", excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), rule_id=f"{name}.unique", render_action=sheet.actions.invalid_value))
+    return validated_records
 
 
 def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number: int, key: tuple[Any, ...], parsed: dict[str, ParsedValue], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:

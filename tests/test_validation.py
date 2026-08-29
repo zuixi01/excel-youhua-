@@ -172,6 +172,80 @@ def test_unmatched_records_still_receive_field_and_cross_field_validation(tmp_pa
     assert "end-required" in rule_ids
 
 
+def test_primary_key_error_rows_still_receive_all_field_validation(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "duplicate-key-quality", "schema_version": "1.0.0", "name": "Duplicate key quality",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "integer"},
+                {"name": "email", "title": "Email", "validation": {"unique": True}},
+                {"name": "status", "title": "Status"},
+                {"name": "end_date", "title": "End", "type": "date"},
+            ],
+            "cross_field_rules": [{
+                "rule_id": "end-required",
+                "validator": "conditional_required",
+                "params": {"when_field": "status", "equals": "left", "required_field": "end_date"},
+            }],
+        }],
+    })
+    path = tmp_path / "duplicate-key-quality.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount", "Email", "Status", "End"])
+    sheet.append(["E1", "bad", "same@example.test", "left", None])
+    sheet.append(["E1", "also-bad", "same@example.test", "left", None])
+    book.save(path)
+
+    snapshot = inspect_workbook(path, rules)
+    result = compare_workbook(snapshot, {"data": []}, rules)
+    try:
+        rule_ids = [item.rule_id for item in result.differences]
+        assert sum(item.type.value == "DUPLICATE_PRIMARY_KEY" for item in result.differences) == 2
+        assert rule_ids.count("amount.parse") == 2
+        assert rule_ids.count("email.unique") == 2
+        assert rule_ids.count("end-required") == 2
+        assert result.validated_records_by_sheet == {"data": 2}
+    finally:
+        result.close()
+        snapshot.close()
+
+
+def test_empty_and_formula_primary_key_rows_still_receive_field_validation(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "invalid-key-quality", "schema_version": "1.0.0", "name": "Invalid key quality",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "integer"},
+            ],
+        }],
+    })
+    path = tmp_path / "invalid-key-quality.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append([None, "bad"])
+    sheet.append(['="E2"', "also-bad"])
+    book.save(path)
+
+    snapshot = inspect_workbook(path, rules)
+    result = compare_workbook(snapshot, {"data": []}, rules)
+    try:
+        rule_ids = [item.rule_id for item in result.differences]
+        assert rule_ids.count("amount.parse") == 2
+        assert "id.formula_primary_key" in rule_ids
+        assert result.validated_records_by_sheet == {"data": 2}
+    finally:
+        result.close()
+        snapshot.close()
+
+
 def test_fuzzy_string_is_suggestion_only_even_when_overwrite_is_enabled(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "fuzzy", "schema_version": "1.0.0", "name": "Fuzzy",
