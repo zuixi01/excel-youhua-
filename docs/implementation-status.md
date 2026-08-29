@@ -8,14 +8,16 @@
 
 已完成的本地实现包括：严格且版本化的规则模型、JSON/CSV/受管 HTTP 标准数据接入、不可变标准快照、工作簿安全预检、表头映射、单/联合主键匹配、类型化比较、字段及跨字段校验、受控修复、JSON/HTML/Excel 报告、FastAPI/Web、PostgreSQL/Redis/RQ/MinIO 适配器、租户隔离、审计与保留策略。Web 的任务、规则与下载请求统一支持 Bearer 鉴权，令牌只保存在当前浏览器会话，文件通过鉴权请求下载。生产 Compose 为受管 HTTP 连接注册表和秘密目录提供只读挂载；连接配置严格拒绝未知字段，密钥不进入规则或镜像。
 
+核心精度入口现统一拒绝会产生静默选择或值丢失的标准数据：规范字段名、展示名和别名按 NFKC/空白规则映射，同一字段的冲突表示、JSON 重复对象键、CSV 重复字段名、HTTP 非严格 JSON 均在快照前失败。不同物理表头即使文字不同，只要映射到同一规范字段也按重复表头处理，不会由后列覆盖前列。标准端和 Excel 端的长度、正则、枚举、唯一性均基于相同的规范化值语义；规则发布会拒绝负/非有限容差、矛盾范围、类型不兼容选项、歧义枚举和违反自身校验的静态默认值。Decimal 非有限值及大精度量化有确定性边界；标准记录省略可选字段不会触发自动清空，只有显式空值才进入已授权覆盖路径。
+
 .NET Renderer 当前覆盖标色、批注、插列、类型化写值、追加记录、报告/隐藏元数据工作表、样式去重、Table/AutoFilter/DataValidation/DefinedName/合并区域和简单 A1 公式引用维护。内部超链接、局部命名区域、筛选列索引和排序引用均有插列维护；图表/绘图、透视表、外部链接以及复杂/共享/数组公式在插列时明确返回 `UNSUPPORTED_FEATURE`，不会静默修改。Renderer 还提供结构化 `--version` 自检，API 就绪探针会实际执行并校验其身份与语义版本。
 
 固定 Golden 语料目前为 19 个工作簿：15 个核心表头/记录场景，外加联合主键与完整类型、结构化多工作表、合并表头人工审核，以及 10,000×20 大文件报告模式。大文件输入和 10,000 条标准 JSONL 快照均锁定 SHA，并强制工作簿与标准记录走磁盘后备序列及 Polars 分区连接。Golden 测试校验输入 SHA、完整差异计数/语义投影以及关键渲染结构；Renderer 合约另覆盖公式引用、Table、筛选、验证、命名区域、内部超链接、宏部件字节保持和不安全插列拒绝。
 
 ## 当前验证结果
 
-- 当前完整本地生产 Renderer 回归：`177 passed, 8 skipped`（共收集 185 项）；条件跳过的性能、真实基础设施和 LibreOffice 已由专用远程作业承接。
-- 当前远端提交 `e66788de2a81b936610d7dd7157cf6badfa8c6fe` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。
+- 当前完整本地生产 Renderer 回归：`205 passed, 8 skipped`（共收集 213 项）；条件跳过的性能、真实基础设施和 LibreOffice 已由专用远程作业承接。
+- 当前远端提交 `b3c04e9c5eaa7cdcdf6ba4761b21cc618e2b26b0` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。当前工作区新增的核心精度补强尚未形成远端 CI 证据，因此以上远端结果不替代本轮本地回归。
 - 同一提交的 [性能基线 v4 最终复核运行](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色：五个工作簿负载场景、50,000 条分页标准源、500,000 条直接比较、500,000 条受管 HTTP 服务全链路，以及 500,000 条上传 JSON 的流式解析、校验与快照均通过相对回归门禁并保存指标及 JUnit 制品。
 - 条件跳过项分别由上述性能、真实基础设施和 LibreOffice 专用远程作业承接；远程通过不改变“本机未执行”的事实。
 - 本地 Windows Renderer locked restore/build/publish 通过；新增 Renderer 合约测试通过。
@@ -30,7 +32,7 @@
 - 当前 Docker `desktop-linux` Engine 可响应，但只读前置检查显示可用内存约 2.9 GiB（低于总内存 25% 的安全门槛）、C 盘可用比例约 19%（低于 20%），且已有 11 个其他项目容器运行。按 `AGENTS.md` 已熔断，不启动额外基础设施或构建镜像；最新源码对应镜像的最终重建、容器冒烟和 High/Critical 扫描仍无本机证据，历史镜像结果不能替代。
 - `.xlsm` 自动测试使用固定 VBA 部件验证字节保持；`tools/Invoke-ExcelDesktopAcceptance.ps1` 与 `excel_auditor.excel_acceptance` 已把真实业务宏、数字签名、ActiveX/VML 控件验收变成可重复证据流程，但仍需真实业务文件、Excel 验收机和独立审核人执行。
 - 大文件 Inspector、规范标准记录和大差异序列均可溢写到临时文件；上传 JSON/CSV 以 1 MiB 分块落盘并逐记录解析，达到可配置阈值后迁移到磁盘后备序列。标准数据 Pandera 校验按块执行、跨块检查唯一性，快照按源顺序流式写入且不再全量排序复制；受管 HTTP 分页记录同样会按阈值溢写，偏移索引使用紧凑的 64 位数组。大标准主键/记录载荷使用 SQLite 磁盘映射和 Polars 分区 Parquet 连接，数据库差异索引按千条批量写入，完整 JSON、JSONL 与 HTML 工件可在只报告模式生成。500,000 条上传 JSON 的解析、校验和快照，500,000 条标准记录与 400,001 条差异的直接比较，以及 100 页受管 HTTP 获取、校验、快照、服务比较和完整工件生成均已由远端负载证明。表单内联 `standard_json` 仍由框架作为字符串接收，但受默认 64 MiB 上传限制约束；真实外部网络和生产对象存储延迟不属于确定性 MockTransport 性能基线。
-- precision/recall 已覆盖人工标注的表头、记录、字段差异和修复小型基准，但仍需业务方提供具有代表性的人工标注基准集。
+- precision/recall 固定基准现包含 9 组表头对抗样本和 2 组记录/字段/修复样本，覆盖 Unicode/别名/语义重复表头，以及字符串、数值容差、日期时间、布尔、大小写枚举、集合、JSON、非法值与禁止误修复；门槛为 precision/recall 均不低于 99%。该基准仍是通用人工标注样例，不能替代业务方提供的代表性标注集。
 - 尚未连接部署服务器，因此没有部署前资源检查、实际部署 digest、健康检查和回滚演练记录。
 - 开发文档第 23 节要求的业务标准模板、2–3 份脱敏异常文件、真实接口契约、主键/字段/敏感数据规则和容量目标仍需业务方提供，才能完成业务验收而非通用样例验收。
 

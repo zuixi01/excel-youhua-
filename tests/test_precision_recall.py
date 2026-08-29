@@ -28,6 +28,19 @@ def test_confirmed_header_mapping_precision_and_recall_meet_release_thresholds()
     assert recall >= BENCHMARK["minimum_recall"], {"recall": recall, "false_negatives": sorted(expected - predicted)}
 
 
+def test_distinct_headers_mapping_to_one_canonical_field_are_duplicates():
+    rules = RuleSet.model_validate(CORE["rule"])
+    sheet = rules.sheets[0]
+    snapshot = SheetSnapshot(sheet.name, 1, 4, [(1, ["编号", "id", "姓名", "手机号"])], set(), [])
+
+    mappings, columns = map_headers(sheet, snapshot)
+
+    id_mappings = [item for item in mappings if item.canonical_field == "id"]
+    assert [(item.physical_column, item.status) for item in id_mappings] == [(1, "duplicate"), (2, "duplicate")]
+    assert "id" not in columns
+    assert columns == {"name": 3, "phone": 4}
+
+
 def _assert_precision_recall(predicted, expected, label):
     predicted, expected = set(predicted), set(expected)
     true_positive = len(predicted & expected)
@@ -38,33 +51,40 @@ def _assert_precision_recall(predicted, expected, label):
 
 
 def test_record_field_and_repair_precision_recall_meet_release_thresholds(tmp_path):
-    case = BENCHMARK["record_field_repair_case"]
-    rules = RuleSet.model_validate(case["rule"])
-    path = tmp_path / "annotated.xlsx"
-    book = Workbook()
-    sheet = book.active
-    sheet.title = "Data"
-    sheet.append(case["excel"]["headers"])
-    for row in case["excel"]["rows"]:
-        sheet.append(row)
-    book.save(path)
-    result = compare_workbook(inspect_workbook(path, rules), case["standard"], rules)
-    differences = {item.difference_id: item for item in result.differences}
-    record_types = {"EXTRA_RECORD", "MISSING_RECORD"}
-    predicted_records = [
-        (item.type.value, item.business_key["id"])
-        for item in result.differences
-        if item.type.value in record_types and item.business_key
-    ]
-    predicted_fields = [
-        (item.type.value, item.business_key["id"], item.canonical_field)
-        for item in result.differences
-        if item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"} and item.business_key
-    ]
-    predicted_repairs = [
-        (repair.type, differences[repair.difference_id].business_key["id"], repair.canonical_field)
-        for repair in result.repairs
-    ]
-    _assert_precision_recall(predicted_records, map(tuple, case["expected_record_labels"]), "record matching")
-    _assert_precision_recall(predicted_fields, map(tuple, case["expected_field_labels"]), "field differences")
-    _assert_precision_recall(predicted_repairs, map(tuple, case["expected_repair_labels"]), "automatic repairs")
+    cases = BENCHMARK["record_field_repair_cases"]
+    for case_index, case in enumerate(cases):
+        rules = RuleSet.model_validate(case["rule"])
+        path = tmp_path / f"annotated-{case_index}.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = rules.sheets[0].name
+        sheet.append(case["excel"]["headers"])
+        for row in case["excel"]["rows"]:
+            sheet.append(row)
+        book.save(path)
+        workbook = inspect_workbook(path, rules)
+        result = compare_workbook(workbook, case["standard"], rules)
+        try:
+            differences = {item.difference_id: item for item in result.differences}
+            record_types = {"EXTRA_RECORD", "MISSING_RECORD"}
+            predicted_records = [
+                (item.type.value, item.business_key["id"])
+                for item in result.differences
+                if item.type.value in record_types and item.business_key
+            ]
+            predicted_fields = [
+                (item.type.value, item.business_key["id"], item.canonical_field)
+                for item in result.differences
+                if item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"} and item.business_key
+            ]
+            predicted_repairs = [
+                (repair.type, differences[repair.difference_id].business_key["id"], repair.canonical_field)
+                for repair in result.repairs
+            ]
+            name = case.get("name", f"case-{case_index}")
+            _assert_precision_recall(predicted_records, map(tuple, case["expected_record_labels"]), f"{name}: record matching")
+            _assert_precision_recall(predicted_fields, map(tuple, case["expected_field_labels"]), f"{name}: field differences")
+            _assert_precision_recall(predicted_repairs, map(tuple, case["expected_repair_labels"]), f"{name}: automatic repairs")
+        finally:
+            result.close()
+            workbook.close()

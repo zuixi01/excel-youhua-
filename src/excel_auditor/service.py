@@ -21,7 +21,7 @@ from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopment
 from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
-from .standard_files import load_standard_file
+from .standard_files import canonicalize_standard_row, load_standard_file
 from .persistence import DatabaseRepository
 from .storage import ArtifactStore
 from .ids import new_ulid
@@ -609,16 +609,8 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
             continue
         canonical_rows: list[dict[str, Any]] | SpilledRecords = SpilledRecords() if len(rows) > spill_threshold else []
         try:
-            for row in rows:
-                if not isinstance(row, dict):
-                    raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
-                canonical: dict[str, Any] = {}
-                for column in sheet_rule.columns:
-                    candidates = [column.name, column.title, *column.aliases]
-                    matched = next((candidate for candidate in candidates if candidate in row), None)
-                    if matched is not None:
-                        canonical[column.name] = row[matched]
-                canonical_rows.append(canonical)
+            for record_index, row in enumerate(rows, start=1):
+                canonical_rows.append(canonicalize_standard_row(row, sheet_rule, record_index=record_index))
         except Exception:
             close = getattr(canonical_rows, "close", None)
             if close is not None:

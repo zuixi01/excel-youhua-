@@ -68,6 +68,43 @@ def test_pandera_standard_validator_accepts_string_dtype_and_checks_typed_range(
         validator.validate({"data": [{"id": "E1", "amount": "101"}]}, rules)
 
 
+def test_standard_rules_validate_normalized_values_consistently_with_excel():
+    rules = RuleSet.model_validate({
+        "schema_id": "normalized-standard", "schema_version": "1.0.0", "name": "Normalized",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {
+                "name": "id", "title": "ID", "required": True,
+                "normalize": ["trim", "unicode_nfkc", "uppercase"],
+                "validation": {"regex": "^E[0-9]{2}$", "min_length": 3, "max_length": 3},
+            },
+            {
+                "name": "status", "title": "Status", "type": "enum",
+                "normalize": ["trim"], "enum_values": ["active"], "enum_aliases": {"A": "active"},
+            },
+        ]}],
+    })
+
+    StandardDataValidator().validate({"data": [{"id": "  e０１  ", "status": " A "}]}, rules)
+
+    with pytest.raises(ValueError, match=r"typed failures in \['id'\]"):
+        StandardDataValidator().validate({"data": [{"id": "  X01  ", "status": "A"}]}, rules)
+
+
+def test_nullable_unique_standard_field_ignores_empty_values_but_not_normalized_duplicates():
+    rules = RuleSet.model_validate({
+        "schema_id": "nullable-unique", "schema_version": "1.0.0", "name": "Nullable unique",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+            {"name": "code", "title": "Code", "normalize": ["trim"], "validation": {"unique": True}},
+        ]}],
+    })
+    validator = StandardDataValidator()
+
+    validator.validate({"data": [{"id": "E1", "code": None}, {"id": "E2", "code": ""}]}, rules)
+    with pytest.raises(ValueError, match="code is not unique at record 2"):
+        validator.validate({"data": [{"id": "E1", "code": " A "}, {"id": "E2", "code": "A"}]}, rules)
+
+
 def test_standard_validator_enforces_composite_primary_key_and_sheet_set():
     rules = RuleSet.model_validate({
         "schema_id": "composite", "schema_version": "1.0.0", "name": "Composite",

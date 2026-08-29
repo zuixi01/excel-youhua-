@@ -94,6 +94,85 @@ def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
         RuleSet.model_validate(payload)
 
 
+@pytest.mark.parametrize("field", ["absolute_tolerance", "relative_tolerance"])
+def test_negative_numeric_tolerance_is_rejected(field):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["compare"][field] = "-0.01"
+    with pytest.raises(ValidationError, match="non-negative"):
+        RuleSet.model_validate(payload)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_numeric_configuration_is_rejected(value):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["compare"]["absolute_tolerance"] = value
+    with pytest.raises(ValidationError, match="finite"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["validation"]["min"] = value
+    with pytest.raises(ValidationError, match="finite"):
+        RuleSet.model_validate(payload)
+
+
+def test_conflicting_validation_and_type_specific_options_are_rejected():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["validation"].update({"min": "10", "max": "1"})
+    with pytest.raises(ValidationError, match="min cannot exceed max"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["validation"]["min"] = "1"
+    with pytest.raises(ValidationError, match="numeric validation bounds are incompatible with string"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["compare"]["absolute_tolerance"] = "0.1"
+    with pytest.raises(ValidationError, match="numeric comparison options are incompatible with string"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    amount = payload["sheets"][0]["columns"][2]
+    amount["compare"].update({"mode": "exact", "absolute_tolerance": "0.1"})
+    with pytest.raises(ValidationError, match="require compare.mode=numeric"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["enum_values"] = ["ignored"]
+    with pytest.raises(ValidationError, match="enum configuration is incompatible with string"):
+        RuleSet.model_validate(payload)
+
+
+def test_enum_aliases_and_static_repair_defaults_must_satisfy_the_rule():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][4]["enum_aliases"]["未知"] = "不存在"
+    with pytest.raises(ValidationError, match="target unknown values"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    name = payload["sheets"][0]["columns"][1]
+    name.update({"fill_static_default": True, "static_default": "x"})
+    name["validation"] = {"nullable": True, "regex": "^[A-Z]{2}$"}
+    with pytest.raises(ValidationError, match="static_default.*validation regex"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    name = payload["sheets"][0]["columns"][1]
+    name.update({"fill_static_default": True, "static_default": " N/A ", "normalize": ["trim"], "value_aliases": {"N/A": ""}})
+    with pytest.raises(ValidationError, match="normalizes to an empty value"):
+        RuleSet.model_validate(payload)
+
+
+def test_ignore_case_enum_configuration_rejects_folded_collisions():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    department = payload["sheets"][0]["columns"][4]
+    department["compare"]["mode"] = "ignore_case"
+    department["enum_values"] = ["HR", "hr"]
+    department["enum_aliases"] = {}
+    with pytest.raises(ValidationError, match="ambiguous under ignore_case"):
+        RuleSet.model_validate(payload)
+
+
 def test_draft_mapping_confirmation_is_validated_and_published_draft_is_immutable(tmp_path):
     rules = load_rules(EXAMPLE)
     drafts = DraftRegistry(tmp_path / "drafts")

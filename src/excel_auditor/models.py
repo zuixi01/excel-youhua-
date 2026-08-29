@@ -83,14 +83,22 @@ class CompareConfig(StrictModel):
                 raise ValueError(f"unknown IANA timezone: {value}") from exc
         return value
 
+    @model_validator(mode="after")
+    def non_negative_tolerances(self) -> "CompareConfig":
+        if not self.absolute_tolerance.is_finite() or not self.relative_tolerance.is_finite():
+            raise ValueError("numeric tolerances must be finite")
+        if self.absolute_tolerance < 0 or self.relative_tolerance < 0:
+            raise ValueError("numeric tolerances must be non-negative")
+        return self
+
 
 class ValidationConfig(StrictModel):
     nullable: bool = True
     unique: bool = False
     min: Decimal | None = None
     max: Decimal | None = None
-    min_length: int | None = None
-    max_length: int | None = None
+    min_length: int | None = Field(default=None, ge=0)
+    max_length: int | None = Field(default=None, ge=0)
     regex: str | None = None
 
     @field_validator("regex")
@@ -103,6 +111,16 @@ class ValidationConfig(StrictModel):
                 raise ValueError("regex contains a forbidden high-complexity construct")
             re.compile(value)
         return value
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> "ValidationConfig":
+        if any(bound is not None and not bound.is_finite() for bound in (self.min, self.max)):
+            raise ValueError("validation numeric bounds must be finite")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("validation min cannot exceed max")
+        if self.min_length is not None and self.max_length is not None and self.min_length > self.max_length:
+            raise ValueError("validation min_length cannot exceed max_length")
+        return self
 
 
 class RegexReplacement(StrictModel):
@@ -155,6 +173,20 @@ class ColumnRule(StrictModel):
             raise ValueError(f"unknown normalizers for {self.name!r}: {sorted(unknown)}")
         if self.type == FieldType.ENUM and not self.enum_values:
             raise ValueError(f"enum field {self.name!r} requires enum_values")
+        if self.type != FieldType.ENUM and (self.enum_values or self.enum_aliases):
+            raise ValueError(f"enum configuration is incompatible with {self.type.value}")
+        if len(self.enum_values) != len(set(self.enum_values)):
+            raise ValueError(f"enum field {self.name!r} has duplicate enum_values")
+        invalid_enum_targets = set(self.enum_aliases.values()) - set(self.enum_values)
+        if invalid_enum_targets:
+            raise ValueError(f"enum aliases for {self.name!r} target unknown values: {sorted(invalid_enum_targets)}")
+        remapped_canonical_values = {
+            alias: target
+            for alias, target in self.enum_aliases.items()
+            if alias in self.enum_values and alias != target
+        }
+        if remapped_canonical_values:
+            raise ValueError(f"enum aliases for {self.name!r} remap canonical values")
         if (self.value_aliases or self.regex_replacements) and self.type not in {
             FieldType.STRING, FieldType.PHONE, FieldType.ID_CODE, FieldType.POSTAL_CODE, FieldType.FUZZY_STRING
         }:
@@ -176,6 +208,40 @@ class ColumnRule(StrictModel):
         }
         if self.compare.mode not in compatible_modes[self.type]:
             raise ValueError(f"{self.compare.mode} comparison is incompatible with {self.type.value}")
+        if self.type == FieldType.ENUM and self.compare.mode == "ignore_case":
+            folded_values = [value.casefold() for value in self.enum_values]
+            if len(folded_values) != len(set(folded_values)):
+                raise ValueError(f"enum field {self.name!r} is ambiguous under ignore_case")
+            folded_aliases: dict[str, str] = {}
+            for alias, target in self.enum_aliases.items():
+                folded = alias.casefold()
+                owner = folded_aliases.get(folded)
+                if owner is not None and owner != target:
+                    raise ValueError(f"enum aliases for {self.name!r} are ambiguous under ignore_case")
+                folded_aliases[folded] = target
+            canonical_by_fold = {value.casefold(): value for value in self.enum_values}
+            for alias, target in self.enum_aliases.items():
+                canonical = canonical_by_fold.get(alias.casefold())
+                if canonical is not None and canonical != target:
+                    raise ValueError(f"enum aliases for {self.name!r} remap canonical values under ignore_case")
+        numeric = self.type in {FieldType.INTEGER, FieldType.DECIMAL}
+        if (self.validation.min is not None or self.validation.max is not None) and not numeric:
+            raise ValueError(f"numeric validation bounds are incompatible with {self.type.value}")
+        numeric_options_configured = (
+            self.compare.absolute_tolerance != 0
+            or self.compare.relative_tolerance != 0
+            or self.compare.decimal_places is not None
+        )
+        if numeric_options_configured and not numeric:
+            raise ValueError(f"numeric comparison options are incompatible with {self.type.value}")
+        if numeric_options_configured and self.compare.mode != "numeric":
+            raise ValueError("numeric comparison options require compare.mode=numeric")
+        if self.compare.timezone is not None and self.type != FieldType.DATETIME:
+            raise ValueError(f"compare.timezone is incompatible with {self.type.value}")
+        if self.compare.allow_naive_datetime and self.type != FieldType.DATETIME:
+            raise ValueError(f"allow_naive_datetime is incompatible with {self.type.value}")
+        if self.parse_formats and self.type not in {FieldType.DATE, FieldType.DATETIME}:
+            raise ValueError(f"parse_formats are incompatible with {self.type.value}")
         if self.fill_static_default and self.static_default is None:
             raise ValueError(f"field {self.name!r} enables fill_static_default without static_default")
         if self.fill_static_default:
@@ -184,6 +250,20 @@ class ColumnRule(StrictModel):
             parsed = parse_value(self.static_default, self)
             if not parsed.valid:
                 raise ValueError(f"static_default for {self.name!r} is invalid: {parsed.error}")
+            if parsed.normalized is None:
+                raise ValueError(f"static_default for {self.name!r} normalizes to an empty value")
+            text = str(parsed.normalized)
+            validation = self.validation
+            if validation.min_length is not None and len(text) < validation.min_length:
+                raise ValueError(f"static_default for {self.name!r} is shorter than min_length")
+            if validation.max_length is not None and len(text) > validation.max_length:
+                raise ValueError(f"static_default for {self.name!r} is longer than max_length")
+            if validation.regex is not None and re.fullmatch(validation.regex, text) is None:
+                raise ValueError(f"static_default for {self.name!r} does not match validation regex")
+            if validation.min is not None and Decimal(str(parsed.normalized)) < validation.min:
+                raise ValueError(f"static_default for {self.name!r} is below validation min")
+            if validation.max is not None and Decimal(str(parsed.normalized)) > validation.max:
+                raise ValueError(f"static_default for {self.name!r} exceeds validation max")
         if self.type == FieldType.BOOLEAN:
             truthy = {str(value).strip().casefold() for value in self.boolean_true_values}
             falsy = {str(value).strip().casefold() for value in self.boolean_false_values}

@@ -7,7 +7,7 @@ from openpyxl import Workbook
 from excel_auditor.models import StandardSourceConfig
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
-from excel_auditor.service import AuditService
+from excel_auditor.service import AuditService, _canonicalize_standard
 from excel_auditor.models import RuleSet
 
 
@@ -149,6 +149,26 @@ def test_managed_http_stream_aborts_at_response_limit(tmp_path):
         source.fetch(config)
 
 
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (b'{"data":[{"id":"E1","id":"E2"}]}', "duplicate object key"),
+        (b'{"data":[', "response JSON is malformed"),
+        (b'{"data":[{"id":"E1","amount":NaN}]}', "non-finite number"),
+    ],
+)
+def test_managed_http_rejects_ambiguous_or_malformed_json(content, message, tmp_path):
+    source = ManagedHttpSource(
+        _registry(tmp_path),
+        httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, content=content)),
+        resolver=lambda _host: ["93.184.216.34"],
+    )
+    config = StandardSourceConfig(type="managed_http", connection_id="hr", path="/employees")
+
+    with pytest.raises(ValueError, match=message):
+        source.fetch(config)
+
+
 def test_managed_http_is_snapshotted_by_service(tmp_path):
     transport = httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, json={"data": [{"id": "E001", "name": "张三"}, {"id": "E002", "name": "李四"}]}))
     source = ManagedHttpSource(_registry(tmp_path), transport, resolver=lambda _host: ["93.184.216.34"], spill_after_records=1)
@@ -174,3 +194,15 @@ def test_managed_http_is_snapshotted_by_service(tmp_path):
     assert status["status"] == "completed"
     assert status["summary"]["matched_records"] == 2
     assert list(service.job_directory(job_id).glob("std_*.jsonl"))
+
+
+def test_managed_http_canonicalization_rejects_conflicting_aliases():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "人员", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "编号", "aliases": ["工号"], "required": True}
+        ]}],
+    })
+
+    with pytest.raises(ValueError, match=r"STANDARD_DATA_INVALID: people\.id has conflicting field representations at record 1"):
+        _canonicalize_standard({"people": [{"id": "E001", "工号": "E002"}]}, rules)

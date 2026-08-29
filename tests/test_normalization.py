@@ -20,6 +20,23 @@ def test_percentage_and_decimal_places_are_explicit():
     assert values_equal(parse_value("12.54%", percent), parse_value("0.125", percent), percent)
 
 
+def test_non_finite_numbers_are_invalid_and_large_decimals_quantize_safely():
+    decimal_rule = ColumnRule.model_validate({
+        "name": "amount", "title": "Amount", "type": "decimal",
+        "compare": {"mode": "numeric", "decimal_places": 2},
+    })
+    integer_rule = ColumnRule.model_validate({"name": "count", "title": "Count", "type": "integer"})
+
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        assert not parse_value(raw, decimal_rule).valid
+        assert not parse_value(raw, integer_rule).valid
+
+    left = parse_value("123456789012345678901234567890.124", decimal_rule)
+    right = parse_value("123456789012345678901234567890.12", decimal_rule)
+    assert left.valid and right.valid
+    assert values_equal(left, right, decimal_rule)
+
+
 def test_string_primary_key_preserves_leading_zero():
     rule = ColumnRule(name="id", title="编号", type="string", normalize=["trim"])
     assert parse_value(" 001 ", rule).normalized == "001"
@@ -47,3 +64,23 @@ def test_boolean_aliases_are_explicit_and_disjoint():
     assert parse_value("启用", rule).normalized is True
     assert parse_value("停用", rule).normalized is False
     assert not parse_value("是", rule).valid
+
+
+def test_enum_ignore_case_applies_to_canonical_values_and_aliases():
+    rule = ColumnRule.model_validate({
+        "name": "status", "title": "Status", "type": "enum",
+        "enum_values": ["Active", "Disabled"],
+        "enum_aliases": {"ENABLED": "Active"},
+        "compare": {"mode": "ignore_case"},
+    })
+
+    assert parse_value("active", rule).normalized == "Active"
+    assert parse_value("enabled", rule).normalized == "Active"
+    assert values_equal(parse_value("ACTIVE", rule), parse_value("Active", rule), rule)
+
+
+def test_json_rejects_non_finite_numbers():
+    rule = ColumnRule.model_validate({"name": "payload", "title": "Payload", "type": "json"})
+
+    assert not parse_value('{"amount": NaN}', rule).valid
+    assert not parse_value({"amount": float("inf")}, rule).valid

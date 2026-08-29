@@ -78,7 +78,6 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
             exact.setdefault(normalize_header(alias), (column.name, "confirmed_alias"))
     choices = {column.name: normalize_header(column.title) for column in sheet.columns}
     mappings: list[HeaderMapping] = []
-    canonical_columns: dict[str, int] = {}
     for index, (raw, normalized) in enumerate(zip(header_values, normalized_values), start=1):
         raw_text = "" if raw is None else str(raw)
         if normalized in duplicate_values:
@@ -86,7 +85,6 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
         elif normalized in exact:
             canonical, match_type = exact[normalized]
             mapping = HeaderMapping(sheet_id=sheet.id, physical_column=index, raw_header=raw_text, normalized_header=normalized, canonical_field=canonical, match_type=match_type, confidence=100, status="matched")
-            canonical_columns[canonical] = index
         elif normalized:
             match = process.extractOne(normalized, choices, scorer=fuzz.ratio, score_cutoff=sheet.header.fuzzy_suggestion_threshold)
             if match:
@@ -97,6 +95,25 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
         else:
             mapping = HeaderMapping(sheet_id=sheet.id, physical_column=index, raw_header=raw_text, normalized_header=normalized, match_type="unmatched", status="extra")
         mappings.append(mapping)
+    matched_by_canonical: dict[str, list[int]] = defaultdict(list)
+    for mapping_index, mapping in enumerate(mappings):
+        if mapping.status == "matched" and mapping.canonical_field:
+            matched_by_canonical[mapping.canonical_field].append(mapping_index)
+    semantic_duplicates = {
+        canonical: indexes
+        for canonical, indexes in matched_by_canonical.items()
+        if len(indexes) > 1
+    }
+    for canonical, indexes in semantic_duplicates.items():
+        for mapping_index in indexes:
+            mappings[mapping_index] = mappings[mapping_index].model_copy(
+                update={"status": "duplicate", "canonical_field": canonical}
+            )
+    canonical_columns = {
+        mapping.canonical_field: mapping.physical_column
+        for mapping in mappings
+        if mapping.status == "matched" and mapping.canonical_field
+    }
     return mappings, canonical_columns
 
 
@@ -457,6 +474,13 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                         ))
                     continue
                 left_raw = snapshot.cached_values.get(cell)
+            # An omitted optional standard field means the source supplied no
+            # authoritative value. Preserve the distinction from an explicit
+            # null/empty value so overwrite_mismatch cannot silently clear data.
+            if name not in standard_record and not (
+                (left_raw is None or left_raw == "") and rule.fill_static_default
+            ):
+                continue
             if (left_raw is None or left_raw == "") and (right_raw is None or right_raw == "") and not rule.fill_static_default:
                 continue
             left = parse_value(left_raw, rule)

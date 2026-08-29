@@ -186,7 +186,7 @@ class ManagedHttpSource:
                 metrics.increment("standard_http_response_bytes_total", amount=len(response.content), connection_id=config.connection_id)
                 if len(response.content) > connection.max_response_bytes or total_response_bytes > connection.max_response_bytes:
                     raise ValueError("STANDARD_SOURCE_FAILED: response exceeds configured size")
-                payload = response.json()
+                payload = _strict_json_loads(response.content)
                 page_records = _json_path(payload, config.data_json_path)
                 if isinstance(page_records, dict) and not config.pagination and all(isinstance(items, list) and all(isinstance(item, dict) for item in items) for items in page_records.values()):
                     workbook_records = {str(sheet): items for sheet, items in page_records.items()}
@@ -239,6 +239,28 @@ def _load_secret(reference: str) -> str:
     if "\r" in secret or "\n" in secret:
         raise ValueError(f"secret reference contains an unsafe line break: {reference}")
     return secret
+
+
+def _strict_json_loads(content: bytes) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("STANDARD_SOURCE_FAILED: response JSON has a duplicate object key")
+            result[key] = value
+        return result
+
+    def reject_non_finite_number(value: str) -> Any:
+        raise ValueError(f"STANDARD_SOURCE_FAILED: response JSON contains non-finite number: {value}")
+
+    try:
+        return json.loads(
+            content,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_finite_number,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("STANDARD_SOURCE_FAILED: response JSON is malformed") from exc
 
 
 def _request(client: httpx.Client, method: str, url: str, parameters: dict[str, Any], max_bytes: int, sni_hostname: str | None = None) -> tuple[httpx.Response, int]:

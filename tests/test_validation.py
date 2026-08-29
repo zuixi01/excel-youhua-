@@ -127,6 +127,39 @@ def test_fuzzy_string_is_suggestion_only_even_when_overwrite_is_enabled(tmp_path
     assert not result.repairs
 
 
+def test_omitted_optional_standard_field_never_clears_excel_but_explicit_null_can(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "omitted-standard", "schema_version": "1.0.0", "name": "Omitted standard",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"overwrite_mismatch": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "note", "title": "Note"},
+            ],
+        }],
+    })
+    path = tmp_path / "omitted-standard.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Note"])
+    sheet.append(["E1", "keep me"])
+    book.save(path)
+
+    omitted = compare_workbook(inspect_workbook(path, rules), {"data": [{"id": "E1"}]}, rules)
+    assert omitted.summary.matched_records == 1
+    assert not [item for item in omitted.differences if item.canonical_field == "note"]
+    assert not omitted.repairs
+
+    explicit_null = compare_workbook(inspect_workbook(path, rules), {"data": [{"id": "E1", "note": None}]}, rules)
+    note_difference = next(item for item in explicit_null.differences if item.canonical_field == "note")
+    assert note_difference.type.value == "VALUE_MISMATCH"
+    assert note_difference.repair_status == "planned"
+    assert [(repair.type, repair.canonical_field, repair.value) for repair in explicit_null.repairs] == [
+        ("set_cell", "note", None)
+    ]
+
+
 def test_empty_primary_key_policy_can_match_by_row_number_without_silent_default(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "empty-key", "schema_version": "1.0.0", "name": "Empty key",
