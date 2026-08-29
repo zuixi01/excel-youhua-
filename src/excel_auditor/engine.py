@@ -265,6 +265,11 @@ def compare_workbook(
         for item in differences
         if item.rule_id and item.rule_id.endswith(".excel_write_timezone")
     }))
+    manual_review_reasons.extend(sorted({
+        f"{item.sheet_name}: formula_cached_value_write_blocked:{item.canonical_field}"
+        for item in differences
+        if item.rule_id and item.rule_id.endswith(".formula_cached_write_blocked")
+    }))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -622,6 +627,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 continue
             rule = rules_by_name[name]
             left_raw = excel_record.get(name)
+            excel_cell_raw = left_raw
             right_raw = standard_record.get(name)
             cell = f"{get_column_letter(col_index)}{row_number}"
             # An omitted optional standard field means the source supplied no
@@ -684,7 +690,20 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 can_fill = left.normalized is None and right.normalized is not None and sheet.actions.fill_empty_from_standard
                 can_overwrite = sheet.actions.overwrite_mismatch
                 repair = can_fill or can_overwrite
-                if repair and not _excel_write_safe(right, rule):
+                if repair and left_is_formula:
+                    _append_formula_cached_write_blocked(
+                        differences,
+                        sheet,
+                        rule,
+                        formula_raw=excel_cell_raw,
+                        cached=left,
+                        standard=right,
+                        row_number=row_number,
+                        cell=cell,
+                        key=key,
+                    )
+                    repair = False
+                elif repair and not _excel_write_safe(right, rule):
                     _append_excel_write_safety_difference(differences, sheet, rule, right, row_number=row_number, cell=cell, key=key)
                     repair = False
                 repair_rule = f"{name}.fill_empty_from_standard" if can_fill else f"{name}.overwrite_mismatch"
@@ -696,7 +715,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     excel_row=row_number,
                     canonical_field=name,
                     business_key=_business_key(key, sheet),
-                    excel_raw_value=_safe_value(left.raw, rule),
+                    excel_raw_value=_safe_value(excel_cell_raw, rule),
                     excel_normalized_value=_safe_value(left.normalized, rule),
                     standard_raw_value=_safe_value(right.raw, rule),
                     standard_normalized_value=_safe_value(right.normalized, rule),
@@ -709,6 +728,19 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=_excel_write_value(right, rule)))
             elif left.normalized is None and rule.fill_static_default:
                 default = parse_value(rule.static_default, rule)
+                if left_is_formula:
+                    _append_formula_cached_write_blocked(
+                        differences,
+                        sheet,
+                        rule,
+                        formula_raw=excel_cell_raw,
+                        cached=left,
+                        standard=default,
+                        row_number=row_number,
+                        cell=cell,
+                        key=key,
+                    )
+                    continue
                 if not _excel_write_safe(default, rule):
                     _append_excel_write_safety_difference(differences, sheet, rule, default, row_number=row_number, cell=cell, key=key)
                     continue
@@ -903,6 +935,35 @@ def _append_excel_write_safety_difference(
         standard_raw_value=_safe_value(parsed.raw, rule),
         standard_normalized_value=_safe_value(parsed.normalized, rule),
         rule_id=f"{rule.name}.excel_write_timezone" if datetime_unsafe else f"{rule.name}.excel_write_precision",
+        render_action="report_only",
+    ))
+
+
+def _append_formula_cached_write_blocked(
+    differences: list[Difference] | SpillableSequence[Difference],
+    sheet: SheetRule,
+    rule: Any,
+    *,
+    formula_raw: Any,
+    cached: ParsedValue,
+    standard: ParsedValue,
+    row_number: int,
+    cell: str,
+    key: tuple[Any, ...],
+) -> None:
+    differences.append(_difference(
+        DifferenceType.UNSUPPORTED_FEATURE,
+        sheet,
+        "字段使用公式缓存值比较；自动写回会破坏原公式，必须人工确认",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet),
+        excel_raw_value=_safe_value(formula_raw, rule),
+        excel_normalized_value=_safe_value(cached.normalized, rule),
+        standard_raw_value=_safe_value(standard.raw, rule),
+        standard_normalized_value=_safe_value(standard.normalized, rule),
+        rule_id=f"{rule.name}.formula_cached_write_blocked",
         render_action="report_only",
     ))
 

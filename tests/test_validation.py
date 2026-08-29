@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
@@ -9,7 +10,7 @@ from excel_auditor.models import RuleSet
 from excel_auditor.pandera_adapter import StandardDataValidator
 from excel_auditor.service import _field_statistics
 from excel_auditor.snapshots import SpilledRecords
-from excel_auditor.workbook import inspect_workbook
+from excel_auditor.workbook import SheetSnapshot, WorkbookSnapshot, inspect_workbook
 
 
 @pytest.mark.parametrize("epoch", [WINDOWS_EPOCH, MAC_EPOCH])
@@ -480,6 +481,58 @@ def test_excel_json_field_reports_duplicate_object_keys_as_invalid(tmp_path):
         assert len(invalid) == 1
         assert invalid[0].type.value == "INVALID_VALUE"
         assert "duplicate object key" in invalid[0].message
+    finally:
+        result.close()
+        snapshot.close()
+
+
+@pytest.mark.parametrize("repair_mode", ["overwrite", "fill", "default"])
+def test_cached_formula_comparison_never_replaces_the_formula(repair_mode):
+    actions = {}
+    amount = {
+        "name": "amount", "title": "Amount", "type": "decimal",
+        "compare": {"mode": "numeric", "formula_mode": "cached_value"},
+    }
+    cached_value = None
+    standard_value = None
+    if repair_mode == "overwrite":
+        actions["overwrite_mismatch"] = True
+        cached_value = "2"
+        standard_value = "3"
+    elif repair_mode == "fill":
+        actions["fill_empty_from_standard"] = True
+        standard_value = "3"
+    else:
+        amount.update({"fill_static_default": True, "static_default": "5"})
+    rules = RuleSet.model_validate({
+        "schema_id": f"cached-formula-{repair_mode}", "schema_version": "1.0.0", "name": "Cached formula",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"], "actions": actions,
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                amount,
+            ],
+        }],
+    })
+    sheet = SheetSnapshot(
+        "Data",
+        2,
+        2,
+        [(1, ["ID", "Amount"]), (2, ["E1", "=1+1"])],
+        cached_values={"B2": cached_value},
+    )
+    snapshot = WorkbookSnapshot(Path("cached-formula.xlsx"), "0" * 64, {"Data": sheet})
+    result = compare_workbook(
+        snapshot,
+        {"data": [{"id": "E1", "amount": standard_value}]},
+        rules,
+    )
+    try:
+        blocked = [item for item in result.differences if item.rule_id == "amount.formula_cached_write_blocked"]
+        assert len(blocked) == 1
+        assert blocked[0].excel_raw_value == "=1+1"
+        assert result.manual_review_reasons == ["Data: formula_cached_value_write_blocked:amount"]
+        assert list(result.repairs) == []
     finally:
         result.close()
         snapshot.close()
