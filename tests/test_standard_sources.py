@@ -206,3 +206,15 @@ def test_managed_http_canonicalization_rejects_conflicting_aliases():
 
     with pytest.raises(ValueError, match=r"STANDARD_DATA_INVALID: people\.id has conflicting field representations at record 1"):
         _canonicalize_standard({"people": [{"id": "E001", "工号": "E002"}]}, rules)
+
+
+def test_managed_http_canonicalization_rejects_duplicate_sheet_mapping():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "人员", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "编号", "required": True}
+        ]}],
+    })
+
+    with pytest.raises(ValueError, match="STANDARD_DATA_INVALID: duplicate sheet mapping: people"):
+        _canonicalize_standard({"people": [{"id": "E001"}], "人员": [{"id": "E002"}]}, rules)

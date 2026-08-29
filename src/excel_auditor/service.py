@@ -607,6 +607,12 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
         if sheet_rule is None:
             result[str(key)] = rows
             continue
+        if sheet_rule.id in result:
+            close_source = getattr(rows, "close", None)
+            if close_source is not None:
+                close_source()
+            _close_record_sequences(result)
+            raise ValueError(f"STANDARD_DATA_INVALID: duplicate sheet mapping: {sheet_rule.id}")
         canonical_rows: list[dict[str, Any]] | SpilledRecords = SpilledRecords() if len(rows) > spill_threshold else []
         try:
             for record_index, row in enumerate(rows, start=1):

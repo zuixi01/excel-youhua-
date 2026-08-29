@@ -166,7 +166,7 @@ async def precheck_workbook(
         try:
             comparison = compare_workbook(workbook, {sheet.id: [] for sheet in rules.sheets}, rules)
             header_types = {
-                DifferenceType.MISSING_SHEET, DifferenceType.EXTRA_SHEET, DifferenceType.HEADER_NOT_FOUND,
+                DifferenceType.MISSING_SHEET, DifferenceType.EXTRA_SHEET, DifferenceType.AMBIGUOUS_SHEET, DifferenceType.HEADER_NOT_FOUND,
                 DifferenceType.MISSING_HEADER, DifferenceType.EXTRA_HEADER, DifferenceType.DUPLICATE_HEADER,
                 DifferenceType.AMBIGUOUS_HEADER, DifferenceType.HEADER_ORDER_MISMATCH,
             }

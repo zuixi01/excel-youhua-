@@ -148,7 +148,21 @@ def compare_workbook(
     storage_backends: list[str] = []
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
-        actual_name = next((name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets), None)
+        matching_names = [name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets]
+        if len(matching_names) > 1:
+            consumed_sheets.update(matching_names)
+            differences.append(_difference(
+                DifferenceType.AMBIGUOUS_SHEET,
+                sheet_rule,
+                f"工作表规则同时匹配到多个物理工作表：{matching_names}",
+                severity="error",
+                render_action="report_only",
+            ))
+            manual_review_reasons.append(
+                f"{sheet_rule.id}: ambiguous_sheet:{'|'.join(matching_names)}"
+            )
+            continue
+        actual_name = matching_names[0] if matching_names else None
         if actual_name is None:
             if sheet_rule.required:
                 differences.append(_difference(DifferenceType.MISSING_SHEET, sheet_rule, f"缺少必需工作表：{sheet_rule.name}"))

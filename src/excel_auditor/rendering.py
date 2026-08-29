@@ -87,13 +87,17 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
             operation_count += 1
         for sheet_rule in rules.sheets:
-            if sheet_rule.name not in book.sheetnames:
+            physical_name = next(
+                (name for name in [sheet_rule.name, *sheet_rule.aliases] if name in book.sheetnames),
+                None,
+            )
+            if physical_name is None:
                 continue
-            sheet = book[sheet_rule.name]
-            risky = workbook.sheets[sheet_rule.name].risky_features
+            sheet = book[physical_name]
+            risky = workbook.sheets[physical_name].risky_features
             missing = [item for item in comparison.differences if item.sheet_id == sheet_rule.id and item.type == DifferenceType.MISSING_HEADER and item.render_action == "insert_and_mark_green"]
             if missing and risky:
-                warnings.append(f"{sheet_rule.name}: development renderer refused column insertion because of {', '.join(risky)}")
+                warnings.append(f"{physical_name}: development renderer refused column insertion because of {', '.join(risky)}")
                 continue
             operation_count += _insert_missing_columns(sheet, sheet_rule, missing, rules.colors.inserted)
         for repair in comparison.repairs:

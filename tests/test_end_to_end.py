@@ -6,7 +6,7 @@ from openpyxl import Workbook, load_workbook
 
 from excel_auditor.rules import load_rules
 from excel_auditor.models import RuleSet
-from excel_auditor.rendering import ExcelRenderer
+from excel_auditor.rendering import ExcelRenderer, OpenPyxlDevelopmentRenderer
 from excel_auditor.service import AuditService
 
 
@@ -308,6 +308,73 @@ def test_sheet_alias_is_preserved_in_differences_and_repairs(tmp_path):
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
     assert {item["sheet_name"] for item in report["differences"]} == {"Physical"}
     rendered = load_workbook(service.artifact(job_id, "excel"))
+    assert rendered["Physical"]["B2"].value == "new"
+    rendered.close()
+
+
+def test_multiple_physical_sheets_matching_one_rule_require_manual_review(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "ambiguous-sheet", "schema_version": "1.0.0", "name": "Ambiguous sheet",
+        "sheets": [{
+            "id": "data", "name": "Canonical", "aliases": ["Physical"], "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    excel, standard = tmp_path / "ambiguous-sheet.xlsx", tmp_path / "ambiguous-sheet.json"
+    book = Workbook()
+    canonical = book.active
+    canonical.title = "Canonical"
+    canonical.append(["ID"])
+    canonical.append(["E1"])
+    alias = book.create_sheet("Physical")
+    alias.append(["ID"])
+    alias.append(["E2"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [{"id": "E1"}]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "ambiguous-sheet-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "manual_review"
+    assert "excel" not in status["artifacts"]
+    assert any("ambiguous_sheet:Canonical|Physical" in warning for warning in status["warnings"])
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    assert [item["type"] for item in report["differences"]] == ["AMBIGUOUS_SHEET"]
+
+
+def test_development_renderer_inserts_and_fills_missing_column_on_sheet_alias(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "alias-insert", "schema_version": "1.0.0", "name": "Alias insert",
+        "sheets": [{
+            "id": "data", "name": "Canonical", "aliases": ["Physical"], "primary_key": ["id"],
+            "actions": {"fill_empty_from_standard": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value", "required": True, "missing_column_action": "insert"},
+            ],
+        }],
+    })
+    excel, standard = tmp_path / "alias-insert.xlsx", tmp_path / "alias-insert.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Physical"
+    sheet.append(["ID"])
+    sheet.append(["E1"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [{"id": "E1", "value": "new"}]}), encoding="utf-8")
+
+    service = AuditService(
+        tmp_path / "alias-insert-runtime",
+        renderer=OpenPyxlDevelopmentRenderer(),
+    )
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+
+    assert service.status(job_id)["status"] == "completed"
+    rendered = load_workbook(service.artifact(job_id, "excel"))
+    assert [rendered["Physical"].cell(1, column).value for column in (1, 2)] == ["ID", "Value"]
     assert rendered["Physical"]["B2"].value == "new"
     rendered.close()
 
