@@ -344,7 +344,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             key_fields = sheet.primary_key or [sheet.row_number_field]
             for name in key_fields:
                 col = columns.get(name)
-                differences.append(_difference(DifferenceType.EMPTY_PRIMARY_KEY, sheet, "主键为空或无法解析", cell=f"{get_column_letter(col)}{row_number}" if col else None, excel_row=row_number, canonical_field=name, excel_raw_value=record.get(name), render_action=key_action))
+                differences.append(_difference(DifferenceType.EMPTY_PRIMARY_KEY, sheet, "主键为空或无法解析", cell=f"{get_column_letter(col)}{row_number}" if col else None, excel_row=row_number, canonical_field=name, excel_raw_value=_safe_value(record.get(name), rules_by_name[name]), render_action=key_action))
             continue
         if key in excel_records:
             excel_duplicates[key].extend([excel_records[key][0], row_number])
