@@ -21,12 +21,12 @@
 | 9 | 字段及跨字段数据质量规则 | 本地已证明 | `pandera_adapter.py`、注册校验器；`test_validation.py` | 业务规则清单 |
 | 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试 | 业务方修复策略签署 |
 | 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言 | 客户端下载抽验 |
-| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden、LibreOffice CI 作业定义 | 远程 LibreOffice JUnit；Microsoft Excel 桌面验收记录 |
+| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `b639cc6` 的 [LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33248710765/job/99090538589) 及 JUnit 制品已通过 | Microsoft Excel 桌面验收记录 |
 | 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试 | 生产审计抽样 |
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
-| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden（含磁盘后备大文件及标准快照）；本地回归；标准规范化溢写、分块校验与流式快照；100k×100、100k×200、5 工作表和分页源性能实跑；性能工作流与上一成功主分支同场景指标做相对门禁且发布强制要求参考基线；小型人工标注 precision/recall；独立基础设施/性能/安全工作流 | 同一远程 SHA 的全套绿色运行和制品；业务标注基准；500k 稠密全流程负载 |
-| 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`、CI SBOM/许可证步骤 | 对发布 SHA 保存的 SBOM、许可证和漏洞扫描制品 |
-| 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | `ci.yml`/`release.yml` 先测试扫描后推送；生产 Compose 强制 tag | Git remote、成功发布运行、仓库中的 SHA/digest 镜像 |
+| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地 `141 passed, 5 skipped`；提交 `b639cc6` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33248710765) 七项与 [性能基线](https://github.com/zuixi01/excel-youhua-/actions/runs/33248715938) 六项全部绿色并保存制品；小型人工标注 precision/recall | 业务标注基准；500k 稠密全流程负载 |
+| 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `b639cc6` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |
+| 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送；生产 Compose 强制 tag | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
 | 18 | 精确回滚版本与命令 | 待外部验收 | `docs/deployment.md`、release manifest 生成逻辑 | 发布前后真实 digest 和一次回滚演练记录 |
 | 19 | 日志/报告不泄密或未脱敏敏感数据 | 本地已证明 | 掩码、manifest 脱敏、安全错误；Web Bearer 令牌仅存会话且下载走鉴权请求；`test_privacy.py`、`test_startup_security.py` | 生产日志抽检 |
 | 20 | 不支持/不安全场景明确失败或人工审核 | 本地已证明（已知边界） | 严格 manifest、未知操作拒绝；复杂公式/图表/透视/外链插列拒绝；已支持结构只报告而不误拦截；真正不支持的包结构即使配置 `allow/report` 也不可绕过人工审核；模糊/合并表头测试 | 业务真实复杂工作簿扩充 Golden，持续维护边界清单 |
@@ -44,8 +44,8 @@
 
 ## 当前阻止“生产完成”的外部输入
 
-1. 配置 Git remote，并让同一提交的 CI、性能、基础设施、LibreOffice、安全和 release 门禁全部通过。
-2. 保存推送后镜像 digest、SBOM、漏洞报告和 release manifest。
+1. 创建正式版本标签，让 release 门禁在已有 CI 和性能参考基线上构建、扫描并推送版本化镜像。
+2. 保存发布镜像 digest、镜像 SBOM、漏洞报告和 release manifest，并验证 GHCR 拉取。
 3. 在安装 Microsoft Excel 的验收机打开固定 Golden 及真实 `.xlsm` 样例，核验格式、关系、宏、签名和控件。
 4. 提供开发文档第 23 节列出的业务模板、脱敏异常文件、标准接口、主键/字段/敏感规则与容量目标。
 5. 提供目标服务器后，按 `AGENTS.md` 完成只读资源检查、指定 digest 部署、健康检查和回滚演练；服务器不承担构建。
