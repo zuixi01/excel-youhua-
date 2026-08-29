@@ -14,12 +14,12 @@
 
 ## 当前验证结果
 
-- 当前完整本地回归：`141 passed, 5 skipped`，覆盖率 81%；JUnit 和 Coverage XML 保存在本地 `.tools` 验证目录。
-- 当前远端提交 `b639cc64cd41dc99bbae8becb64095a2b787cda1` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33248710765) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。
-- 同一提交的 [性能基线](https://github.com/zuixi01/excel-youhua-/actions/runs/33248715938) 六项全部绿色：五个工作簿负载场景和 50,000 条分页标准源均生成指标及 JUnit 制品。此次运行播种了远程主分支首份稳定参考基线。
+- 当前完整本地生产 Renderer 回归：`143 passed, 5 skipped`，覆盖率 81%；JUnit 和 Coverage XML 保存在本地 `.tools` 验证目录。
+- 当前远端提交 `f4497164f1417ebf3886fb12118d082f79d0f976` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33249286131) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。
+- 同一提交的 [性能基线](https://github.com/zuixi01/excel-youhua-/actions/runs/33249290324) 六项全部绿色：五个工作簿负载场景和 50,000 条分页标准源均生成指标及 JUnit 制品，并通过与上一成功主分支基线的回归比较。分页标准源在 10,000 条阈值后使用磁盘落盘，远端实测 100 页/50,000 条为 0.155 秒。
 - 条件跳过项分别由上述性能、真实基础设施和 LibreOffice 专用远程作业承接；远程通过不改变“本机未执行”的事实。
 - 本地 Windows Renderer locked restore/build/publish 通过；新增 Renderer 合约测试通过。
-- 最新记录的性能基线：10k×50 为 12.297 秒/52.13 MiB；100k×100 为 37.783 秒/252.79 MiB；100k×200、50% 差异为 51.325 秒/422.52 MiB；5 工作表 50k×50 为 11.232 秒/30.96 MiB；50,000 条分页标准源为 0.119 秒。详见 `docs/performance-baselines.json`。
+- 仓库记录的参考性能基线：10k×50 为 12.297 秒/52.13 MiB；100k×100 为 37.783 秒/252.79 MiB；100k×200、50% 差异为 51.325 秒/422.52 MiB；5 工作表 50k×50 为 11.232 秒/30.96 MiB；50,000 条分页标准源为 0.119 秒。详见 `docs/performance-baselines.json`；当前远端运行的分页落盘场景为 0.155 秒且未触发回归门禁。
 - 性能工作流会下载上一成功主分支运行的同场景指标，按约定时间/内存回归阈值比较；定时或手工作业可播种首份基线，正式发布缺少参考基线或发生实质回归都会失败。
 - Python、Node、NuGet 锁文件以及安全/许可证/SBOM 工作流已配置；本地已对锁定的 Python、Node、NuGet 依赖执行漏洞检查，Python 环境的 86 个包未发现 GPL/AGPL。远程 CI 已保存 `dependency-governance` 制品；GitHub Actions 已升级到官方最新发布版并固定不可变提交 SHA，运行不再产生 Node 20 运行时弃用告警。
 
@@ -29,7 +29,7 @@
 - 当前主机未安装 Microsoft Excel 或 LibreOffice；LibreOffice 已由远程专用作业出具绿色 JUnit 证据，Microsoft Excel 桌面打开验收仍不能伪造。
 - 当前 Docker `desktop-linux` Engine 可响应，但只读前置检查显示可用内存约 2.9 GiB（低于总内存 25% 的安全门槛）、C 盘可用比例约 19%（低于 20%），且已有 11 个其他项目容器运行。按 `AGENTS.md` 已熔断，不启动额外基础设施或构建镜像；最新源码对应镜像的最终重建、容器冒烟和 High/Critical 扫描仍无本机证据，历史镜像结果不能替代。
 - `.xlsm` 现有测试使用固定 VBA 部件验证字节保持，不等同于真实业务宏、数字签名、ActiveX/VML 控件在 Excel 客户端中的验收。
-- 大文件 Inspector 和规范标准记录均可溢写到临时文件；标准数据 Pandera 校验按块执行、跨块检查唯一性，快照按源顺序流式写入且不再全量排序复制；达到阈值后主键集合使用 Polars 分区 Parquet 连接。100k×100、100k×200 和固定大文件 Golden 已证明部分路径。上传 JSON/受管 HTTP 获取仍先形成源载荷，比较阶段仍会构造记录载荷映射与完整差异对象列表，因此文档所述 500k 条稠密业务数据的全流程峰值内存尚未由真实负载证明。
+- 大文件 Inspector 和规范标准记录均可溢写到临时文件；标准数据 Pandera 校验按块执行、跨块检查唯一性，快照按源顺序流式写入且不再全量排序复制；受管 HTTP 分页记录达到可配置阈值后也会迁移到磁盘后备序列，偏移索引使用紧凑的 64 位数组。达到阈值后主键集合使用 Polars 分区 Parquet 连接。100k×100、100k×200、固定大文件 Golden 和 50,000 条分页落盘基线已证明部分路径。上传 JSON 仍会先全量解析，比较阶段仍会构造记录载荷映射与完整差异对象列表，因此文档所述 500k 条稠密业务数据的全流程峰值内存尚未由真实负载证明。
 - precision/recall 已覆盖人工标注的表头、记录、字段差异和修复小型基准，但仍需业务方提供具有代表性的人工标注基准集。
 - 尚未连接部署服务器，因此没有部署前资源检查、实际部署 digest、健康检查和回滚演练记录。
 - 开发文档第 23 节要求的业务标准模板、2–3 份脱敏异常文件、真实接口契约、主键/字段/敏感数据规则和容量目标仍需业务方提供，才能完成业务验收而非通用样例验收。
