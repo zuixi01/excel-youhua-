@@ -3,9 +3,9 @@ from __future__ import annotations
 import html
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from .models import AuditReport
+from .models import AuditReport, Difference
 
 
 def write_json_report(report: AuditReport, path: Path) -> None:
@@ -52,3 +52,9 @@ def write_html_report(report: AuditReport, path: Path) -> None:
                 item.standard_normalized_value, item.rule_id, item.render_action, item.repair_status, item.message,
             ]) + "</tr>")
         handle.write("</tbody></table></body></html>")
+
+
+def write_differences_jsonl(differences: Sequence[Difference], path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for difference in differences:
+            handle.write(json.dumps(difference.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"), default=str) + "\n")

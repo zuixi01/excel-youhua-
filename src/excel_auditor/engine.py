@@ -21,6 +21,8 @@ from .models import (
     normalize_header,
 )
 from .normalization import ParsedValue, parse_value, values_equal
+from .record_store import DiskBackedRecordMap
+from .spill import SpillableSequence
 from .workbook import SheetSnapshot, WorkbookSnapshot
 from .validators import run_validator
 from .ids import new_ulid
@@ -29,11 +31,19 @@ from .ids import new_ulid
 @dataclass
 class ComparisonResult:
     mappings: list[HeaderMapping]
-    differences: list[Difference]
+    differences: Sequence[Difference]
     summary: ReportSummary
-    repairs: list["RepairOperation"]
+    repairs: Sequence["RepairOperation"]
     manual_review_reasons: list[str] | None = None
     join_backends: list[str] | None = None
+    report_only: bool = False
+    storage_backends: list[str] | None = None
+
+    def close(self) -> None:
+        for sequence in (self.differences, self.repairs):
+            close = getattr(sequence, "close", None)
+            if close is not None:
+                close()
 
 
 @dataclass(frozen=True)
@@ -89,13 +99,29 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
     return mappings, canonical_columns
 
 
-def compare_workbook(workbook: WorkbookSnapshot, standard: dict[str, Sequence[dict[str, Any]]], rules: RuleSet) -> ComparisonResult:
-    differences: list[Difference] = []
-    repairs: list[RepairOperation] = []
+def compare_workbook(
+    workbook: WorkbookSnapshot,
+    standard: dict[str, Sequence[dict[str, Any]]],
+    rules: RuleSet,
+    *,
+    job_id: str | None = None,
+    difference_spill_threshold: int | None = None,
+) -> ComparisonResult:
+    threshold = difference_spill_threshold if difference_spill_threshold is not None else int(os.environ.get("EXCEL_AUDITOR_DIFFERENCE_SPILL_THRESHOLD", "50000"))
+    if threshold < 1:
+        raise ValueError("EXCEL_AUDITOR_DIFFERENCE_SPILL_THRESHOLD must be positive")
+
+    def attach_job_id(item: Difference) -> None:
+        if job_id is not None:
+            item.job_id = job_id
+
+    differences = SpillableSequence[Difference](threshold, on_append=attach_job_id)
+    repairs = SpillableSequence[RepairOperation](threshold)
     all_mappings: list[HeaderMapping] = []
     summary = ReportSummary()
     manual_review_reasons: list[str] = []
     join_backends: list[str] = []
+    storage_backends: list[str] = []
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
         actual_name = next((name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets), None)
@@ -121,7 +147,9 @@ def compare_workbook(workbook: WorkbookSnapshot, standard: dict[str, Sequence[di
         ):
             continue
         sheet_standard = standard.get(sheet_rule.id, standard.get(sheet_rule.name, []))
-        join_backends.append(_compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary))
+        join_backend, record_storage = _compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary)
+        join_backends.append(join_backend)
+        storage_backends.append(record_storage)
     for extra_name in set(workbook.sheets) - consumed_sheets:
         pseudo = rules.sheets[0]
         differences.append(_difference(DifferenceType.EXTRA_SHEET, pseudo, f"存在规则未声明的工作表：{extra_name}", sheet_name=extra_name, severity="warning"))
@@ -129,12 +157,23 @@ def compare_workbook(workbook: WorkbookSnapshot, standard: dict[str, Sequence[di
     summary.mismatched_cells = sum(item.type == DifferenceType.VALUE_MISMATCH for item in differences)
     summary.validation_errors = sum(item.type in {DifferenceType.INVALID_VALUE, DifferenceType.VALIDATION_ERROR} for item in differences)
     summary.repairs_planned = sum(item.repair_status == "planned" for item in differences)
-    manual_review_reasons.extend(
+    manual_review_reasons.extend(sorted({
         f"{item.sheet_name}: fuzzy_value_suggestion:{item.canonical_field}"
         for item in differences
         if item.rule_id and item.rule_id.endswith(".fuzzy_suggestion")
+    }))
+    spilled = differences.spilled or repairs.spilled
+    storage_backends.append("disk_differences" if spilled else "memory_differences")
+    return ComparisonResult(
+        all_mappings,
+        differences.finish(),
+        summary,
+        repairs.finish(),
+        manual_review_reasons,
+        join_backends,
+        report_only=spilled,
+        storage_backends=sorted(set(storage_backends)),
     )
-    return ComparisonResult(all_mappings, differences, summary, repairs, manual_review_reasons, join_backends)
 
 
 def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonical_columns: dict[str, int], repairs: list[RepairOperation]) -> list[Difference]:
@@ -208,7 +247,7 @@ def _locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, 
     return best_rows[0], None
 
 
-def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> str:
+def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str]:
     rules_by_name = {column.name: column for column in sheet.columns}
     start_row = sheet.data_region.start_row or sheet.header.row + 1
     excel_records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
@@ -242,7 +281,12 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             duplicate_action = "mark_row_purple" if sheet.actions.duplicate_key == "mark_purple" else "report_only"
             differences.append(_difference(DifferenceType.DUPLICATE_PRIMARY_KEY, sheet, "Excel 中主键重复，不参与自动匹配", excel_row=row_number, business_key=_business_key(key, sheet), render_action=duplicate_action))
     _validate_excel_records(sheet, snapshot, columns, excel_records, rules_by_name, differences)
-    standard_records: dict[tuple[Any, ...], dict[str, Any]] = {}
+    join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
+    if join_threshold < 1:
+        raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
+    use_disk_records = len(excel_records) + len(standard_rows) >= join_threshold
+    standard_records: dict[tuple[Any, ...], dict[str, Any]] | DiskBackedRecordMap
+    standard_records = DiskBackedRecordMap() if use_disk_records else {}
     standard_duplicates: set[tuple[Any, ...]] = set()
     for standard_ordinal, record in enumerate(standard_rows, start=1):
         standard_row_number = record.get(sheet.row_number_field) if sheet.primary_key_mode == "row_number" else standard_ordinal
@@ -259,17 +303,14 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
     for key in standard_duplicates:
         standard_records.pop(key, None)
         differences.append(_difference(DifferenceType.DUPLICATE_PRIMARY_KEY, sheet, "标准数据中主键重复，不参与自动匹配", business_key=_business_key(key, sheet), render_action="report_only"))
-    join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
-    if join_threshold < 1:
-        raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
     if len(excel_records) + len(standard_records) >= join_threshold:
         from .partitioned_join import PolarsPartitionedKeyConnector
 
         excel_key_order = list(excel_records)
-        standard_key_order = list(standard_records)
+        standard_key_order = standard_records.iter_join_keys() if isinstance(standard_records, DiskBackedRecordMap) else list(standard_records)
         joined = PolarsPartitionedKeyConnector().classify(excel_key_order, standard_key_order)
         excel_only = [excel_key_order[index] for index in joined.excel_only]
-        standard_only = [standard_key_order[index] for index in joined.standard_only]
+        standard_only = joined.standard_only if isinstance(standard_records, DiskBackedRecordMap) else [standard_key_order[index] for index in joined.standard_only]
         matched_keys = [excel_key_order[excel_index] for excel_index, _standard_index in joined.matched]
         join_backend = "polars_partitioned"
     else:
@@ -313,9 +354,13 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 differences.append(difference)
                 repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
     append_row = snapshot.max_row + 1
-    for key in standard_only:
+    for standard_reference in standard_only:
         summary.missing_records += 1
-        record = standard_records[key]
+        if isinstance(standard_records, DiskBackedRecordMap):
+            key, record = standard_records.item_at_join_index(int(standard_reference))
+        else:
+            key = standard_reference
+            record = standard_records[key]
         duplicate_in_excel = key in excel_duplicates
         append = sheet.actions.missing_record == "append_and_mark_green" and not duplicate_in_excel
         difference = _difference(
@@ -458,7 +503,9 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 )
                 differences.append(difference)
                 repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
-    return join_backend
+    if isinstance(standard_records, DiskBackedRecordMap):
+        standard_records.close()
+    return join_backend, "disk_standard_records" if use_disk_records else "memory_standard_records"
 
 
 def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:

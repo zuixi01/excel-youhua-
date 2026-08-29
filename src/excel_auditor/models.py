@@ -6,9 +6,11 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
+
+from .spill import SpillableSequence
 
 
 class StrictModel(BaseModel):
@@ -479,7 +481,10 @@ class AuditReport(StrictModel):
     standard_sha256: str
     standard_source_metadata: dict[str, Any] = Field(default_factory=dict)
     header_mappings: list[HeaderMapping] = Field(default_factory=list)
-    differences: list[Difference] = Field(default_factory=list)
+    # Large report-mode comparisons may keep the complete difference stream in
+    # a disk-backed Sequence. Validation occurs when each Difference is created;
+    # preserving the sequence here avoids materializing it again in the report.
+    differences: SkipValidation[Sequence[Difference]] = Field(default_factory=list)
     summary: ReportSummary = Field(default_factory=ReportSummary)
     warnings: list[str] = Field(default_factory=list)
     workbook_structure: list[dict[str, Any]] = Field(default_factory=list)
@@ -488,3 +493,12 @@ class AuditReport(StrictModel):
     field_statistics: dict[str, dict[str, Any]] = Field(default_factory=dict)
     data_quality_summary: dict[str, int] = Field(default_factory=dict)
     output_sha256: str | None = None
+
+    @field_validator("differences", mode="before")
+    @classmethod
+    def validate_difference_sequence(cls, value: Any) -> Sequence[Difference]:
+        if isinstance(value, SpillableSequence):
+            return value
+        if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+            raise ValueError("differences must be a sequence")
+        return [item if isinstance(item, Difference) else Difference.model_validate(item) for item in value]

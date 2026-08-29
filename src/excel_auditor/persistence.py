@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, delete, select
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, delete, insert, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from .models import AuditReport, RuleSet
@@ -200,12 +200,31 @@ class DatabaseRepository:
     def save_differences(self, report: AuditReport) -> None:
         now = _now()
         with Session(self.engine) as session, session.begin():
+            batch: list[dict[str, Any]] = []
             for item in report.differences:
                 key_hash = None
                 if item.business_key is not None:
                     stable = json.dumps(item.business_key, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                     key_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
-                session.add(DifferenceIndexRow(id=item.difference_id, job_id=report.job_id, type=item.type.value, severity=item.severity, sheet_id=item.sheet_id, cell_ref=item.cell, canonical_field=item.canonical_field, business_key_hash=key_hash, message_safe=item.message, render_action=item.render_action, repair_status=item.repair_status, created_at=now))
+                batch.append({
+                    "id": item.difference_id,
+                    "job_id": report.job_id,
+                    "type": item.type.value,
+                    "severity": item.severity,
+                    "sheet_id": item.sheet_id,
+                    "cell_ref": item.cell,
+                    "canonical_field": item.canonical_field,
+                    "business_key_hash": key_hash,
+                    "message_safe": item.message,
+                    "render_action": item.render_action,
+                    "repair_status": item.repair_status,
+                    "created_at": now,
+                })
+                if len(batch) >= 1_000:
+                    session.execute(insert(DifferenceIndexRow), batch)
+                    batch.clear()
+            if batch:
+                session.execute(insert(DifferenceIndexRow), batch)
 
     def mark_repair_results(self, job_id: str, results: dict[str, str]) -> None:
         with Session(self.engine) as session, session.begin():

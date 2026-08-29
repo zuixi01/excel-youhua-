@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import polars as pl
 
@@ -26,7 +26,7 @@ class PolarsPartitionedKeyConnector:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
 
-    def classify(self, excel_keys: Sequence[tuple[Any, ...]], standard_keys: Sequence[tuple[Any, ...]]) -> PartitionedKeyJoin:
+    def classify(self, excel_keys: Iterable[tuple[Any, ...]], standard_keys: Iterable[tuple[Any, ...]]) -> PartitionedKeyJoin:
         with tempfile.TemporaryDirectory(prefix="excel-auditor-key-join-") as temporary:
             root = Path(temporary)
             self._write_partitions(root, "excel", excel_keys)
@@ -61,7 +61,7 @@ class PolarsPartitionedKeyConnector:
         batch_ids: list[int] = []
         part = 0
         for row_id, key in enumerate(keys):
-            batch_keys.append(_stable_key(key))
+            batch_keys.append(stable_key(key))
             batch_ids.append(row_id)
             if len(batch_keys) >= self.batch_size:
                 self._write_part(root, prefix, part, batch_keys, batch_ids)
@@ -78,7 +78,7 @@ class PolarsPartitionedKeyConnector:
         frame.write_parquet(root / f"{prefix}-{part:06d}.parquet", compression="zstd")
 
 
-def _stable_key(key: tuple[Any, ...]) -> str:
+def stable_key(key: tuple[Any, ...]) -> str:
     return json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_key_value)
 
 

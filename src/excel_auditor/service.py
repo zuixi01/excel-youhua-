@@ -6,7 +6,9 @@ from contextlib import contextmanager
 import hashlib
 import os
 import shutil
+import sqlite3
 import stat
+import tempfile
 import time
 from collections.abc import Sequence as SequenceABC
 from collections import Counter
@@ -17,7 +19,7 @@ from typing import Any, Sequence
 from .engine import compare_workbook
 from .models import AuditReport, RuleSet
 from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer
-from .reporting import write_html_report, write_json_report
+from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
 from .persistence import DatabaseRepository
@@ -153,6 +155,7 @@ class AuditService:
         user_id = identity.get("user_id", "local")
         trace_id = identity.get("trace_id")
         started = time.perf_counter()
+        comparison: Any | None = None
         try:
             metrics.observe("queue_wait_seconds", max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(identity["created_at"])).total_seconds()))
         except (KeyError, ValueError, TypeError):
@@ -217,7 +220,7 @@ class AuditService:
             self._write_status(job_id, {**self.status(job_id), "status": "comparing", "progress": 40, "standard_snapshot_id": snapshot.snapshot_id, "object_keys": snapshot_objects})
             stage_started = time.perf_counter()
             try:
-                comparison = compare_workbook(workbook, standard, rules)
+                comparison = compare_workbook(workbook, standard, rules, job_id=job_id)
                 metrics.observe("stage_duration_seconds", time.perf_counter() - stage_started, stage="comparison")
             finally:
                 for rows in standard.values():
@@ -255,6 +258,7 @@ class AuditService:
                     *workbook.warnings,
                     *mapping_review_reasons,
                     *[f"comparison_backend:{backend}" for backend in sorted(set(comparison.join_backends or []))],
+                    *[f"comparison_storage:{backend}" for backend in sorted(set(comparison.storage_backends or []))],
                 ],
                 workbook_structure=[
                     {"sheet_name": item.name, "rows": item.max_row, "columns": item.max_column, "hidden_rows": len(item.hidden_rows), "features": item.risky_features}
@@ -277,7 +281,7 @@ class AuditService:
                 if report.summary.repairs_planned:
                     self.database.audit("comparison.auto_repair_planned", "comparison_job", job_id, user_id, {"repair_count": report.summary.repairs_planned, "schema_sha256": rules.content_sha256}, tenant_id)
             write_json_report(report, directory / "report.json")
-            _write_differences_jsonl(report.differences, directory / "differences.jsonl")
+            write_differences_jsonl(report.differences, directory / "differences.jsonl")
             # These reasons represent structures the current implementation cannot
             # prove safe.  They are never bypassed by the legacy allow/report
             # settings: unsupported work must fail or enter manual review (DoD 20).
@@ -301,10 +305,15 @@ class AuditService:
                 })
                 metrics.increment("jobs_terminal_total", status="manual_review")
                 return
-            if workbook.report_only:
-                report.warnings.append("LARGE_FILE_REPORT_ONLY: full-workbook coloring was intentionally skipped")
+            if workbook.report_only or comparison.report_only:
+                report_only_reason = "large_file_report_only" if workbook.report_only else "large_difference_report_only"
+                report.warnings.append(
+                    "LARGE_DIFFERENCE_REPORT_ONLY: difference payload exceeded the in-memory threshold; full-workbook coloring was intentionally skipped"
+                    if comparison.report_only and not workbook.report_only
+                    else "LARGE_FILE_REPORT_ONLY: full-workbook coloring was intentionally skipped"
+                )
                 write_json_report(report, directory / "report.json")
-                public_manifest = _non_rendering_manifest(report, "large_file_report_only")
+                public_manifest = _non_rendering_manifest(report, report_only_reason)
                 (directory / "render-manifest.json").write_text(json.dumps(public_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
                 write_html_report(report, directory / "report.html")
                 object_keys = self._upload_artifacts(job_id, directory, [input_path.name, "report.json", "differences.jsonl", "report.html", "render-manifest.json"])
@@ -380,7 +389,7 @@ class AuditService:
                 self.database.mark_repair_results(job_id, {item.difference_id: item.repair_status for item in report.differences if item.repair_status in {"applied", "failed"}})
                 self.database.audit("comparison.auto_repair_completed", "comparison_job", job_id, user_id, {"repair_count": report.summary.repairs_applied, "failure_count": report.summary.repair_failures, "output_sha256": report.output_sha256}, tenant_id)
             write_json_report(report, directory / "report.json")
-            _write_differences_jsonl(report.differences, directory / "differences.jsonl")
+            write_differences_jsonl(report.differences, directory / "differences.jsonl")
             write_html_report(report, directory / "report.html")
             object_keys = self._upload_artifacts(job_id, directory, [input_path.name, output_path.name, "report.json", "differences.jsonl", "report.html", "render-manifest.json"])
             self._write_status(job_id, {
@@ -423,6 +432,9 @@ class AuditService:
             self._write_status(job_id, {**previous, "status": "failed", "progress": previous.get("progress", 0), "completed_at": _now(), "error_code": error_code, "error_message_safe": _safe_error_message(error_code)})
             metrics.increment("jobs_terminal_total", status="failed", error_code=error_code)
             log_event(job_id=job_id, trace_id=trace_id, stage=previous.get("status", "unknown"), event="comparison.failed", duration_ms=int((time.perf_counter() - started) * 1000), safe_error_code=error_code)
+        finally:
+            if comparison is not None:
+                comparison.close()
 
     def _check_cancelled(self, job_id: str) -> None:
         if (self.job_directory(job_id) / "cancel.requested").is_file():
@@ -550,13 +562,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_differences_jsonl(differences: list[Any], path: Path) -> None:
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for difference in differences:
-            handle.write(json.dumps(difference.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
-
-
 def _field_statistics(comparison: Any) -> dict[str, dict[str, Any]]:
+    if comparison.report_only:
+        return _field_statistics_on_disk(comparison)
     affected: dict[str, set[tuple[str, int | None]]] = {}
     for item in comparison.differences:
         if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
@@ -566,6 +574,39 @@ def _field_statistics(comparison: Any) -> dict[str, dict[str, Any]]:
         name: {"difference_count": len(rows), "difference_rate": (min(1.0, len(rows) / denominator) if denominator else None)}
         for name, rows in sorted(affected.items())
     }
+
+
+def _field_statistics_on_disk(comparison: Any) -> dict[str, dict[str, Any]]:
+    descriptor, raw_path = tempfile.mkstemp(prefix="excel-auditor-field-statistics-", suffix=".sqlite3")
+    os.close(descriptor)
+    path = Path(raw_path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute(
+            "CREATE TABLE affected (field TEXT NOT NULL, sheet_id TEXT NOT NULL, excel_row INTEGER, UNIQUE(field, sheet_id, excel_row))"
+        )
+        batch: list[tuple[str, str, int | None]] = []
+        for item in comparison.differences:
+            if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
+                batch.append((item.canonical_field, item.sheet_id, item.excel_row))
+                if len(batch) >= 1_000:
+                    connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
+                    batch.clear()
+        if batch:
+            connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
+        denominator = comparison.summary.matched_records
+        return {
+            str(name): {
+                "difference_count": int(count),
+                "difference_rate": (min(1.0, int(count) / denominator) if denominator else None),
+            }
+            for name, count in connection.execute("SELECT field, COUNT(*) FROM affected GROUP BY field ORDER BY field")
+        }
+    finally:
+        connection.close()
+        path.unlink(missing_ok=True)
 
 
 def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str, Sequence[dict[str, Any]]]:

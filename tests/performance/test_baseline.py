@@ -12,7 +12,7 @@ from openpyxl import Workbook
 
 from excel_auditor.engine import compare_workbook
 from excel_auditor.models import AuditReport, RuleSet
-from excel_auditor.reporting import write_json_report
+from excel_auditor.reporting import write_differences_jsonl, write_json_report
 from excel_auditor.models import StandardSourceConfig
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
@@ -133,3 +133,120 @@ def test_paginated_standard_source_baseline(tmp_path):
         assert elapsed <= float(os.environ.get("PERF_HTTP_MAX_SECONDS", "60"))
     finally:
         records.close()
+
+
+@pytest.mark.performance
+def test_maximum_standard_comparison_baseline(tmp_path):
+    if os.environ.get("PERF_RUN_LARGE_STANDARD") != "1":
+        pytest.skip("set PERF_RUN_LARGE_STANDARD=1 to execute the maximum standard comparison")
+    record_count = int(os.environ.get("PERF_LARGE_STANDARD_RECORDS", "500000"))
+    excel_rows = int(os.environ.get("PERF_LARGE_EXCEL_ROWS", "99999"))
+    spill_after = int(os.environ.get("PERF_LARGE_DIFFERENCE_SPILL", "10000"))
+    assert 1 <= excel_rows <= 99_999 and excel_rows <= record_count
+    rules = RuleSet.model_validate({
+        "schema_id": "maximum-standard",
+        "schema_version": "1.0.0",
+        "name": "Maximum standard comparison",
+        "workbook": {"max_standard_records": record_count},
+        "sheets": [{
+            "id": "data",
+            "name": "Data",
+            "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    workbook_path = tmp_path / "maximum-standard.xlsx"
+    book = Workbook(write_only=True)
+    sheet = book.create_sheet("Data")
+    sheet.append(["ID"])
+    for index in range(excel_rows):
+        sheet.append([f"R{index:06d}"])
+    book.save(workbook_path)
+    standard = SpilledRecords()
+    for index in range(record_count):
+        standard.append({"id": f"R{index:06d}"})
+
+    process = psutil.Process()
+    baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stopped = threading.Event()
+
+    def sample_memory():
+        while not stopped.wait(0.02):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
+    started = time.perf_counter()
+    cpu_started = process.cpu_times()
+    snapshot = inspect_workbook(workbook_path, rules)
+    inspected = time.perf_counter()
+    result = None
+    try:
+        result = compare_workbook(
+            snapshot,
+            {"data": standard},
+            rules,
+            job_id="job_maximum_standard",
+            difference_spill_threshold=spill_after,
+        )
+        compared = time.perf_counter()
+        report = AuditReport(
+            job_id="job_maximum_standard",
+            created_at=datetime.now(timezone.utc),
+            schema_id=rules.schema_id,
+            schema_version=rules.schema_version,
+            schema_sha256=rules.content_sha256,
+            input_sha256=snapshot.sha256,
+            standard_snapshot_id="std_maximum_standard",
+            standard_sha256="0" * 64,
+            header_mappings=result.mappings,
+            differences=result.differences,
+            summary=result.summary,
+        )
+        report_path = tmp_path / "maximum-standard-report.json"
+        jsonl_path = tmp_path / "maximum-standard-differences.jsonl"
+        write_json_report(report, report_path)
+        write_differences_jsonl(report.differences, jsonl_path)
+        elapsed = time.perf_counter() - started
+        cpu_finished = process.cpu_times()
+        metrics = {
+            "standard_records": record_count,
+            "excel_rows": excel_rows,
+            "matched_records": result.summary.matched_records,
+            "missing_records": result.summary.missing_records,
+            "differences": result.summary.differences,
+            "join_backends": sorted(set(result.join_backends or [])),
+            "storage_backends": sorted(set(result.storage_backends or [])),
+            "report_only": result.report_only,
+            "inspect_seconds": round(inspected - started, 3),
+            "compare_seconds": round(compared - inspected, 3),
+            "report_seconds": round(elapsed - (compared - started), 3),
+            "render_seconds": 0,
+            "cpu_seconds": round((cpu_finished.user + cpu_finished.system) - (cpu_started.user + cpu_started.system), 3),
+            "elapsed_seconds": round(elapsed, 3),
+            "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2),
+            "report_bytes": report_path.stat().st_size,
+            "jsonl_bytes": jsonl_path.stat().st_size,
+        }
+        print(metrics)
+        if output := os.environ.get("PERF_LARGE_STANDARD_RESULT_PATH"):
+            Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        assert result.summary.matched_records == excel_rows
+        assert result.summary.missing_records == record_count - excel_rows
+        assert result.summary.differences == record_count - excel_rows
+        expected_join = "polars_partitioned" if record_count + excel_rows >= int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000")) else "python_in_memory"
+        assert result.join_backends == [expected_join]
+        expected_record_storage = "disk_standard_records" if expected_join == "polars_partitioned" else "memory_standard_records"
+        assert result.report_only and result.storage_backends == ["disk_differences", expected_record_storage]
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            assert sum(1 for _line in handle) == result.summary.differences
+        assert elapsed <= float(os.environ.get("PERF_LARGE_STANDARD_MAX_SECONDS", "900"))
+        assert metrics["peak_rss_delta_mib"] <= float(os.environ.get("PERF_LARGE_STANDARD_MAX_RSS_MIB", "2048"))
+    finally:
+        stopped.set()
+        sampler.join()
+        if result is not None:
+            result.close()
+        snapshot.close()
+        standard.close()
