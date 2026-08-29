@@ -174,6 +174,60 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     assert json.loads(rejected.stderr)["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
 
 
+def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_values(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    rules = RuleSet.model_validate({
+        "schema_id": "typed-repairs", "schema_version": "1.0.0", "name": "Typed repairs",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"overwrite_mismatch": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "active", "title": "Active", "type": "boolean"},
+                {"name": "status", "title": "Status", "type": "enum", "enum_values": ["active", "inactive"], "enum_aliases": {"A": "active"}},
+                {"name": "event_at", "title": "Event", "type": "datetime", "compare": {"mode": "datetime", "timezone": "Asia/Shanghai"}},
+                {"name": "tags", "title": "Tags", "type": "set"},
+                {"name": "payload", "title": "Payload", "type": "json"},
+                {"name": "ratio", "title": "Ratio", "type": "decimal", "normalize": ["percent_to_decimal"], "compare": {"mode": "numeric"}},
+            ],
+        }],
+    })
+    source, standard = tmp_path / "typed-repairs.xlsx", tmp_path / "typed-repairs.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Active", "Status", "Event", "Tags", "Payload", "Ratio"])
+    sheet.append(["E1", False, "inactive", "2026-01-01T00:00:00+08:00", "c", '{"z":0}', 0])
+    book.save(source)
+    standard.write_text(json.dumps({"data": [{
+        "id": "E1", "active": "yes", "status": "A", "event_at": "2026-01-01T00:00:00Z",
+        "tags": "b,a,a", "payload": {"b": 2, "a": 1}, "ratio": "10%",
+    }]}), encoding="utf-8")
+    service = AuditService(tmp_path / "typed-repair-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+    job_id = service.create_job()
+    service.run(job_id, source, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["repairs_applied"] == 6
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    result = rendered["Data"]
+    assert result["B2"].value is True and result["B2"].data_type == "b"
+    assert result["C2"].value == "active"
+    assert result["D2"].value.isoformat() == "2026-01-01T08:00:00"
+    assert result["E2"].value == "a,b"
+    assert result["F2"].value == '{"a":1,"b":2}'
+    assert result["G2"].value == pytest.approx(0.1) and result["G2"].data_type == "n"
+    rendered.close()
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    raw_by_field = {item["canonical_field"]: item["standard_raw_value"] for item in report["differences"]}
+    assert raw_by_field["active"] == "yes"
+    assert raw_by_field["event_at"] == "2026-01-01T00:00:00Z"
+    assert raw_by_field["ratio"] == "10%"
+
+
 def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_ranges(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:

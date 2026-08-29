@@ -426,7 +426,8 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
+                default_value = _excel_write_value(parse_value(rule.static_default, rule), rule)
+                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     append_row = snapshot.max_row + 1
     for standard_reference in standard_only:
         summary.missing_records += 1
@@ -454,7 +455,11 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         )
         differences.append(difference)
         if append:
-            repairs.append(RepairOperation("append_record", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, excel_row=append_row, values=record))
+            write_record = {
+                name: _excel_write_value(parse_value(record.get(name), rule), rule)
+                for name, rule in rules_by_name.items()
+            }
+            repairs.append(RepairOperation("append_record", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, excel_row=append_row, values=write_record))
             append_row += 1
     for key in matched_keys:
         summary.matched_records += 1
@@ -467,11 +472,13 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     continue
                 right = parse_value(standard_record.get(name), rule)
                 repair_value = None
+                write_value = None
                 repair_rule = None
                 if sheet.actions.fill_empty_from_standard and right.valid and right.normalized is not None:
-                    repair_value, repair_rule = right.raw, f"{name}.fill_empty_from_standard"
+                    repair_value, write_value, repair_rule = right.raw, _excel_write_value(right, rule), f"{name}.fill_empty_from_standard"
                 elif rule.fill_static_default:
-                    repair_value, repair_rule = rule.static_default, f"{name}.fill_static_default"
+                    default = parse_value(rule.static_default, rule)
+                    repair_value, write_value, repair_rule = rule.static_default, _excel_write_value(default, rule), f"{name}.fill_static_default"
                 if repair_rule is not None:
                     difference = _difference(
                         DifferenceType.NORMALIZED_MATCH,
@@ -487,7 +494,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                         repair_status="planned",
                     )
                     differences.append(difference)
-                    repairs.append(RepairOperation("set_field", sheet.id, sheet.name, repair_rule, difference.difference_id, excel_row=row_number, canonical_field=name, value=repair_value))
+                    repairs.append(RepairOperation("set_field", sheet.id, sheet.name, repair_rule, difference.difference_id, excel_row=row_number, canonical_field=name, value=write_value))
                 continue
             rule = rules_by_name[name]
             left_raw = excel_record.get(name)
@@ -570,7 +577,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 )
                 differences.append(difference)
                 if repair:
-                    repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=right.raw))
+                    repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=_excel_write_value(right, rule)))
             elif left.normalized is None and rule.fill_static_default:
                 difference = _difference(
                     DifferenceType.NORMALIZED_MATCH,
@@ -587,7 +594,8 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
+                default_value = _excel_write_value(parse_value(rule.static_default, rule), rule)
+                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     if isinstance(standard_records, DiskBackedRecordMap):
         standard_records.close()
     return join_backend, "disk_standard_records" if use_disk_records else "memory_standard_records"
@@ -685,6 +693,29 @@ def _safe_value(value: Any, rule: Any) -> Any:
 
 def _safe_record(record: dict[str, Any], rules_by_name: dict[str, Any]) -> dict[str, Any]:
     return {name: _safe_value(value, rules_by_name[name]) if name in rules_by_name else value for name, value in record.items()}
+
+
+def _excel_write_value(parsed: ParsedValue, rule: Any) -> Any:
+    """Return a deterministic, type-preserving value for the renderer.
+
+    Reports retain ``parsed.raw`` separately. Repairs must use the same typed
+    normalization that comparison used, otherwise aliases, percentages,
+    booleans and timezone-aware datetimes can be written back as different
+    semantics or as plain text.
+    """
+    if not parsed.valid or parsed.normalized is None:
+        return None
+    if rule.type.value == "decimal":
+        return str(parsed.normalized)
+    if rule.type.value in {"date", "datetime"}:
+        return parsed.normalized.isoformat()
+    if rule.type.value == "set":
+        return rule.separator.join(str(value) for value in parsed.normalized)
+    if rule.type.value == "json":
+        return str(parsed.normalized)
+    if rule.type.value in {"integer", "boolean", "enum"}:
+        return parsed.normalized
+    return parsed.raw
 
 
 def _should_insert_missing(sheet: SheetRule, column: Any) -> bool:
