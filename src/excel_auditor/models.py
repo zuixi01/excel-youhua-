@@ -275,6 +275,17 @@ class ColumnRule(StrictModel):
             raise ValueError("parse formats must be unique")
         return values
 
+    @field_validator("format")
+    @classmethod
+    def valid_excel_number_format(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("Excel number format must not be blank")
+        if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+            raise ValueError("Excel number format must not contain control characters")
+        return value
+
     @model_validator(mode="after")
     def validate_field(self) -> "ColumnRule":
         allowed_normalizers = {"trim", "unicode_nfkc", "collapse_spaces", "uppercase", "lowercase", "casefold", "remove_group_separator", "remove_currency_symbol", "percent_to_decimal"}

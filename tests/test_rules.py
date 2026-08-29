@@ -385,6 +385,14 @@ def test_display_format_normalization_requires_numeric_or_temporal_type_and_expl
         RuleSet.model_validate(payload)
 
 
+@pytest.mark.parametrize("number_format", ["   ", "0.00\n[Red]"])
+def test_excel_number_format_rejects_blank_or_control_characters(number_format):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["format"] = number_format
+    with pytest.raises(ValidationError, match="number format"):
+        RuleSet.model_validate(payload)
+
+
 def test_enum_aliases_and_static_repair_defaults_must_satisfy_the_rule():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["columns"][4]["enum_aliases"]["未知"] = "不存在"
