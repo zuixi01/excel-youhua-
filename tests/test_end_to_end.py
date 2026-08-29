@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 
 from excel_auditor.rules import load_rules
 from excel_auditor.models import RuleSet
@@ -785,6 +786,7 @@ def test_higher_priority_invalid_cell_is_not_overwritten_by_extra_row_mark(tmp_p
     sheet.title = "Data"
     sheet.append(["ID", "Amount"])
     sheet.append(["EXTRA", "-1"])
+    sheet["B2"].comment = Comment("用户原批注", "Alice")
     book.save(excel)
     standard.write_text(json.dumps({"data": []}), encoding="utf-8")
     matched_excel, matched_standard = tmp_path / "color-priority-matched.xlsx", tmp_path / "color-priority-matched.json"
@@ -793,6 +795,7 @@ def test_higher_priority_invalid_cell_is_not_overwritten_by_extra_row_mark(tmp_p
     sheet.title = "Data"
     sheet.append(["ID", "Amount"])
     sheet.append(["E1", "-1"])
+    sheet["B2"].comment = Comment("用户原批注", "Alice")
     book.save(matched_excel)
     matched_standard.write_text(json.dumps({"data": [{"id": "E1", "amount": "5"}]}), encoding="utf-8")
     renderers = [("development", OpenPyxlDevelopmentRenderer())]
@@ -812,6 +815,8 @@ def test_higher_priority_invalid_cell_is_not_overwritten_by_extra_row_mark(tmp_p
         result = rendered["Data"]
         assert result["A2"].fill.fgColor.rgb.endswith(rules.colors.extra)
         assert result["B2"].fill.fgColor.rgb.endswith(rules.colors.invalid)
+        assert result["B2"].comment.author == "Alice"
+        assert "用户原批注\n\n[Excel Auditor]\n" in result["B2"].comment.text
         assert "最小值" in result["B2"].comment.text
         rendered.close()
         manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
@@ -826,6 +831,8 @@ def test_higher_priority_invalid_cell_is_not_overwritten_by_extra_row_mark(tmp_p
         matched_rendered = load_workbook(matched_service.artifact(matched_job, "excel"), data_only=False)
         matched_cell = matched_rendered["Data"]["B2"]
         assert matched_cell.fill.fgColor.rgb.endswith(rules.colors.invalid)
+        assert matched_cell.comment.author == "Alice"
+        assert "用户原批注\n\n[Excel Auditor]\n" in matched_cell.comment.text
         assert "最小值" in matched_cell.comment.text
         assert "字段值与标准数据不一致" in matched_cell.comment.text
         matched_rendered.close()

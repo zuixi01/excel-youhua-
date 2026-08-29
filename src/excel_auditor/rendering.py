@@ -106,9 +106,9 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             cell = book[repair.sheet_name][repair.cell]
             _set_safe_value(cell, repair.value)
             cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-            cell.comment = Comment(
+            _set_audit_comment(
+                cell,
                 _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
-                "Excel Auditor",
             )
             operation_count += 1
         for sheet_rule in rules.sheets:
@@ -136,9 +136,9 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 cell = sheet.cell(repair.excel_row, positions[repair.canonical_field])
                 _set_safe_value(cell, repair.value)
                 cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                cell.comment = Comment(
+                _set_audit_comment(
+                    cell,
                     _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
-                    "Excel Auditor",
                 )
                 operation_count += 1
             elif repair.type == "append_record" and repair.excel_row and repair.values is not None:
@@ -150,9 +150,9 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                     cell = sheet.cell(repair.excel_row, positions[field])
                     _set_safe_value(cell, value)
                     cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                sheet.cell(repair.excel_row, 1).comment = Comment(
+                _set_audit_comment(
+                    sheet.cell(repair.excel_row, 1),
                     _repair_provenance_comment("自动追加标准记录", repair.rule_id, differences_by_id.get(repair.difference_id)),
-                    "Excel Auditor",
                 )
                 operation_count += 1
         if "核验报告" in book.sheetnames:
@@ -286,9 +286,9 @@ def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Differenc
             cell.font, cell.border, cell.alignment, cell.number_format, cell.protection = copy(source.font), copy(source.border), copy(source.alignment), source.number_format, copy(source.protection)
         cell.fill = PatternFill("solid", fgColor=color)
         difference = missing_by_name[rule.name]
-        cell.comment = Comment(
+        _set_audit_comment(
+            cell,
             _repair_provenance_comment("自动插入缺失表头", difference.rule_id or f"{rule.name}.missing_column", difference),
-            "Excel Auditor",
         )
     return len(plans)
 
@@ -393,9 +393,31 @@ def _comment(item: Difference) -> str:
 
 
 def _set_audit_comment(cell: Any, text: str) -> None:
-    if cell.comment is not None and cell.comment.author == "Excel Auditor":
-        text = f"{cell.comment.text} | {text}"[:32000]
-    cell.comment = Comment(text, "Excel Auditor")
+    audit_marker = "\n\n[Excel Auditor]\n"
+    author = "Excel Auditor"
+    if cell.comment is not None:
+        existing_text = cell.comment.text or ""
+        author = cell.comment.author or author
+        if cell.comment.author == "Excel Auditor":
+            audit_text = _merge_audit_comment_text(existing_text, text)
+            output = audit_text
+        else:
+            original, marker, previous_audit = existing_text.partition(audit_marker)
+            audit_text = _merge_audit_comment_text(previous_audit if marker else "", text)
+            output = original + audit_marker + audit_text
+    else:
+        output = text
+    if len(output.encode("utf-16-le")) // 2 > 32767:
+        raise RuntimeError("UNSUPPORTED_FEATURE: existing comment leaves insufficient room for an audit comment without data loss")
+    cell.comment = Comment(output, author)
+
+
+def _merge_audit_comment_text(existing: str, next_text: str) -> str:
+    if not existing:
+        return next_text
+    if existing == next_text or next_text in existing.split(" | "):
+        return existing
+    return f"{existing} | {next_text}"
 
 
 def _repair_provenance_comment(prefix: str, rule_id: str, difference: Difference | None) -> str:

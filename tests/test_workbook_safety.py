@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from excel_auditor.models import RuleSet
@@ -21,6 +22,30 @@ def test_package_feature_inventory_detects_drawings(tmp_path):
     snapshot = inspect_workbook(path, load_rules(Path("configs/examples/employee-roster.yaml")))
     assert "workbook: drawings" in snapshot.warnings
     assert "workbook: drawings" in snapshot.manual_review_reasons
+
+
+def test_real_cell_comment_vml_is_not_misclassified_as_a_drawing_or_control(tmp_path):
+    path = tmp_path / "ordinary-comment.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID"])
+    sheet.append(["E1"])
+    sheet["A2"].comment = Comment("user note", "Alice")
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "ordinary-comment", "schema_version": "1.0.0", "name": "Ordinary comment",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+        ]}],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert "Data: existing_comments" in snapshot.warnings
+    assert "workbook: drawings" not in snapshot.warnings
+    assert "workbook: legacy_controls" not in snapshot.warnings
+    assert snapshot.manual_review_reasons == []
 
 
 @pytest.mark.parametrize(

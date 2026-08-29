@@ -182,7 +182,10 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             "external_links": any(name.startswith("xl/externallinks/") for name in names),
             "external_connections": "xl/connections.xml" in names,
             "pivot_tables": any(name.startswith("xl/pivottables/") for name in names),
-            "drawings": any(name.startswith("xl/drawings/") for name in names),
+            # Legacy VML Note drawings are the storage mechanism for ordinary
+            # cell comments and are assessed separately by legacy_controls.
+            # Only DrawingML worksheet drawing parts are unsafe here.
+            "drawings": any(name.startswith("xl/drawings/") and name.endswith(".xml") for name in names),
             "embedded_objects": any(name.startswith("xl/embeddings/") for name in names),
             "activex_controls": any(name.startswith("xl/activex/") for name in names),
             "legacy_controls": any(name.endswith(".vml") and _vml_has_controls(archive, info) for name, info in ((item.filename.lower(), item) for item in infos)),

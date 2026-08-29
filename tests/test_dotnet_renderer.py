@@ -10,6 +10,7 @@ from xml.etree import ElementTree
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
@@ -136,6 +137,7 @@ def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     sheet.title = "人员信息"
     sheet.append(["员工编号", "工资"])
     sheet.append(["E001", "99"])
+    sheet["B2"].comment = Comment("用户原批注", "Alice")
     book.save(source)
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     report_path.write_text(json.dumps({"summary": {"matched_records": 1}, "differences": [{"type": "VALUE_MISMATCH", "sheet_name": "人员信息", "cell": "B2", "canonical_field": "salary", "message": "值不一致"}]}, ensure_ascii=False), encoding="utf-8")
@@ -159,7 +161,8 @@ def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     assert rendered["人员信息"]["C2"].value == "99"
     assert rendered["人员信息"]["C2"].fill.fgColor.rgb.endswith("FFE599")
     assert rendered["人员信息"]["C2"].comment is not None
-    assert "值不一致" in rendered["人员信息"]["C2"].comment.text
+    assert rendered["人员信息"]["C2"].comment.author == "Alice"
+    assert rendered["人员信息"]["C2"].comment.text == "用户原批注\n\n[Excel Auditor]\n值不一致"
     assert rendered["核验报告"]["A2"].value == "matched_records"
     first_style_count = len(rendered._cell_styles)
     first_fill_count = len(rendered._fills)
@@ -172,7 +175,7 @@ def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     assert [sheet_name for sheet_name in rerendered.sheetnames if sheet_name == "核验报告"] == ["核验报告"]
     assert [sheet_name for sheet_name in rerendered.sheetnames if sheet_name == "__ExcelAuditorMetadata"] == ["__ExcelAuditorMetadata"]
     assert rerendered["人员信息"]["B1"].value == "姓名"
-    assert rerendered["人员信息"]["C2"].comment.text == "值不一致"
+    assert rerendered["人员信息"]["C2"].comment.text == "用户原批注\n\n[Excel Auditor]\n值不一致"
     assert len(rerendered._cell_styles) == first_style_count
     assert len(rerendered._fills) == first_fill_count
     rerendered.close()
@@ -184,6 +187,41 @@ def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     dry_result = json.loads(dry.stdout)
     assert dry_result["success"] is True and dry_result["dry_run"] is True
     assert dry_output.read_bytes() == b"pre-existing-output"
+
+    chained_output = tmp_path / "chained-output.xlsx"
+    chained_manifest = tmp_path / "chained-manifest.json"
+    chained_manifest.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_contract_chained",
+        "input_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "operations": [{"type": "mark_cell", "sheet": "人员信息", "cell": "C2", "fill_color": "FFE599", "comment": "值不一致"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    chained = subprocess.run([command, "--input", str(output), "--output", str(chained_output), "--manifest", str(chained_manifest)], capture_output=True, text=True, check=False)
+    assert chained.returncode == 0, chained.stderr
+    chained_book = load_workbook(chained_output)
+    chained_comment = chained_book["人员信息"]["C2"].comment
+    assert chained_comment.author == "Alice"
+    assert chained_comment.text.count("用户原批注") == 1
+    assert chained_comment.text.count("[Excel Auditor]") == 1
+    assert chained_comment.text.count("值不一致") == 1
+    chained_book.close()
+
+    long_source, long_output, long_manifest = tmp_path / "long-comment.xlsx", tmp_path / "long-comment-output.xlsx", tmp_path / "long-comment-manifest.json"
+    long_book = Workbook()
+    long_book.active.title = "Data"
+    long_book.active["A1"] = "value"
+    long_book.active["A1"].comment = Comment("U" * 32760, "Alice")
+    long_book.save(long_source)
+    long_manifest.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_long_comment",
+        "input_sha256": hashlib.sha256(long_source.read_bytes()).hexdigest(),
+        "operations": [{"type": "mark_cell", "sheet": "Data", "cell": "A1", "fill_color": "FFE599", "comment": "audit"}],
+    }), encoding="utf-8")
+    long_result = subprocess.run([command, "--input", str(long_source), "--output", str(long_output), "--manifest", str(long_manifest)], capture_output=True, text=True, check=False)
+    assert long_result.returncode != 0
+    assert json.loads(long_result.stderr)["error_code"] == "UNSUPPORTED_FEATURE"
+    assert not long_output.exists()
 
 
 def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_rejects_unknown_ops(tmp_path):

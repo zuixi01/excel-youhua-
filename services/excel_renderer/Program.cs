@@ -774,6 +774,7 @@ static (int Start, int End) ShiftInterval(int start, int end, int target)
 
 static void AddOrReplaceComment(WorksheetPart worksheetPart, string reference, string text)
 {
+    const string auditMarker = "\n\n[Excel Auditor]\n";
     var commentsPart = worksheetPart.WorksheetCommentsPart ?? worksheetPart.AddNewPart<WorksheetCommentsPart>();
     if (commentsPart.Comments is null)
         commentsPart.Comments = new Comments(new Authors(new Author("Excel Auditor")), new CommentList());
@@ -782,15 +783,49 @@ static void AddOrReplaceComment(WorksheetPart worksheetPart, string reference, s
     var authorId = authorList.FindIndex(author => author.Text == "Excel Auditor");
     if (authorId < 0) { authors.Append(new Author("Excel Auditor")); authorId = authorList.Count; }
     var list = commentsPart.Comments.CommentList ?? commentsPart.Comments.AppendChild(new CommentList());
-    list.Elements<Comment>().FirstOrDefault(item => item.Reference?.Value == reference)?.Remove();
+    var existing = list.Elements<Comment>().FirstOrDefault(item => item.Reference?.Value == reference);
+    var outputText = text;
+    var outputAuthorId = (uint)authorId;
+    if (existing is not null)
+    {
+        var existingText = existing.CommentText?.InnerText ?? "";
+        var existingAuthorId = existing.AuthorId?.Value;
+        var existingAuthor = existingAuthorId is not null && existingAuthorId.Value < (uint)authors.ChildElements.Count
+            ? authors.Elements<Author>().ElementAt((int)existingAuthorId.Value).Text
+            : null;
+        if (!StringComparer.Ordinal.Equals(existingAuthor, "Excel Auditor"))
+        {
+            var markerIndex = existingText.IndexOf(auditMarker, StringComparison.Ordinal);
+            var originalText = markerIndex >= 0 ? existingText[..markerIndex] : existingText;
+            var previousAuditText = markerIndex >= 0 ? existingText[(markerIndex + auditMarker.Length)..] : "";
+            var auditText = MergeAuditCommentText(previousAuditText, text);
+            outputText = originalText + auditMarker + auditText;
+            if (existingAuthorId is not null) outputAuthorId = existingAuthorId.Value;
+        }
+        else
+        {
+            outputText = MergeAuditCommentText(existingText, text);
+        }
+        existing.Remove();
+    }
+    if (outputText.Length > 32767)
+        throw new InvalidDataException("UNSUPPORTED_FEATURE: existing comment leaves insufficient room for an audit comment without data loss");
     list.Append(new Comment
     {
         Reference = reference,
-        AuthorId = (uint)authorId,
-        CommentText = new CommentText(new Run(new Text(text) { Space = SpaceProcessingModeValues.Preserve }))
+        AuthorId = outputAuthorId,
+        CommentText = new CommentText(new Run(new Text(outputText) { Space = SpaceProcessingModeValues.Preserve }))
     });
     commentsPart.Comments.Save();
     RebuildCommentVml(worksheetPart);
+}
+
+static string MergeAuditCommentText(string existing, string next)
+{
+    if (String.IsNullOrEmpty(existing)) return next;
+    if (StringComparer.Ordinal.Equals(existing, next)) return existing;
+    var entries = existing.Split(" | ", StringSplitOptions.None);
+    return entries.Contains(next, StringComparer.Ordinal) ? existing : existing + " | " + next;
 }
 
 static void RebuildCommentVml(WorksheetPart worksheetPart)
