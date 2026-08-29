@@ -151,6 +151,39 @@ def test_workbook_sheet_limit_and_structure_inventory(tmp_path):
     assert not snapshot.manual_review_reasons
 
 
+def test_row_limit_is_counted_from_the_configured_data_start(tmp_path):
+    path = tmp_path / "data-start-limit.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "ID"
+    sheet["A5"] = "E1"
+    sheet["A6"] = "E2"
+    sheet["A7"] = "E3"
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "data-start-limit", "schema_version": "1.0.0", "name": "Data start limit",
+        "workbook": {"max_rows_per_sheet": 3},
+        "sheets": [{
+            "id": "data", "name": "Data", "data_region": {"start_row": 5},
+            "primary_key": ["id"], "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+    assert snapshot.sheets["Data"].max_row == 7
+    snapshot.close()
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "ID"
+    sheet["A8"] = "E4"
+    book.save(path)
+    with pytest.raises(WorkbookSafetyError, match="FILE_LIMIT_EXCEEDED"):
+        inspect_workbook(path, rules)
+
+
 def test_only_merged_header_requires_review(tmp_path):
     path = tmp_path / "merged.xlsx"
     book = Workbook()

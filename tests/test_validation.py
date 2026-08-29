@@ -78,6 +78,31 @@ def test_ambiguous_auto_detected_header_requires_review(tmp_path):
     assert [item.type.value for item in result.differences] == ["HEADER_NOT_FOUND"]
 
 
+def test_auto_detected_header_must_precede_explicit_data_region(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "header-data-overlap", "schema_version": "1.0.0", "name": "Header overlap",
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True},
+            "data_region": {"start_row": 3}, "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    path = tmp_path / "header-data-overlap.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Report title"])
+    sheet.append(["More preamble"])
+    sheet.append(["ID"])
+    sheet.append(["E1"])
+    book.save(path)
+
+    result = compare_workbook(inspect_workbook(path, rules), {"data": [{"id": "E1"}]}, rules)
+    assert result.manual_review_reasons == ["Data: data_region_overlaps_header"]
+    assert [item.type.value for item in result.differences] == ["HEADER_NOT_FOUND"]
+    assert result.summary.matched_records == 0
+
+
 def test_unmatched_records_still_receive_field_and_cross_field_validation(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "quality", "schema_version": "1.0.0", "name": "Quality",

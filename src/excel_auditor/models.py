@@ -460,6 +460,12 @@ class SheetRule(StrictModel):
         folded_physical_names = [name.casefold() for name in physical_names]
         if len(folded_physical_names) != len(set(folded_physical_names)):
             raise ValueError(f"worksheet {self.id!r} repeats its name or an alias")
+        if (
+            self.data_region.start_row is not None
+            and not self.header.auto_detect
+            and self.data_region.start_row <= self.header.row
+        ):
+            raise ValueError("data_region.start_row must be after the configured header row")
         names = [column.name for column in self.columns]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate canonical column in sheet {self.id!r}")

@@ -190,6 +190,11 @@ def test_rule_rejects_ambiguous_or_runtime_invalid_names_and_separators():
     with pytest.raises(ValidationError, match="separator"):
         RuleSet.model_validate(payload)
 
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["data_region"]["start_row"] = payload["sheets"][0]["header"]["row"]
+    with pytest.raises(ValidationError, match="start_row must be after"):
+        RuleSet.model_validate(payload)
+
 
 def test_rule_rejects_aliases_and_enum_values_unreachable_after_normalization():
     payload = load_rules(EXAMPLE).model_dump(mode="json")

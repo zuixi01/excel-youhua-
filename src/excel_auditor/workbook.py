@@ -202,7 +202,8 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         raise WorkbookSafetyError("WORKBOOK_PROTECTED")
     for sheet in book.worksheets:
         matching_rule = sheet_rule_for_name(rules, sheet.title)
-        row_limit = rules.workbook.max_rows_per_sheet + matching_rule.header.row
+        data_start_row = matching_rule.data_region.start_row or matching_rule.header.row + 1
+        row_limit = rules.workbook.max_rows_per_sheet + data_start_row - 1
         max_row, max_column = sheet.max_row, sheet.max_column
         if (max_row is not None and max_row > row_limit) or (max_column is not None and max_column > rules.workbook.max_columns_per_sheet):
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")

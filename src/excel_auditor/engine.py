@@ -178,6 +178,16 @@ def compare_workbook(
             differences.append(_difference(DifferenceType.HEADER_NOT_FOUND, sheet_rule, header_problem, sheet_name=actual_name, severity="error"))
             manual_review_reasons.append(f"{actual_name}: header_not_found_or_ambiguous")
             continue
+        if sheet_rule.data_region.start_row is not None and sheet_rule.data_region.start_row <= header_row:
+            differences.append(_difference(
+                DifferenceType.HEADER_NOT_FOUND,
+                sheet_rule,
+                f"数据起始行 {sheet_rule.data_region.start_row} 必须晚于定位表头行 {header_row}",
+                sheet_name=actual_name,
+                severity="error",
+            ))
+            manual_review_reasons.append(f"{actual_name}: data_region_overlaps_header")
+            continue
         # Keep the stable rule id, but carry the physical worksheet name through
         # every difference and render operation when a configured alias matched.
         actual_sheet_rule = sheet_rule.model_copy(update={"name": actual_name, "header": sheet_rule.header.model_copy(update={"row": header_row})})
