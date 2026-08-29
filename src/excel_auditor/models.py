@@ -158,8 +158,8 @@ class ColumnRule(StrictModel):
     regex_replacements: list[RegexReplacement] = Field(default_factory=list, max_length=8)
     boolean_true_values: list[str] = Field(default_factory=lambda: ["true", "1", "yes", "y", "是", "真"])
     boolean_false_values: list[str] = Field(default_factory=lambda: ["false", "0", "no", "n", "否", "假"])
-    parse_formats: list[str] = Field(default_factory=list)
-    format: str | None = None
+    parse_formats: list[str] = Field(default_factory=list, max_length=32)
+    format: str | None = Field(default=None, min_length=1, max_length=255)
     formula_template: str | None = None
     separator: str = Field(default=",", min_length=1, max_length=16)
     missing_column_action: Literal["insert", "report_only"] | None = None
@@ -185,6 +185,15 @@ class ColumnRule(StrictModel):
             if key in normalized:
                 raise ValueError(f"duplicate normalized column alias: {value!r}")
             normalized.add(key)
+        return values
+
+    @field_validator("parse_formats")
+    @classmethod
+    def valid_parse_formats(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > 128 for value in values):
+            raise ValueError("parse formats must be non-blank and no longer than 128 characters")
+        if len(values) != len(set(values)):
+            raise ValueError("parse formats must be unique")
         return values
 
     @model_validator(mode="after")
@@ -295,8 +304,23 @@ class ColumnRule(StrictModel):
             raise ValueError(f"compare.timezone is incompatible with {self.type.value}")
         if self.compare.allow_naive_datetime and self.type != FieldType.DATETIME:
             raise ValueError(f"allow_naive_datetime is incompatible with {self.type.value}")
+        if self.compare.precision != "second" and self.type != FieldType.DATETIME:
+            raise ValueError(f"datetime precision is incompatible with {self.type.value}")
         if self.parse_formats and self.type not in {FieldType.DATE, FieldType.DATETIME}:
             raise ValueError(f"parse_formats are incompatible with {self.type.value}")
+        textual = self.type in {
+            FieldType.STRING,
+            FieldType.PHONE,
+            FieldType.ID_CODE,
+            FieldType.POSTAL_CODE,
+            FieldType.FUZZY_STRING,
+        }
+        if (
+            self.validation.min_length is not None
+            or self.validation.max_length is not None
+            or self.validation.regex is not None
+        ) and not textual:
+            raise ValueError(f"text length and regex validation are incompatible with {self.type.value}")
         if self.type != FieldType.SET and self.separator != ",":
             raise ValueError(f"separator is incompatible with {self.type.value}")
         if self.fill_static_default and self.static_default is None:

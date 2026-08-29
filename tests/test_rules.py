@@ -273,6 +273,26 @@ def test_conflicting_validation_and_type_specific_options_are_rejected():
     with pytest.raises(ValidationError, match="enum configuration is incompatible with string"):
         RuleSet.model_validate(payload)
 
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["validation"]["min_length"] = 2
+    with pytest.raises(ValidationError, match="text length and regex validation are incompatible with decimal"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["compare"]["precision"] = "day"
+    with pytest.raises(ValidationError, match="datetime precision is incompatible with string"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][3]["parse_formats"] = ["yyyy-MM-dd", "yyyy-MM-dd"]
+    with pytest.raises(ValidationError, match="parse formats must be unique"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][3]["parse_formats"] = ["   "]
+    with pytest.raises(ValidationError, match="parse formats must be non-blank"):
+        RuleSet.model_validate(payload)
+
 
 def test_enum_aliases_and_static_repair_defaults_must_satisfy_the_rule():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
