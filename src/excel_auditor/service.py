@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import time
+from collections.abc import Sequence as SequenceABC
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -571,7 +572,7 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
     result: dict[str, Sequence[dict[str, Any]]] = {}
     spill_threshold = _standard_spill_threshold(rules)
     for key, rows in payload.items():
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        if isinstance(rows, (str, bytes, bytearray)) or not isinstance(rows, SequenceABC):
             _close_record_sequences(result)
             raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
         sheet_rule = next((sheet for sheet in rules.sheets if sheet.id == str(key) or sheet.name == str(key)), None)
@@ -581,6 +582,8 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
         canonical_rows: list[dict[str, Any]] | SpilledRecords = SpilledRecords() if len(rows) > spill_threshold else []
         try:
             for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
                 canonical: dict[str, Any] = {}
                 for column in sheet_rule.columns:
                     candidates = [column.name, column.title, *column.aliases]
@@ -594,6 +597,10 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
                 close()
             _close_record_sequences(result)
             raise
+        finally:
+            close_source = getattr(rows, "close", None)
+            if close_source is not None:
+                close_source()
         result[sheet_rule.id] = canonical_rows
     return result
 

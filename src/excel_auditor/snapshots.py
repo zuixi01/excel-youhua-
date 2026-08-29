@@ -4,6 +4,7 @@ import hashlib
 import json
 import pickle
 import tempfile
+from array import array
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -28,7 +29,7 @@ class SpilledRecords(Sequence[dict[str, Any]]):
 
     def __init__(self) -> None:
         self._file = tempfile.TemporaryFile(prefix="excel-auditor-standard-", suffix=".bin")
-        self._offsets: list[int] = []
+        self._offsets = array("Q")
 
     def append(self, record: dict[str, Any]) -> None:
         self._offsets.append(self._file.tell())

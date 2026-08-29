@@ -6,7 +6,7 @@ import os
 import socket
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import StandardSourceConfig
 from .observability import metrics
+from .snapshots import SpilledRecords
 
 
 class ManagedConnection(BaseModel):
@@ -73,17 +74,66 @@ class ConnectionRegistry:
         return self.connections[connection_id]
 
 
+class _RecordAccumulator:
+    """Own paginated response records and spill their payloads past a limit."""
+
+    def __init__(self, spill_after_records: int) -> None:
+        if spill_after_records < 1:
+            raise ValueError("spill_after_records must be positive")
+        self.spill_after_records = spill_after_records
+        self.records: list[dict[str, Any]] | SpilledRecords = []
+        self.detached = False
+
+    def __enter__(self) -> "_RecordAccumulator":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if not self.detached:
+            self.close()
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def extend(self, page_records: list[dict[str, Any]]) -> None:
+        if isinstance(self.records, list) and len(self.records) + len(page_records) > self.spill_after_records:
+            spilled = SpilledRecords()
+            try:
+                for record in self.records:
+                    spilled.append(record)
+            except Exception:
+                spilled.close()
+                raise
+            self.records = spilled
+        if isinstance(self.records, list):
+            self.records.extend(page_records)
+        else:
+            for record in page_records:
+                self.records.append(record)
+
+    def detach(self) -> Sequence[dict[str, Any]]:
+        self.detached = True
+        return self.records
+
+    def close(self) -> None:
+        close = getattr(self.records, "close", None)
+        if close is not None:
+            close()
+
+
 class ManagedHttpSource:
-    def __init__(self, registry: ConnectionRegistry, transport: httpx.BaseTransport | None = None, resolver: Callable[[str], list[str]] | None = None) -> None:
+    def __init__(self, registry: ConnectionRegistry, transport: httpx.BaseTransport | None = None, resolver: Callable[[str], list[str]] | None = None, spill_after_records: int = 50_000) -> None:
         self.registry = registry
         self.transport = transport
         self.resolver = resolver or _resolve_addresses
+        if spill_after_records < 1:
+            raise ValueError("spill_after_records must be positive")
+        self.spill_after_records = spill_after_records
 
-    def fetch(self, config: StandardSourceConfig, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]] | dict[str, list[dict[str, Any]]]:
+    def fetch(self, config: StandardSourceConfig, parameters: dict[str, Any] | None = None) -> Sequence[dict[str, Any]] | dict[str, list[dict[str, Any]]]:
         records, _metadata = self.fetch_with_metadata(config, parameters)
         return records
 
-    def fetch_with_metadata(self, config: StandardSourceConfig, parameters: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]] | dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    def fetch_with_metadata(self, config: StandardSourceConfig, parameters: dict[str, Any] | None = None) -> tuple[Sequence[dict[str, Any]] | dict[str, list[dict[str, Any]]], dict[str, Any]]:
         if config.type != "managed_http" or not config.connection_id or not config.path:
             raise ValueError("managed HTTP source configuration is incomplete")
         connection = self.registry.get(config.connection_id)
@@ -108,12 +158,11 @@ class ManagedHttpSource:
             default_port = 443 if parsed_url.scheme == "https" else 80
             headers["Host"] = original_host if parsed_url.port in {None, default_port} else f"{original_host}:{parsed_url.port}"
             sni_hostname = original_host if parsed_url.scheme == "https" else None
-        records: list[dict[str, Any]] = []
         workbook_records: dict[str, list[dict[str, Any]]] | None = None
         total_response_bytes = 0
         page_metadata: list[dict[str, int]] = []
         page = 1
-        with httpx.Client(timeout=connection.timeout_seconds, headers=headers, follow_redirects=False, transport=self.transport) as client:
+        with _RecordAccumulator(self.spill_after_records) as records, httpx.Client(timeout=connection.timeout_seconds, headers=headers, follow_redirects=False, transport=self.transport) as client:
             while True:
                 request_parameters = dict(config.static_parameters)
                 task_parameters = parameters or {}
@@ -160,13 +209,14 @@ class ManagedHttpSource:
                 page += 1
                 if page > config.pagination.max_pages:
                     raise ValueError("STANDARD_SOURCE_FAILED: pagination limit exceeded")
-        return workbook_records if workbook_records is not None else records, {
-            "connection_id": config.connection_id,
-            "request_path": config.path,
-            "method": config.method,
-            "pages": page_metadata,
-            "response_bytes": total_response_bytes,
-        }
+            return workbook_records if workbook_records is not None else records.detach(), {
+                "connection_id": config.connection_id,
+                "request_path": config.path,
+                "method": config.method,
+                "pages": page_metadata,
+                "response_bytes": total_response_bytes,
+                "record_storage": "disk_spill" if isinstance(records.records, SpilledRecords) else "memory",
+            }
 
 
 def _load_secret(reference: str) -> str:

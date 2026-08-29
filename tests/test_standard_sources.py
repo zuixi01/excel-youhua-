@@ -5,6 +5,7 @@ import pytest
 from openpyxl import Workbook
 
 from excel_auditor.models import StandardSourceConfig
+from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.service import AuditService
 from excel_auditor.models import RuleSet
@@ -33,6 +34,60 @@ def test_managed_http_paginates_and_only_uses_registered_origin(tmp_path):
         "pagination": {"size": 2, "total_json_path": "$.data.total"},
     })
     assert [item["id"] for item in source.fetch(config)] == ["1", "2", "3"]
+
+
+def test_managed_http_spills_paginated_records_and_transfers_ownership(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        records = [{"id": "1"}, {"id": "2"}] if page == 1 else [{"id": "3"}]
+        return httpx.Response(200, headers={"content-type": "application/json"}, json={"data": records, "total": 3})
+
+    source = ManagedHttpSource(
+        _registry(tmp_path),
+        httpx.MockTransport(handler),
+        resolver=lambda _host: ["93.184.216.34"],
+        spill_after_records=2,
+    )
+    config = StandardSourceConfig.model_validate({
+        "type": "managed_http", "connection_id": "hr", "path": "/employees", "data_json_path": "$.data",
+        "pagination": {"size": 2, "total_json_path": "$.total"},
+    })
+    records, metadata = source.fetch_with_metadata(config)
+    try:
+        assert isinstance(records, SpilledRecords)
+        assert [item["id"] for item in records] == ["1", "2", "3"]
+        assert metadata["record_storage"] == "disk_spill"
+    finally:
+        records.close()
+
+
+def test_managed_http_closes_spill_when_record_limit_aborts(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        records = [{"id": "1"}, {"id": "2"}] if page == 1 else [{"id": "3"}]
+        return httpx.Response(200, headers={"content-type": "application/json"}, json={"data": records, "total": 3})
+
+    closed = []
+    original_close = SpilledRecords.close
+
+    def recording_close(self):
+        closed.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(SpilledRecords, "close", recording_close)
+    source = ManagedHttpSource(
+        _registry(tmp_path, max_records=2),
+        httpx.MockTransport(handler),
+        resolver=lambda _host: ["93.184.216.34"],
+        spill_after_records=1,
+    )
+    config = StandardSourceConfig.model_validate({
+        "type": "managed_http", "connection_id": "hr", "path": "/employees", "data_json_path": "$.data",
+        "pagination": {"size": 2, "total_json_path": "$.total"},
+    })
+    with pytest.raises(ValueError, match="record limit exceeded"):
+        source.fetch(config)
+    assert closed == [True]
 
 
 def test_managed_http_reads_secret_from_read_only_secret_directory(tmp_path, monkeypatch):
@@ -95,8 +150,8 @@ def test_managed_http_stream_aborts_at_response_limit(tmp_path):
 
 
 def test_managed_http_is_snapshotted_by_service(tmp_path):
-    transport = httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, json={"data": [{"id": "E001", "name": "张三"}]}))
-    source = ManagedHttpSource(_registry(tmp_path), transport, resolver=lambda _host: ["93.184.216.34"])
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, json={"data": [{"id": "E001", "name": "张三"}, {"id": "E002", "name": "李四"}]}))
+    source = ManagedHttpSource(_registry(tmp_path), transport, resolver=lambda _host: ["93.184.216.34"], spill_after_records=1)
     rules = RuleSet.model_validate({
         "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
         "sheets": [{"id": "people", "name": "人员", "primary_key": ["id"], "columns": [
@@ -110,11 +165,12 @@ def test_managed_http_is_snapshotted_by_service(tmp_path):
     sheet.title = "人员"
     sheet.append(["编号", "姓名"])
     sheet.append(["E001", "张三"])
+    sheet.append(["E002", "李四"])
     book.save(excel)
     service = AuditService(tmp_path / "runtime", managed_http=source)
     job_id = service.create_job()
     service.run(job_id, excel, None, rules)
     status = service.status(job_id)
     assert status["status"] == "completed"
-    assert status["summary"]["matched_records"] == 1
+    assert status["summary"]["matched_records"] == 2
     assert list(service.job_directory(job_id).glob("std_*.jsonl"))

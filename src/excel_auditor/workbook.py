@@ -5,6 +5,7 @@ import pickle
 import re
 import tempfile
 import zipfile
+from array import array
 from xml.parsers import expat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,7 +51,7 @@ class SpilledRows(Sequence[tuple[int, list[Any]]]):
 
     def __init__(self) -> None:
         self._file = tempfile.TemporaryFile(prefix="excel-auditor-rows-", suffix=".bin")
-        self._offsets: list[int] = []
+        self._offsets = array("Q")
 
     def append(self, item: tuple[int, list[Any]]) -> None:
         self._offsets.append(self._file.tell())

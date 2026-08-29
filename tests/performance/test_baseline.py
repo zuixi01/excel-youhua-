@@ -14,6 +14,7 @@ from excel_auditor.engine import compare_workbook
 from excel_auditor.models import AuditReport, RuleSet
 from excel_auditor.reporting import write_json_report
 from excel_auditor.models import StandardSourceConfig
+from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.workbook import inspect_workbook
 
@@ -109,7 +110,8 @@ def test_paginated_standard_source_baseline(tmp_path):
         stop = min(record_count, start + size)
         return httpx.Response(200, json={"data": [{"id": f"R{index:06d}"} for index in range(start, stop)], "total": record_count})
 
-    source = ManagedHttpSource(ConnectionRegistry(registry_path), transport=httpx.MockTransport(handler), resolver=lambda _host: ["93.184.216.34"])
+    spill_after_records = int(os.environ.get("PERF_HTTP_SPILL_AFTER_RECORDS", "10000"))
+    source = ManagedHttpSource(ConnectionRegistry(registry_path), transport=httpx.MockTransport(handler), resolver=lambda _host: ["93.184.216.34"], spill_after_records=spill_after_records)
     config = StandardSourceConfig.model_validate({
         "type": "managed_http",
         "connection_id": "performance-http",
@@ -119,11 +121,15 @@ def test_paginated_standard_source_baseline(tmp_path):
     })
     started = time.perf_counter()
     records, metadata = source.fetch_with_metadata(config)
-    elapsed = time.perf_counter() - started
-    metrics = {"records": len(records), "page_size": page_size, "pages": len(metadata["pages"]), "elapsed_seconds": round(elapsed, 3), "response_bytes": metadata["response_bytes"]}
-    print(metrics)
-    if output := os.environ.get("PERF_HTTP_RESULT_PATH"):
-        Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    assert len(records) == record_count
-    assert len(metadata["pages"]) == (record_count + page_size - 1) // page_size
-    assert elapsed <= float(os.environ.get("PERF_HTTP_MAX_SECONDS", "60"))
+    try:
+        elapsed = time.perf_counter() - started
+        metrics = {"records": len(records), "page_size": page_size, "pages": len(metadata["pages"]), "elapsed_seconds": round(elapsed, 3), "response_bytes": metadata["response_bytes"], "record_storage": metadata["record_storage"]}
+        print(metrics)
+        if output := os.environ.get("PERF_HTTP_RESULT_PATH"):
+            Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        assert len(records) == record_count
+        assert len(metadata["pages"]) == (record_count + page_size - 1) // page_size
+        assert isinstance(records, SpilledRecords) and metadata["record_storage"] == "disk_spill"
+        assert elapsed <= float(os.environ.get("PERF_HTTP_MAX_SECONDS", "60"))
+    finally:
+        records.close()
