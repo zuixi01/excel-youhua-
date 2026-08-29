@@ -130,7 +130,7 @@ static void ApplySetCell(WorkbookPart workbookPart, RenderOperation operation, D
 {
     var worksheetPart = Worksheet(workbookPart, operation.Sheet!);
     var cell = FindOrCreateCell(worksheetPart, operation.Cell!);
-    WriteSafeValue(cell, operation.Value, operation.FieldType);
+    WriteSafeValue(cell, operation.Value, operation.FieldType, Uses1904DateSystem(workbookPart));
     cell.StyleIndex = FillStyle(workbookPart, cell.StyleIndex, operation.FillColor!, operation.NumberFormat, styleCache);
     if (!String.IsNullOrWhiteSpace(operation.Comment)) AddOrReplaceComment(worksheetPart, operation.Cell!, operation.Comment!);
     RecalculateDimension(worksheetPart.Worksheet!);
@@ -140,6 +140,7 @@ static void ApplySetCell(WorkbookPart workbookPart, RenderOperation operation, D
 static void AppendRow(WorkbookPart workbookPart, RenderOperation operation, Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
 {
     var worksheetPart = Worksheet(workbookPart, operation.Sheet!);
+    var date1904 = Uses1904DateSystem(workbookPart);
     var targetRow = operation.Row is null ? null : FindOrCreateRow(worksheetPart, operation.Row.Value);
     var previousRow = operation.Row is null ? null : worksheetPart.Worksheet?.GetFirstChild<SheetData>()?.Elements<Row>().FirstOrDefault(item => item.RowIndex?.Value + 1u == operation.Row.Value);
     if (targetRow is not null && previousRow is not null)
@@ -163,7 +164,7 @@ static void AppendRow(WorkbookPart workbookPart, RenderOperation operation, Dict
             cell.DataType = null; cell.CellValue = null; cell.InlineString = null;
             cell.CellFormula = new CellFormula(value.FormulaTemplate.Replace("{row}", rowIndex.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal).TrimStart('='));
         }
-        else WriteSafeValue(cell, value.Value, value.FieldType);
+        else WriteSafeValue(cell, value.Value, value.FieldType, date1904);
         cell.StyleIndex = FillStyle(workbookPart, sourceCell?.StyleIndex ?? cell.StyleIndex, operation.FillColor!, value.NumberFormat, styleCache);
     }
     if (!String.IsNullOrWhiteSpace(operation.Comment) && operation.Row is not null)
@@ -173,7 +174,7 @@ static void AppendRow(WorkbookPart workbookPart, RenderOperation operation, Dict
     (worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing")).Save();
 }
 
-static void WriteSafeValue(Cell cell, JsonElement? value, string? fieldType = null)
+static void WriteSafeValue(Cell cell, JsonElement? value, string? fieldType = null, bool date1904 = false)
 {
     cell.CellFormula = null;
     cell.CellValue = null;
@@ -205,13 +206,25 @@ static void WriteSafeValue(Cell cell, JsonElement? value, string? fieldType = nu
     if (fieldType is "date" or "datetime" && DateTimeOffset.TryParse(textValue, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out var timestamp))
     {
         cell.DataType = CellValues.Number;
-        cell.CellValue = new CellValue(timestamp.DateTime.ToOADate().ToString(CultureInfo.InvariantCulture));
+        cell.CellValue = new CellValue(ToExcelSerial(timestamp.DateTime, date1904).ToString("R", CultureInfo.InvariantCulture));
         return;
     }
     // Strings are always written as inline text. Values beginning with =, +, - or
     // @ therefore cannot be interpreted as formulas by Excel.
     cell.DataType = CellValues.InlineString;
     cell.InlineString = new InlineString(new Text(textValue) { Space = SpaceProcessingModeValues.Preserve });
+}
+
+static bool Uses1904DateSystem(WorkbookPart workbookPart) => workbookPart.Workbook?.WorkbookProperties?.Date1904?.Value == true;
+
+static double ToExcelSerial(DateTime value, bool date1904)
+{
+    var epoch = date1904 ? new DateTime(1904, 1, 1) : new DateTime(1899, 12, 30);
+    var serial = (value - epoch).TotalDays;
+    // Excel's 1900 system deliberately preserves Lotus 1-2-3's fictitious
+    // 1900-02-29. Dates before that boundary use a one-day correction.
+    if (!date1904 && serial > 0d && serial <= 60d) serial -= 1d;
+    return serial;
 }
 
 static void InsertColumn(WorkbookPart workbookPart, RenderOperation operation, Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)

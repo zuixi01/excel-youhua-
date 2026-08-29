@@ -3,7 +3,9 @@ import json
 import os
 import subprocess
 import zipfile
+from datetime import date, datetime
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -12,6 +14,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table
 from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH
 
 from excel_auditor.models import RuleSet
 from excel_auditor.rendering import DotNetOpenXmlRenderer
@@ -241,6 +244,61 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     rejected = subprocess.run([command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)], capture_output=True, text=True, check=False)
     assert rejected.returncode != 0
     assert json.loads(rejected.stderr)["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("epoch", "field_type", "written_value", "expected_serial", "expected_datetime"),
+    [
+        (WINDOWS_EPOCH, "date", "1900-01-01", 1.0, "1900-01-01T00:00:00"),
+        (MAC_EPOCH, "date", "2026-08-30", 44802.0, "2026-08-30T00:00:00"),
+        (MAC_EPOCH, "datetime", "2026-08-30T12:00:00+08:00", 44802.5, "2026-08-30T12:00:00"),
+    ],
+)
+def test_dotnet_renderer_writes_dates_using_the_workbook_epoch(tmp_path, epoch, field_type, written_value, expected_serial, expected_datetime):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "dates.xlsx", tmp_path / "dates-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    book.epoch = epoch
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Date"])
+    sheet.append([date(2020, 1, 1)])
+    book.save(source)
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_date_epoch",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{
+            "type": "set_cell",
+            "sheet": "Data",
+            "cell": "A2",
+            "value": written_value,
+            "field_type": field_type,
+            "number_format": "yyyy-mm-dd" if field_type == "date" else "yyyy-mm-dd hh:mm:ss",
+            "fill_color": "D9EAD3",
+        }],
+    }), encoding="utf-8")
+
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    with zipfile.ZipFile(output) as archive:
+        worksheet = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    raw_value = worksheet.find(".//x:c[@r='A2']/x:v", namespace)
+    assert raw_value is not None and float(raw_value.text) == pytest.approx(expected_serial)
+    rendered = load_workbook(output, data_only=False)
+    assert rendered.epoch == epoch
+    observed = rendered["Data"]["A2"].value
+    assert isinstance(observed, datetime) and observed.isoformat() == expected_datetime
+    rendered.close()
 
 
 @pytest.mark.parametrize(
