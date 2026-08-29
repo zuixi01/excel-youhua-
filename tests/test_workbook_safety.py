@@ -23,6 +23,36 @@ def test_package_feature_inventory_detects_drawings(tmp_path):
     assert "workbook: drawings" in snapshot.manual_review_reasons
 
 
+@pytest.mark.parametrize(
+    ("object_type", "requires_review"),
+    [("Note", False), ("Radio", True), ("Scroll", True)],
+)
+def test_vml_inventory_distinguishes_comments_from_legacy_controls(tmp_path, object_type, requires_review):
+    path = tmp_path / f"vml-{object_type}.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID"])
+    book.save(path)
+    vml = (
+        '<xml xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:x="urn:schemas-microsoft-com:office:excel">'
+        f'<v:shape id="shape1"><x:ClientData ObjectType="{object_type}"/></v:shape>'
+        '</xml>'
+    )
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/drawings/vmlDrawing1.vml", vml)
+    rules = RuleSet.model_validate({
+        "schema_id": "vml", "schema_version": "1.0.0", "name": "VML",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+        ]}],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+    assert ("workbook: legacy_controls" in snapshot.manual_review_reasons) is requires_review
+
+
 def test_unsafe_package_feature_cannot_be_bypassed_by_report_action(tmp_path):
     path = tmp_path / "drawing-report.xlsx"
     book = Workbook()

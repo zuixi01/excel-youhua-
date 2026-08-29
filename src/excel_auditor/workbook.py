@@ -346,11 +346,44 @@ def _detect_sheet_xml_features(archive: zipfile.ZipFile, info: zipfile.ZipInfo) 
 
 
 def _vml_has_controls(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+    shape_count = 0
+    note_count = 0
+    unsafe = False
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal shape_count, note_count, unsafe
+        local_name = name.rsplit(":", 1)[-1].casefold()
+        if local_name == "shape":
+            shape_count += 1
+        elif local_name == "macro":
+            unsafe = True
+        elif local_name == "clientdata":
+            object_type = next(
+                (value for key, value in attributes.items() if key.rsplit(":", 1)[-1].casefold() == "objecttype"),
+                None,
+            )
+            if object_type is not None and object_type.casefold() == "note":
+                note_count += 1
+            else:
+                unsafe = True
+
+    def reject_declaration(*_arguments: Any) -> None:
+        raise ValueError("VML declarations are not safe to inspect")
+
     try:
+        parser = expat.ParserCreate()
+        parser.StartElementHandler = start_element
+        parser.StartDoctypeDeclHandler = reject_declaration
+        parser.EntityDeclHandler = reject_declaration
+        parser.ExternalEntityRefHandler = lambda *_arguments: 0
         with archive.open(info) as handle:
-            text = handle.read(min(info.file_size, 2 * 1024 * 1024)).lower()
-        return any(marker in text for marker in (b'objecttype="button"', b'objecttype="checkbox"', b'objecttype="drop"', b'<x:macro'))
-    except OSError:
+            while chunk := handle.read(256 * 1024):
+                parser.Parse(chunk, False)
+            parser.Parse(b"", True)
+        # Comment VML has one Note ClientData element per shape. Any other
+        # shape would be destroyed by rebuilding the comment drawing.
+        return unsafe or shape_count != note_count
+    except (OSError, ValueError, expat.ExpatError):
         return True
 
 

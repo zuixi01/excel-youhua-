@@ -14,13 +14,13 @@
 
 配置文档在进入 Pydantic 前也执行严格装载：规则 JSON/YAML、规则草稿/已发布版本、连接注册表、API 内联标准 JSON 和任务参数均拒绝重复键及非有限 JSON 数字。受管 HTTP 路径必须是规范化的 origin-relative path，拒绝点段、反斜杠、重复斜杠、查询/片段、非法 UTF-8 以及单层或多层百分号编码绕过；静态、任务映射和分页参数不得重名覆盖，JSONPath 在规则发布时验证为运行期实际支持的简单对象路径。上传型标准源携带任何不会生效的 HTTP 配置也会直接失败。
 
-.NET Renderer 当前覆盖标色、批注、插列、类型化写值、追加记录、报告/隐藏元数据工作表、样式去重、Table/AutoFilter/DataValidation/DefinedName/合并区域和简单 A1 公式引用维护。内部超链接、局部命名区域、筛选列索引和排序引用均有插列维护；图表/绘图、透视表、外部链接以及复杂/共享/数组公式在插列时明确返回 `UNSUPPORTED_FEATURE`，不会静默修改。Renderer 还提供结构化 `--version` 自检，API 就绪探针会实际执行并校验其身份与语义版本。
+.NET Renderer 当前覆盖标色、批注、插列、类型化写值、追加记录、报告/隐藏元数据工作表、样式去重、Table/AutoFilter/DataValidation/DefinedName/合并区域和简单 A1 公式引用维护。内部超链接、局部命名区域、筛选列索引和排序引用均有插列维护；图表/绘图、透视表、外部链接以及复杂/共享/数组公式在插列时明确返回 `UNSUPPORTED_FEATURE`，不会静默修改。VML 预检以流式 XML 结构区分纯批注和任意旧式控件/宏，非 `Note` 形状在渲染前转人工审核；固定宏包在实际标色与批注后验证 VBA 项目及签名部件逐字节保持。Renderer 还提供结构化 `--version` 自检，API 就绪探针会实际执行并校验其身份与语义版本。
 
 固定 Golden 语料目前为 19 个工作簿：15 个核心表头/记录场景，外加联合主键与完整类型、结构化多工作表、合并表头人工审核，以及 10,000×20 大文件报告模式。大文件输入和 10,000 条标准 JSONL 快照均锁定 SHA，并强制工作簿与标准记录走磁盘后备序列及 Polars 分区连接。Golden 测试校验输入 SHA、完整差异计数/语义投影以及关键渲染结构；Renderer 合约另覆盖公式引用、Table、筛选、验证、命名区域、内部超链接、宏部件字节保持和不安全插列拒绝。
 
 ## 当前验证结果
 
-- 当前完整本地生产 Renderer 回归：`228 passed, 8 skipped`（共收集 236 项）；条件跳过的性能、真实基础设施和 LibreOffice 已由专用远程作业承接。
+- 当前完整本地生产 Renderer 回归：`231 passed, 8 skipped`（共收集 239 项）；条件跳过的性能、真实基础设施和 LibreOffice 已由专用远程作业承接。
 - 当前远端提交 `b3c04e9c5eaa7cdcdf6ba4761b21cc618e2b26b0` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。当前工作区新增的核心精度补强尚未形成远端 CI 证据，因此以上远端结果不替代本轮本地回归。
 - 同一提交的 [性能基线 v4 最终复核运行](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色：五个工作簿负载场景、50,000 条分页标准源、500,000 条直接比较、500,000 条受管 HTTP 服务全链路，以及 500,000 条上传 JSON 的流式解析、校验与快照均通过相对回归门禁并保存指标及 JUnit 制品。
 - 条件跳过项分别由上述性能、真实基础设施和 LibreOffice 专用远程作业承接；远程通过不改变“本机未执行”的事实。

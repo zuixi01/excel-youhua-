@@ -266,15 +266,18 @@ def test_dotnet_renderer_rejects_unsafe_complex_formula_insertions(tmp_path):
     assert not output.exists()
 
 
-def test_dotnet_renderer_preserves_macro_part_byte_for_byte(tmp_path):
+def test_dotnet_renderer_preserves_macro_and_signature_parts_during_real_edit(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:
         pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
     xlsx, source, output, manifest_path = tmp_path / "base.xlsx", tmp_path / "macro.xlsm", tmp_path / "macro-output.xlsm", tmp_path / "manifest.json"
     book = Workbook()
+    book.active.title = "Data"
     book.active.append(["ID"])
+    book.active.append(["E1"])
     book.save(xlsx)
     macro_payload = b"\x00VBA-PROJECT-GOLDEN\xff\x10"
+    signature_payload = b"\x00VBA-SIGNATURE-GOLDEN\xfe\x20"
     with zipfile.ZipFile(xlsx) as incoming, zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as outgoing:
         for info in incoming.infolist():
             data = incoming.read(info.filename)
@@ -282,20 +285,44 @@ def test_dotnet_renderer_preserves_macro_part_byte_for_byte(tmp_path):
                 text = data.decode("utf-8").replace(
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
                     "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
-                ).replace("</Types>", '<Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>')
+                ).replace(
+                    "</Types>",
+                    '<Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/>'
+                    '<Override PartName="/xl/vbaProjectSignature.bin" ContentType="application/vnd.ms-office.vbaProjectSignature"/>'
+                    "</Types>",
+                )
                 data = text.encode("utf-8")
             elif info.filename == "xl/_rels/workbook.xml.rels":
                 text = data.decode("utf-8").replace("</Relationships>", '<Relationship Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin" Id="rIdVba"/></Relationships>')
                 data = text.encode("utf-8")
             outgoing.writestr(info, data)
         outgoing.writestr("xl/vbaProject.bin", macro_payload)
+        outgoing.writestr("xl/vbaProjectSignature.bin", signature_payload)
+        outgoing.writestr(
+            "xl/_rels/vbaProject.bin.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rIdSignature" '
+            'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProjectSignature" '
+            'Target="vbaProjectSignature.bin"/>'
+            '</Relationships>',
+        )
     manifest_path.write_text(json.dumps({
-        "manifest_version": "1.0", "job_id": "job_macro", "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "operations": [],
+        "manifest_version": "1.0", "job_id": "job_macro", "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{
+            "type": "mark_cell", "sheet": "Data", "cell": "A2", "fill_color": "FFF2CC",
+            "comment": "audited", "difference_id": "diff_macro",
+        }],
     }), encoding="utf-8")
     completed = subprocess.run([command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)], capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
     with zipfile.ZipFile(output) as archive:
         assert archive.read("xl/vbaProject.bin") == macro_payload
+        assert archive.read("xl/vbaProjectSignature.bin") == signature_payload
+    rendered = load_workbook(output, keep_vba=True)
+    assert rendered["Data"]["A2"].comment.text == "audited"
+    assert rendered["Data"]["A2"].fill.fgColor.rgb.endswith("FFF2CC")
+    rendered.close()
 
 
 def test_rendered_output_opens_and_resaves_in_libreoffice(tmp_path):
