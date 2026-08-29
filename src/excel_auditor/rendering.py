@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import posixpath
 import re
 import subprocess
 import shutil
+import tempfile
+import zipfile
+from xml.etree import ElementTree
 from abc import ABC, abstractmethod
 from copy import copy
 from dataclasses import dataclass, field
@@ -45,6 +51,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
         destination.chmod(0o600)
         book = load_workbook(destination, data_only=False, keep_links=False)
         warnings: list[str] = []
+        operation_count = 0
         color_by_action = {
             "mark_red": rules.colors.extra,
             "mark_row_red": rules.colors.extra,
@@ -65,10 +72,12 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 cell = sheet[difference.cell]
                 cell.fill = fill
                 cell.comment = Comment(_comment(difference), "Excel Auditor")
+                operation_count += 1
             elif difference.excel_row:
                 for cell in sheet[difference.excel_row]:
                     cell.fill = fill
                 sheet.cell(difference.excel_row, 1).comment = Comment(_comment(difference), "Excel Auditor")
+                operation_count += 1
         for repair in comparison.repairs:
             if repair.type != "set_cell" or repair.sheet_name not in book.sheetnames or not repair.cell:
                 continue
@@ -76,6 +85,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             _set_safe_value(cell, repair.value)
             cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
             cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+            operation_count += 1
         for sheet_rule in rules.sheets:
             if sheet_rule.name not in book.sheetnames:
                 continue
@@ -85,7 +95,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             if missing and risky:
                 warnings.append(f"{sheet_rule.name}: development renderer refused column insertion because of {', '.join(risky)}")
                 continue
-            _insert_missing_columns(sheet, sheet_rule, missing, rules.colors.inserted)
+            operation_count += _insert_missing_columns(sheet, sheet_rule, missing, rules.colors.inserted)
         for repair in comparison.repairs:
             if repair.sheet_name not in book.sheetnames:
                 continue
@@ -98,6 +108,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 _set_safe_value(cell, repair.value)
                 cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
                 cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+                operation_count += 1
             elif repair.type == "append_record" and repair.excel_row and repair.values is not None:
                 sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
                 positions = _canonical_positions(sheet, sheet_rule)
@@ -108,6 +119,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                     _set_safe_value(cell, value)
                     cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
                 sheet.cell(repair.excel_row, 1).comment = Comment(f"自动追加标准记录；规则：{repair.rule_id}", "Excel Auditor")
+                operation_count += 1
         if "核验报告" in book.sheetnames:
             del book["核验报告"]
         report_sheet = book.create_sheet("核验报告")
@@ -120,8 +132,29 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
         for item in report_payload.get("differences", []):
             report_sheet.append([item["type"], item["sheet_name"], item.get("cell"), json.dumps(item.get("business_key"), ensure_ascii=False), item["message"]])
         report_sheet.sheet_state = "visible"
+        operation_count += 1
+        if "__ExcelAuditorMetadata" in book.sheetnames:
+            del book["__ExcelAuditorMetadata"]
+        metadata_sheet = book.create_sheet("__ExcelAuditorMetadata")
+        metadata_sheet.append(["key", "value"])
+        metadata = [
+            ("job_id", report_payload.get("job_id")),
+            ("schema_id", report_payload.get("schema_id")),
+            ("schema_version", report_payload.get("schema_version")),
+            ("schema_sha256", report_payload.get("schema_sha256")),
+            ("standard_snapshot_id", report_payload.get("standard_snapshot_id")),
+            ("standard_sha256", report_payload.get("standard_sha256")),
+            ("input_sha256", report_payload.get("input_sha256")),
+            ("result_content_sha256", ""),
+            ("operation_count", operation_count),
+        ]
+        for key, value in metadata:
+            metadata_sheet.append([key, "" if value is None else str(value)])
+        metadata_sheet.sheet_state = "veryHidden"
         book.save(destination)
         book.close()
+        metadata_entry = _worksheet_package_entry(destination, "__ExcelAuditorMetadata")
+        _set_result_content_hash(destination, metadata_entry)
         load_workbook(destination, read_only=True, data_only=False).close()
         applied = [{"difference_id": item.difference_id, "status": "applied"} for item in comparison.differences if item.repair_status == "planned"]
         return RenderResult(destination, sha256_file(destination), warnings, applied)
@@ -176,10 +209,10 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
         return RenderResult(destination, digest, operation_results=operation_results)
 
 
-def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Difference], color: str) -> None:
+def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Difference], color: str) -> int:
     missing_names = {item.canonical_field for item in missing}
     if not missing_names:
-        return
+        return 0
     header_row = sheet_rule.header.row
     known_positions: dict[str, int] = {}
     normalized_headers = {str(sheet.cell(header_row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
@@ -203,6 +236,78 @@ def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Differenc
             cell.font, cell.border, cell.alignment, cell.number_format, cell.protection = copy(source.font), copy(source.border), copy(source.alignment), source.number_format, copy(source.protection)
         cell.fill = PatternFill("solid", fgColor=color)
         cell.comment = Comment(f"缺失表头；由规则 {sheet_rule.id} 插入", "Excel Auditor")
+    return len(plans)
+
+
+def _workbook_content_hash(path: Path, excluded_entry: str) -> str:
+    """Hash all uncompressed package parts except the self-referential metadata sheet."""
+    digest = hashlib.sha256()
+    with zipfile.ZipFile(path) as archive:
+        for name in sorted(archive.namelist()):
+            if name == excluded_entry:
+                continue
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(archive.read(name))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _worksheet_package_entry(path: Path, sheet_name: str) -> str:
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_relationship_namespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_relationship_namespace = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(path) as archive:
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        sheet = workbook.find(f".//{{{spreadsheet_namespace}}}sheet[@name='{sheet_name}']")
+        if sheet is None:
+            raise RuntimeError(f"OUTPUT_VERIFICATION_FAILED: worksheet is missing: {sheet_name}")
+        relationship_id = sheet.get(f"{{{office_relationship_namespace}}}id")
+        relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        relationship = relationships.find(f".//{{{package_relationship_namespace}}}Relationship[@Id='{relationship_id}']")
+        if relationship is None or not relationship.get("Target"):
+            raise RuntimeError(f"OUTPUT_VERIFICATION_FAILED: worksheet relationship is missing: {sheet_name}")
+        target = str(relationship.get("Target"))
+        return target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+
+
+def _set_result_content_hash(path: Path, metadata_entry: str) -> None:
+    content_hash = _workbook_content_hash(path, metadata_entry)
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ElementTree.register_namespace("", spreadsheet_namespace)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as temporary:
+            temporary_name = temporary.name
+        with zipfile.ZipFile(path) as source, zipfile.ZipFile(temporary_name, "w") as destination:
+            destination.comment = source.comment
+            replaced = False
+            for info in source.infolist():
+                payload = source.read(info.filename)
+                if info.filename == metadata_entry:
+                    replaced = True
+                    root = ElementTree.fromstring(payload)
+                    cell = root.find(f".//{{{spreadsheet_namespace}}}c[@r='B9']")
+                    if cell is None:
+                        raise RuntimeError("OUTPUT_VERIFICATION_FAILED: metadata result hash cell is missing")
+                    cell.clear()
+                    cell.set("r", "B9")
+                    cell.set("t", "inlineStr")
+                    inline = ElementTree.SubElement(cell, f"{{{spreadsheet_namespace}}}is")
+                    text = ElementTree.SubElement(inline, f"{{{spreadsheet_namespace}}}t")
+                    text.text = content_hash
+                    payload = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+                destination.writestr(info, payload)
+            if not replaced:
+                raise RuntimeError("OUTPUT_VERIFICATION_FAILED: metadata worksheet package part is missing")
+        os.replace(temporary_name, path)
+        temporary_name = None
+        path.chmod(0o600)
+        if _workbook_content_hash(path, metadata_entry) != content_hash:
+            raise RuntimeError("OUTPUT_VERIFICATION_FAILED: development renderer content hash mismatch")
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 def _canonical_positions(sheet: Any, sheet_rule: Any) -> dict[str, int]:

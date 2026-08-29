@@ -342,7 +342,7 @@ class AuditService:
             output_path = directory / f"result{input_suffix}"
             try:
                 stage_started = time.perf_counter()
-                render = self.renderer.render(input_path, output_path, workbook, rules, comparison, report.model_dump(mode="json"))
+                render = self.renderer.render(input_path, output_path, workbook, rules, comparison, embedded_report.model_dump(mode="json"))
                 metrics.observe("stage_duration_seconds", time.perf_counter() - stage_started, stage="rendering")
             finally:
                 (directory / "render-manifest.private.json").unlink(missing_ok=True)

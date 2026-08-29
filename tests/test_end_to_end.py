@@ -377,6 +377,14 @@ def test_explicit_auto_repairs_are_applied_and_public_manifest_is_redacted(tmp_p
     assert result["D2"].value == "=SAFE_TEXT" and result["D2"].data_type != "f"
     assert result["A3"].value == "E2"
     assert result["D3"].value == "@SAFE_TEXT" and result["D3"].data_type != "f"
+    embedded_summary = {
+        row[0]: row[1]
+        for row in rendered["核验报告"].iter_rows(min_row=2, values_only=True)
+        if row[0]
+    }
+    assert int(embedded_summary["repairs_planned"]) == 5
+    assert int(embedded_summary["repairs_applied"]) == 5
+    assert int(embedded_summary["repair_failures"]) == 0
     rendered.close()
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
     repaired = [item for item in report["differences"] if item["repair_status"] == "applied"]

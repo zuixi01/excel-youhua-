@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 
 from excel_auditor.engine import compare_workbook
 from excel_auditor.models import RuleSet
+from excel_auditor.rendering import _workbook_content_hash, _worksheet_package_entry
 from excel_auditor.service import AuditService
 from excel_auditor.snapshots import SpilledRecords, StandardSnapshot, load_snapshot
 from excel_auditor.workbook import SpilledRows, inspect_workbook
@@ -44,7 +45,8 @@ def test_structured_multisheet_golden_preserves_key_parts(tmp_path):
     job_id = service.create_job()
     service.run(job_id, source, standard, rules)
     assert service.status(job_id)["status"] == "completed"
-    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    result_path = service.artifact(job_id, "excel")
+    rendered = load_workbook(result_path, data_only=False)
     data = rendered["结构"]
     assert data.tables["GoldenTable"].ref == "A1:C3"
     assert str(data.data_validations.dataValidation[0].sqref) == "B2:B3"
@@ -55,7 +57,16 @@ def test_structured_multisheet_golden_preserves_key_parts(tmp_path):
     assert rendered.defined_names["GoldenData"].attr_text == "'结构'!$A$1:$C$3"
     assert rendered["说明"].sheet_state == "hidden"
     assert {"核验报告", "__ExcelAuditorMetadata"} <= set(rendered.sheetnames)
+    metadata = rendered["__ExcelAuditorMetadata"]
+    metadata_values = {str(row[0]): str(row[1]) for row in metadata.iter_rows(min_row=2, values_only=True)}
+    assert metadata.sheet_state == "veryHidden"
+    assert metadata_values["job_id"] == job_id
+    assert metadata_values["schema_id"] == rules.schema_id
+    assert metadata_values["schema_version"] == rules.schema_version
+    assert metadata_values["input_sha256"] == scenario["input_sha256"]
     rendered.close()
+    metadata_entry = _worksheet_package_entry(result_path, "__ExcelAuditorMetadata")
+    assert metadata_values["result_content_sha256"] == _workbook_content_hash(result_path, metadata_entry)
 
 
 def test_merged_header_golden_requires_manual_review(tmp_path):
