@@ -220,7 +220,7 @@ class AuditService:
             self._write_status(job_id, {**self.status(job_id), "status": "comparing", "progress": 40, "standard_snapshot_id": snapshot.snapshot_id, "object_keys": snapshot_objects})
             stage_started = time.perf_counter()
             try:
-                comparison = compare_workbook(workbook, standard, rules, job_id=job_id)
+                comparison = compare_workbook(workbook, standard, rules, job_id=job_id, spill_to_disk=True)
                 metrics.observe("stage_duration_seconds", time.perf_counter() - stage_started, stage="comparison")
             finally:
                 for rows in standard.values():

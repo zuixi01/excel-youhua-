@@ -107,6 +107,7 @@ def compare_workbook(
     *,
     job_id: str | None = None,
     difference_spill_threshold: int | None = None,
+    spill_to_disk: bool | None = None,
 ) -> ComparisonResult:
     threshold = difference_spill_threshold if difference_spill_threshold is not None else int(os.environ.get("EXCEL_AUDITOR_DIFFERENCE_SPILL_THRESHOLD", "50000"))
     if threshold < 1:
@@ -116,8 +117,13 @@ def compare_workbook(
         if job_id is not None:
             item.job_id = job_id
 
-    differences = SpillableSequence[Difference](threshold, on_append=attach_job_id)
-    repairs = SpillableSequence[RepairOperation](threshold)
+    spill_enabled = spill_to_disk if spill_to_disk is not None else (
+        workbook.report_only or any(isinstance(rows, SpilledRecords) for rows in standard.values())
+    )
+    differences: list[Difference] | SpillableSequence[Difference]
+    repairs: list[RepairOperation] | SpillableSequence[RepairOperation]
+    differences = SpillableSequence[Difference](threshold, on_append=attach_job_id) if spill_enabled else []
+    repairs = SpillableSequence[RepairOperation](threshold) if spill_enabled else []
     all_mappings: list[HeaderMapping] = []
     summary = ReportSummary()
     manual_review_reasons: list[str] = []
@@ -163,13 +169,17 @@ def compare_workbook(
         for item in differences
         if item.rule_id and item.rule_id.endswith(".fuzzy_suggestion")
     }))
-    spilled = differences.spilled or repairs.spilled
+    spilled = (
+        isinstance(differences, SpillableSequence) and differences.spilled
+    ) or (
+        isinstance(repairs, SpillableSequence) and repairs.spilled
+    )
     storage_backends.append("disk_differences" if spilled else "memory_differences")
     return ComparisonResult(
         all_mappings,
-        differences.finish(),
+        differences.finish() if isinstance(differences, SpillableSequence) else differences,
         summary,
-        repairs.finish(),
+        repairs.finish() if isinstance(repairs, SpillableSequence) else repairs,
         manual_review_reasons,
         join_backends,
         report_only=spilled,
