@@ -78,11 +78,23 @@ jobs:
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Download prior stable scenario
         if: steps.reference.outputs.run_id != ''
+        id: compatibility
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ steps.reference.outputs.run_id }}
           ARTIFACT: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}
-        run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir performance-reference
+          REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
+          RESULT: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}.json
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir performance-reference
+          if jq -e '.benchmark_version == 2' "performance-reference/$RESULT" >/dev/null; then
+            echo "compatible=1" >> "$GITHUB_OUTPUT"
+          elif [ "$REQUIRE_REFERENCE" = "1" ]; then
+            echo "A release requires a benchmark-version 2 performance reference." >&2
+            exit 1
+          else
+            echo "compatible=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run baseline
         env:
           RUN_PERFORMANCE: "1"
@@ -96,7 +108,7 @@ jobs:
           PERF_RESULT_PATH: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}.json
         run: uv run --frozen --extra test python -m pytest tests/performance/test_baseline.py -k configured_workbook -s --junitxml=performance-junit.xml
       - name: Reject regression against prior stable scenario
-        if: steps.reference.outputs.run_id != ''
+        if: steps.compatibility.outputs.compatible == '1'
         env:
           RESULT: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}.json
         run: >-
@@ -104,7 +116,7 @@ jobs:
           --current "$RESULT"
           --reference "performance-reference/$RESULT"
           --max-time-ratio 0.25
-          --time-slack-seconds 6
+          --time-slack-seconds 5
           --max-memory-ratio 0.25
           --memory-slack-mib 64
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -141,10 +153,21 @@ jobs:
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Download prior stable pagination scenario
         if: steps.reference.outputs.run_id != ''
+        id: compatibility
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ steps.reference.outputs.run_id }}
-        run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-http-pagination --dir performance-reference
+          REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-http-pagination --dir performance-reference
+          if jq -e '.benchmark_version == 2' performance-reference/performance-http-pagination.json >/dev/null; then
+            echo "compatible=1" >> "$GITHUB_OUTPUT"
+          elif [ "$REQUIRE_REFERENCE" = "1" ]; then
+            echo "A release requires a benchmark-version 2 pagination reference." >&2
+            exit 1
+          else
+            echo "compatible=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run paginated standard-source baseline
         env:
           PERF_RUN_HTTP: "1"
@@ -155,7 +178,7 @@ jobs:
           PERF_HTTP_RESULT_PATH: performance-http-pagination.json
         run: uv run --frozen --extra test python -m pytest tests/performance/test_baseline.py -k paginated_standard_source -s --junitxml=performance-http-junit.xml
       - name: Reject pagination regression against prior stable scenario
-        if: steps.reference.outputs.run_id != ''
+        if: steps.compatibility.outputs.compatible == '1'
         run: >-
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-http-pagination.json
@@ -201,10 +224,21 @@ jobs:
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Download prior maximum-standard scenario
         if: steps.reference.outputs.run_id != ''
+        id: compatibility
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ steps.reference.outputs.run_id }}
-        run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-maximum-standard --dir performance-reference
+          REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-maximum-standard --dir performance-reference
+          if jq -e '.benchmark_version == 2' performance-reference/performance-maximum-standard.json >/dev/null; then
+            echo "compatible=1" >> "$GITHUB_OUTPUT"
+          elif [ "$REQUIRE_REFERENCE" = "1" ]; then
+            echo "A release requires a benchmark-version 2 maximum-standard reference." >&2
+            exit 1
+          else
+            echo "compatible=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run 500,000-record comparison baseline
         env:
           PERF_RUN_LARGE_STANDARD: "1"
@@ -216,7 +250,7 @@ jobs:
           PERF_LARGE_STANDARD_RESULT_PATH: performance-maximum-standard.json
         run: uv run --frozen --extra test python -m pytest tests/performance/test_baseline.py -k maximum_standard_comparison -s --junitxml=performance-maximum-standard-junit.xml
       - name: Reject maximum-standard regression
-        if: steps.reference.outputs.run_id != ''
+        if: steps.compatibility.outputs.compatible == '1'
         run: >-
           uv run --frozen python -m excel_auditor.performance_gate
           --current performance-maximum-standard.json

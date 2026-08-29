@@ -53,7 +53,14 @@ def compare_performance(
 def _validate_scenario_identity(current: dict[str, Any], reference: dict[str, Any]) -> None:
     workbook_keys = ("rows", "columns", "sheets", "density", "difference_rate")
     http_keys = ("records", "page_size", "pages")
-    keys = workbook_keys if "rows" in current or "rows" in reference else http_keys
+    maximum_standard_keys = ("standard_records", "excel_rows")
+    if "rows" in current or "rows" in reference:
+        scenario_keys = workbook_keys
+    elif "standard_records" in current or "standard_records" in reference:
+        scenario_keys = maximum_standard_keys
+    else:
+        scenario_keys = http_keys
+    keys = ("benchmark_version", *scenario_keys)
     mismatches = [key for key in keys if current.get(key) != reference.get(key)]
     if mismatches:
         details = ", ".join(f"{key}={reference.get(key)!r}->{current.get(key)!r}" for key in mismatches)

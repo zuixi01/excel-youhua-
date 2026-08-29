@@ -78,7 +78,7 @@ def test_configured_workbook_baseline(tmp_path):
     write_json_report(AuditReport(job_id="job_performance", created_at=datetime.now(timezone.utc), schema_id=rules.schema_id, schema_version=rules.schema_version, schema_sha256=rules.content_sha256, input_sha256=snapshot.sha256, standard_snapshot_id="std_performance", standard_sha256="0" * 64, header_mappings=result.mappings, differences=result.differences, summary=result.summary), report_path)
     elapsed = time.perf_counter() - started
     stopped.set(); sampler.join()
-    metrics = {"rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
+    metrics = {"benchmark_version": 2, "rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
     print(metrics)
     if output := os.environ.get("PERF_RESULT_PATH"):
         Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -123,7 +123,7 @@ def test_paginated_standard_source_baseline(tmp_path):
     records, metadata = source.fetch_with_metadata(config)
     try:
         elapsed = time.perf_counter() - started
-        metrics = {"records": len(records), "page_size": page_size, "pages": len(metadata["pages"]), "elapsed_seconds": round(elapsed, 3), "response_bytes": metadata["response_bytes"], "record_storage": metadata["record_storage"]}
+        metrics = {"benchmark_version": 2, "records": len(records), "page_size": page_size, "pages": len(metadata["pages"]), "elapsed_seconds": round(elapsed, 3), "response_bytes": metadata["response_bytes"], "record_storage": metadata["record_storage"]}
         print(metrics)
         if output := os.environ.get("PERF_HTTP_RESULT_PATH"):
             Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -211,6 +211,7 @@ def test_maximum_standard_comparison_baseline(tmp_path):
         elapsed = time.perf_counter() - started
         cpu_finished = process.cpu_times()
         metrics = {
+            "benchmark_version": 2,
             "standard_records": record_count,
             "excel_rows": excel_rows,
             "matched_records": result.summary.matched_records,
