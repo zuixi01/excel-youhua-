@@ -382,7 +382,11 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
 
 
 def sheet_rule_for_name(rules: RuleSet, name: str) -> Any:
-    return next((sheet for sheet in rules.sheets if name in {sheet.name, *sheet.aliases}), rules.sheets[0])
+    folded_name = name.casefold()
+    return next(
+        (sheet for sheet in rules.sheets if folded_name in {candidate.casefold() for candidate in [sheet.name, *sheet.aliases]}),
+        rules.sheets[0],
+    )
 
 
 def _detect_sheet_xml_features(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> set[str]:

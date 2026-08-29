@@ -268,3 +268,17 @@ def test_managed_http_canonicalization_rejects_duplicate_sheet_mapping():
 
     with pytest.raises(ValueError, match="STANDARD_DATA_INVALID: duplicate sheet mapping: people"):
         _canonicalize_standard({"people": [{"id": "E001"}], "人员": [{"id": "E002"}]}, rules)
+
+
+def test_standard_sheet_name_and_alias_matching_is_case_insensitive_and_collision_safe():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "People", "aliases": ["Roster"], "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True}
+        ]}],
+    })
+
+    assert _canonicalize_standard({"PEOPLE": [{"id": "E001"}]}, rules) == {"people": [{"id": "E001"}]}
+    assert _canonicalize_standard({"rOsTeR": [{"id": "E002"}]}, rules) == {"people": [{"id": "E002"}]}
+    with pytest.raises(ValueError, match="STANDARD_DATA_INVALID: duplicate sheet mapping: people"):
+        _canonicalize_standard({"PEOPLE": [{"id": "E001"}], "roster": [{"id": "E002"}]}, rules)

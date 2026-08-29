@@ -669,7 +669,16 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
         if isinstance(rows, (str, bytes, bytearray)) or not isinstance(rows, SequenceABC):
             _close_record_sequences(result)
             raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
-        sheet_rule = next((sheet for sheet in rules.sheets if sheet.id == str(key) or sheet.name == str(key)), None)
+        key_text = str(key)
+        sheet_rule = next(
+            (
+                sheet
+                for sheet in rules.sheets
+                if sheet.id == key_text
+                or key_text.casefold() in {name.casefold() for name in [sheet.name, *sheet.aliases]}
+            ),
+            None,
+        )
         if sheet_rule is None:
             result[str(key)] = rows
             continue

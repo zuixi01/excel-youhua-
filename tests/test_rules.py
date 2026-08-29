@@ -150,6 +150,17 @@ def test_unsafe_schema_id_and_cross_sheet_alias_collision_are_rejected():
         RuleSet.model_validate(payload)
 
     payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["aliases"].append("people")
+    payload["sheets"].append({
+        "id": "PEOPLE",
+        "name": "Second",
+        "primary_key": ["id"],
+        "columns": [{"name": "id", "title": "ID", "required": True}],
+    })
+    with pytest.raises(ValidationError, match="sheet id.*conflicts with a worksheet name or alias"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0].update({"primary_key": [], "primary_key_mode": "row_number", "row_number_field": "../row"})
     with pytest.raises(ValidationError, match="row_number_field"):
         RuleSet.model_validate(payload)

@@ -730,6 +730,12 @@ class RuleSet(StrictModel):
                 if owner is not None and owner != sheet.id:
                     raise ValueError(f"worksheet name or alias {physical_name!r} is shared by sheets {owner!r} and {sheet.id!r}")
                 physical_names[key] = sheet.id
+        for sheet in self.sheets:
+            physical_owner = physical_names.get(sheet.id.casefold())
+            if physical_owner is not None and physical_owner != sheet.id:
+                raise ValueError(
+                    f"sheet id {sheet.id!r} conflicts with a worksheet name or alias owned by sheet {physical_owner!r}"
+                )
         return self
 
     @property

@@ -574,7 +574,7 @@ def test_sheet_alias_is_preserved_in_differences_and_repairs(tmp_path):
     excel, standard = tmp_path / "alias.xlsx", tmp_path / "standard.json"
     book = Workbook()
     sheet = book.active
-    sheet.title = "Physical"
+    sheet.title = "pHySiCaL"
     sheet.append(["ID", "Value"])
     sheet.append(["E1", "old"])
     book.save(excel)
@@ -584,9 +584,9 @@ def test_sheet_alias_is_preserved_in_differences_and_repairs(tmp_path):
     service.run(job_id, excel, standard, rules)
     assert service.status(job_id)["status"] == "completed"
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
-    assert {item["sheet_name"] for item in report["differences"]} == {"Physical"}
+    assert {item["sheet_name"] for item in report["differences"]} == {"pHySiCaL"}
     rendered = load_workbook(service.artifact(job_id, "excel"))
-    assert rendered["Physical"]["B2"].value == "new"
+    assert rendered["pHySiCaL"]["B2"].value == "new"
     rendered.close()
 
 

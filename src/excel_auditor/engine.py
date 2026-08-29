@@ -163,7 +163,8 @@ def compare_workbook(
     formula_rows_by_sheet: dict[str, list[int]] = {}
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
-        matching_names = [name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets]
+        configured_names = {name.casefold() for name in [sheet_rule.name, *sheet_rule.aliases]}
+        matching_names = [name for name in workbook.sheets if name.casefold() in configured_names]
         if len(matching_names) > 1:
             consumed_sheets.update(matching_names)
             differences.append(_difference(
