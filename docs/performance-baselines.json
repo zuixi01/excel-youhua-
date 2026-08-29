@@ -1,7 +1,8 @@
 {
+  "benchmark_version": 3,
   "recorded_at": "2026-08-29",
-  "runtime": "CPython 3.12 / Windows x64",
-  "notes": "Measurements cover workbook inspection, deterministic comparison, Polars partitioned key joins when the per-sheet threshold is reached, and JSON report serialization. XLSX fixture creation is excluded. Density controls populated non-key fields so documented row/column boundaries can be exercised within bounded memory.",
+  "runtime": "GitHub Actions / CPython 3.12 / Ubuntu x64",
+  "notes": "Measurements cover workbook inspection, deterministic comparison, Polars partitioned key joins, complete JSON/JSONL report serialization, process CPU time, wall time, and peak RSS. XLSX fixture creation is excluded. Relative release gates use process CPU time and peak RSS; wall time remains subject to each scenario's hard timeout.",
   "baselines": [
     {
       "rows": 10000,
@@ -10,11 +11,12 @@
       "density": 1.0,
       "difference_rate": 0.1,
       "join_backends": ["python_in_memory"],
-      "inspect_seconds": 10.021,
-      "compare_and_report_seconds": 2.276,
-      "elapsed_seconds": 12.297,
-      "peak_rss_delta_mib": 52.13,
-      "report_bytes": 699344
+      "inspect_seconds": 8.128,
+      "compare_and_report_seconds": 2.563,
+      "cpu_seconds": 10.754,
+      "elapsed_seconds": 10.692,
+      "peak_rss_delta_mib": 50.46,
+      "report_bytes": 546810
     },
     {
       "rows": 100000,
@@ -23,11 +25,12 @@
       "density": 0.1,
       "difference_rate": 0.1,
       "join_backends": ["polars_partitioned"],
-      "inspect_seconds": 24.783,
-      "compare_and_report_seconds": 13.0,
-      "elapsed_seconds": 37.783,
-      "peak_rss_delta_mib": 252.79,
-      "report_bytes": 6940302
+      "inspect_seconds": 22.169,
+      "compare_and_report_seconds": 15.92,
+      "cpu_seconds": 38.611,
+      "elapsed_seconds": 38.089,
+      "peak_rss_delta_mib": 259.89,
+      "report_bytes": 5419268
     },
     {
       "rows": 100000,
@@ -36,11 +39,12 @@
       "density": 0.05,
       "difference_rate": 0.5,
       "join_backends": ["polars_partitioned"],
-      "inspect_seconds": 25.084,
-      "compare_and_report_seconds": 26.241,
-      "elapsed_seconds": 51.325,
-      "peak_rss_delta_mib": 422.52,
-      "report_bytes": 34886602
+      "inspect_seconds": 23.519,
+      "compare_and_report_seconds": 29.673,
+      "cpu_seconds": 54.239,
+      "elapsed_seconds": 53.192,
+      "peak_rss_delta_mib": 289.69,
+      "report_bytes": 27284568
     },
     {
       "rows": 100000,
@@ -49,11 +53,12 @@
       "density": 0.01,
       "difference_rate": 0.01,
       "join_backends": ["polars_partitioned"],
-      "inspect_seconds": 5.766,
-      "compare_and_report_seconds": 14.493,
-      "elapsed_seconds": 20.259,
-      "peak_rss_delta_mib": 185.79,
-      "report_bytes": 738596
+      "inspect_seconds": 6.343,
+      "compare_and_report_seconds": 21.389,
+      "cpu_seconds": 28.391,
+      "elapsed_seconds": 27.731,
+      "peak_rss_delta_mib": 195.18,
+      "report_bytes": 584562
     },
     {
       "rows": 50000,
@@ -62,19 +67,41 @@
       "density": 0.1,
       "difference_rate": 0.1,
       "join_backends": ["python_in_memory"],
-      "inspect_seconds": 7.916,
-      "compare_and_report_seconds": 3.317,
-      "elapsed_seconds": 11.232,
-      "peak_rss_delta_mib": 30.96,
-      "report_bytes": 3534488
+      "inspect_seconds": 5.69,
+      "compare_and_report_seconds": 4.335,
+      "cpu_seconds": 10.198,
+      "elapsed_seconds": 10.025,
+      "peak_rss_delta_mib": 19.65,
+      "report_bytes": 2771954
     }
   ],
   "paginated_standard_source": {
     "records": 50000,
     "page_size": 500,
     "pages": 100,
-    "elapsed_seconds": 0.119,
+    "cpu_seconds": 0.183,
+    "elapsed_seconds": 0.183,
     "response_bytes": 852400,
-    "transport_note": "Local deterministic MockTransport isolates pagination and payload processing; production network latency is measured separately through per-page metadata and metrics."
+    "record_storage": "disk_spill",
+    "transport_note": "Deterministic MockTransport isolates pagination and payload processing; production network latency is measured separately through per-page metadata and metrics."
+  },
+  "maximum_standard_comparison": {
+    "standard_records": 500000,
+    "excel_rows": 99999,
+    "matched_records": 99999,
+    "missing_records": 400001,
+    "differences": 400001,
+    "join_backends": ["polars_partitioned"],
+    "storage_backends": ["disk_differences", "disk_standard_records"],
+    "report_only": true,
+    "inspect_seconds": 2.46,
+    "compare_seconds": 40.507,
+    "report_seconds": 15.943,
+    "render_seconds": 0,
+    "cpu_seconds": 60.55,
+    "elapsed_seconds": 58.91,
+    "peak_rss_delta_mib": 263.47,
+    "report_bytes": 219201859,
+    "jsonl_bytes": 202400506
   }
 }
