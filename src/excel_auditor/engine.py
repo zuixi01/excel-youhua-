@@ -22,6 +22,7 @@ from .models import (
 )
 from .normalization import ParsedValue, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
+from .snapshots import SpilledRecords
 from .spill import SpillableSequence
 from .workbook import SheetSnapshot, WorkbookSnapshot
 from .validators import run_validator
@@ -284,7 +285,14 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
     join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
     if join_threshold < 1:
         raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
-    use_disk_records = len(excel_records) + len(standard_rows) >= join_threshold
+    # Do not duplicate an already-resident caller list into SQLite: that only
+    # adds I/O without releasing the source payload. Service large-data paths
+    # arrive as SpilledRecords, where the disk map replaces the Python payload
+    # dictionary and materially bounds memory.
+    disk_record_threshold = int(os.environ.get("EXCEL_AUDITOR_DISK_RECORD_THRESHOLD", "250000"))
+    if disk_record_threshold < 1:
+        raise ValueError("EXCEL_AUDITOR_DISK_RECORD_THRESHOLD must be positive")
+    use_disk_records = isinstance(standard_rows, SpilledRecords) or len(standard_rows) >= disk_record_threshold
     standard_records: dict[tuple[Any, ...], dict[str, Any]] | DiskBackedRecordMap
     standard_records = DiskBackedRecordMap() if use_disk_records else {}
     standard_duplicates: set[tuple[Any, ...]] = set()
