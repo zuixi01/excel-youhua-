@@ -321,6 +321,7 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
                 sheet,
                 f"缺少表头：{column.title}",
                 canonical_field=name,
+                standard_raw_value=column.title,
                 rule_id=f"{name}.missing_column",
                 render_action=action,
                 repair_status="planned" if action == "insert_and_mark_green" else "not_requested",

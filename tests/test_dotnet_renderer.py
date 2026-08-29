@@ -403,11 +403,17 @@ def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_va
     rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
     result = rendered["Data"]
     assert result["B2"].value is True and result["B2"].data_type == "b"
+    assert "原值：false" in result["B2"].comment.text
+    assert "标准值：yes" in result["B2"].comment.text
+    assert "规则：active.overwrite_mismatch" in result["B2"].comment.text
     assert result["C2"].value == "active"
     assert result["D2"].value.isoformat() == "2026-01-01T08:00:00"
     assert result["E2"].value == "a,b"
     assert result["F2"].value == '{"a":1,"b":2}'
     assert result["G2"].value == pytest.approx(0.1) and result["G2"].data_type == "n"
+    assert "原值：0" in result["G2"].comment.text
+    assert "标准值：10%" in result["G2"].comment.text
+    assert "规则：ratio.overwrite_mismatch" in result["G2"].comment.text
     rendered.close()
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
     raw_by_field = {item["canonical_field"]: item["standard_raw_value"] for item in report["differences"]}

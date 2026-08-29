@@ -6,9 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from excel_auditor.engine import compare_workbook
-from excel_auditor.models import RuleSet
+from excel_auditor.models import Difference, DifferenceType, RuleSet
 from excel_auditor.persistence import AuditEventRow, DatabaseRepository
-from excel_auditor.rendering import ExcelRenderer
+from excel_auditor.rendering import ExcelRenderer, _repair_provenance_comment
 from excel_auditor.service import AuditService
 from excel_auditor.workbook import inspect_workbook
 
@@ -36,6 +36,24 @@ def test_sensitive_values_are_masked_in_differences(tmp_path):
     assert mismatch.excel_raw_value == "13***00"
     assert mismatch.standard_raw_value == "13***00"
     assert mismatch.business_key == {"id": "12***78"}
+
+
+def test_repair_provenance_comment_preserves_required_fields_within_excel_limit():
+    difference = Difference(
+        difference_id="diff_comment_limit",
+        type=DifferenceType.VALUE_MISMATCH,
+        sheet_id="data",
+        sheet_name="Data",
+        excel_raw_value="😀" * 10_000,
+        standard_raw_value="🧪" * 10_000,
+        message="mismatch",
+    )
+    comment = _repair_provenance_comment("自动修复", "value.overwrite_mismatch", difference)
+
+    assert len(comment.encode("utf-16-le")) // 2 <= 32767
+    assert "原值：" in comment and "标准值：" in comment
+    assert "规则：value.overwrite_mismatch" in comment
+    assert comment.count("…") == 2
 
 
 def test_invalid_sensitive_primary_key_is_masked():
@@ -93,8 +111,11 @@ def test_sensitive_values_do_not_leak_to_secondary_artifacts_or_database_audit(t
 
     rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
     assert rendered["People"]["B2"].value == standard_secret  # authorized business output
-    assert excel_secret not in (rendered["People"]["B2"].comment.text or "")
-    assert standard_secret not in (rendered["People"]["B2"].comment.text or "")
+    repair_comment = rendered["People"]["B2"].comment.text or ""
+    assert excel_secret not in repair_comment
+    assert standard_secret not in repair_comment
+    assert "原值：13***00" in repair_comment and "标准值：13***00" in repair_comment
+    assert "规则：phone.overwrite_mismatch" in repair_comment
     embedded_report = "\n".join(
         "|".join("" if value is None else str(value) for value in row)
         for row in rendered["核验报告"].iter_rows(values_only=True)
@@ -102,8 +123,15 @@ def test_sensitive_values_do_not_leak_to_secondary_artifacts_or_database_audit(t
     assert excel_secret not in embedded_report and standard_secret not in embedded_report
     rendered.close()
     with Session(database.engine) as session:
-        audit_payload = json.dumps([row.metadata_json for row in session.scalars(select(AuditEventRow)).all()])
+        audit_events = session.scalars(select(AuditEventRow)).all()
+        audit_payload = json.dumps([row.metadata_json for row in audit_events])
     assert excel_secret not in audit_payload and standard_secret not in audit_payload
+    repair_event = next(row for row in audit_events if row.action == "comparison.auto_repair_operation")
+    assert repair_event.metadata_json["rule_id"] == "phone.overwrite_mismatch"
+    assert repair_event.metadata_json["difference_rule_id"] == "phone.exact"
+    assert repair_event.metadata_json["excel_raw_value"] == "13***00"
+    assert repair_event.metadata_json["standard_raw_value"] == "13***00"
+    assert repair_event.metadata_json["status"] == "applied"
 
 
 def test_failure_status_and_diagnostic_never_store_exception_message(tmp_path):

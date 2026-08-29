@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 from .engine import compare_workbook
 from .models import AuditReport, RuleSet
-from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer
+from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer, _repair_provenance_comment
 from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
@@ -364,6 +364,10 @@ class AuditService:
                 for item in render.operation_results
                 if item.get("status") == "applied" and item.get("difference_id")
             }
+            repair_rule_ids = {
+                repair.difference_id: repair.rule_id
+                for repair in comparison.repairs
+            }
             for difference in report.differences:
                 if difference.repair_status == "planned":
                     difference.repair_status = "applied" if difference.difference_id in applied_ids else "failed"
@@ -375,7 +379,8 @@ class AuditService:
                             user_id,
                             metadata={
                                 "job_id": job_id,
-                                "rule_id": difference.rule_id,
+                                "rule_id": repair_rule_ids.get(difference.difference_id, difference.rule_id),
+                                "difference_rule_id": difference.rule_id,
                                 "status": difference.repair_status,
                                 "excel_raw_value": difference.excel_raw_value,
                                 "standard_raw_value": difference.standard_raw_value,
@@ -737,6 +742,7 @@ def _manifest(
         "mark_row_purple": rules.colors.ambiguous,
     }
     sheets_by_id = {sheet.id: sheet for sheet in rules.sheets}
+    differences_by_id = {item.difference_id: item for item in report.differences}
     mapped_by_sheet: dict[str, dict[str, int]] = {}
     for mapping in report.header_mappings:
         if mapping.status == "matched" and mapping.canonical_field:
@@ -780,7 +786,11 @@ def _manifest(
                 "validation": _excel_validation(column),
                 "formula_template": column.formula_template,
                 "formula_rows": formula_rows if column.formula_template else None,
-                "comment": f"缺失表头；由规则 {rules.schema_id}@{rules.schema_version} 的 {column.name}.missing_column 插入",
+                "comment": _repair_provenance_comment(
+                    "自动插入缺失表头",
+                    f"{rules.schema_id}@{rules.schema_version}:{column.name}.missing_column",
+                    item,
+                ),
                 "difference_id": item.difference_id,
             })
             for name, position in list(columns.items()):
@@ -819,15 +829,20 @@ def _manifest(
     for repair in comparison.repairs:
         sheet_rule = sheets_by_id[repair.sheet_id]
         column_rule = next((column for column in sheet_rule.columns if column.name == repair.canonical_field), None)
+        repair_comment = _repair_provenance_comment(
+            "自动追加标准记录" if repair.type == "append_record" else "自动修复",
+            repair.rule_id,
+            differences_by_id.get(repair.difference_id),
+        )
         if repair.type == "set_cell":
-            repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": f"自动修复；规则：{repair.rule_id}", "difference_id": repair.difference_id})
+            repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
             header_rename = repair.rule_id.endswith(".rename_confirmed_alias")
             repair_operations[-1].update({"field_type": "string" if header_rename else column_rule.type.value if column_rule else "string", "number_format": None if header_rename else _number_format(column_rule)})
         elif repair.type == "set_field":
             column = final_columns_by_sheet.get(repair.sheet_id, {}).get(repair.canonical_field or "")
             if column is None or repair.excel_row is None:
                 raise ValueError(f"RENDER_FAILED: repaired field has no final column: {repair.canonical_field}")
-            repair_operations.append({"type": "set_cell_after_insert", "sheet": repair.sheet_name, "cell": f"{_column_letter(column)}{repair.excel_row}", "value": repair.value, "fill_color": rules.colors.inserted, "comment": f"自动修复；规则：{repair.rule_id}", "difference_id": repair.difference_id})
+            repair_operations.append({"type": "set_cell_after_insert", "sheet": repair.sheet_name, "cell": f"{_column_letter(column)}{repair.excel_row}", "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
             repair_operations[-1].update({"field_type": column_rule.type.value if column_rule else None, "number_format": _number_format(column_rule)})
         elif repair.type == "append_record":
             values = []
@@ -835,7 +850,7 @@ def _manifest(
                 position = final_columns_by_sheet.get(repair.sheet_id, {}).get(column.name)
                 if position is not None:
                     values.append({"cell": f"{_column_letter(position)}{repair.excel_row}", "value": (repair.values or {}).get(column.name), "field_type": column.type.value, "number_format": _number_format(column), "formula_template": column.formula_template})
-            repair_operations.append({"type": "append_row", "sheet": repair.sheet_name, "row": repair.excel_row, "values": values, "fill_color": rules.colors.inserted, "comment": f"自动追加标准记录；规则：{repair.rule_id}", "difference_id": repair.difference_id})
+            repair_operations.append({"type": "append_row", "sheet": repair.sheet_name, "row": repair.excel_row, "values": values, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
     operations = [*mark_operations, *insert_operations, *repair_operations]
     operations.append({"type": "add_or_replace_report_sheet", "name": "核验报告", "source_json": "report.json"})
     operations[-1].update({"name": "核验报告", "source_json": report_source})
@@ -890,6 +905,12 @@ def _redact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         metadata.pop("standard_snapshot_id", None)
     for operation in redacted["operations"]:
         operation.pop("difference_id", None)
+        if operation.get("type") in {"set_cell", "set_cell_after_insert", "append_row"} and isinstance(operation.get("comment"), str):
+            rule_marker = "；规则："
+            rule_id = operation["comment"].rsplit(rule_marker, 1)[-1] if rule_marker in operation["comment"] else "unknown"
+            prefix = "自动追加标准记录" if operation.get("type") == "append_row" else "自动修复"
+            operation["comment"] = f"{prefix}；原值和标准值已脱敏；规则：{rule_id}"
+            operation["comment_values_redacted"] = True
         if "value" in operation:
             operation.pop("value")
             operation["value_redacted"] = True

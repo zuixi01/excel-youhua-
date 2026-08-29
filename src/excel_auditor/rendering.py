@@ -60,6 +60,7 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             "mark_purple": rules.colors.ambiguous,
             "mark_row_purple": rules.colors.ambiguous,
         }
+        differences_by_id = {item.difference_id: item for item in comparison.differences}
         for difference in comparison.differences:
             if difference.sheet_name not in book.sheetnames:
                 continue
@@ -84,7 +85,10 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             cell = book[repair.sheet_name][repair.cell]
             _set_safe_value(cell, repair.value)
             cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-            cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+            cell.comment = Comment(
+                _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
+                "Excel Auditor",
+            )
             operation_count += 1
         for sheet_rule in rules.sheets:
             physical_name = next(
@@ -111,7 +115,10 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 cell = sheet.cell(repair.excel_row, positions[repair.canonical_field])
                 _set_safe_value(cell, repair.value)
                 cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+                cell.comment = Comment(
+                    _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
+                    "Excel Auditor",
+                )
                 operation_count += 1
             elif repair.type == "append_record" and repair.excel_row and repair.values is not None:
                 sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
@@ -122,7 +129,10 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                     cell = sheet.cell(repair.excel_row, positions[field])
                     _set_safe_value(cell, value)
                     cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                sheet.cell(repair.excel_row, 1).comment = Comment(f"自动追加标准记录；规则：{repair.rule_id}", "Excel Auditor")
+                sheet.cell(repair.excel_row, 1).comment = Comment(
+                    _repair_provenance_comment("自动追加标准记录", repair.rule_id, differences_by_id.get(repair.difference_id)),
+                    "Excel Auditor",
+                )
                 operation_count += 1
         if "核验报告" in book.sheetnames:
             del book["核验报告"]
@@ -228,7 +238,8 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
 
 
 def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Difference], color: str) -> int:
-    missing_names = {item.canonical_field for item in missing}
+    missing_by_name = {item.canonical_field: item for item in missing}
+    missing_names = set(missing_by_name)
     if not missing_names:
         return 0
     header_row = sheet_rule.header.row
@@ -253,7 +264,11 @@ def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Differenc
             source = sheet.cell(header_row, before - 1)
             cell.font, cell.border, cell.alignment, cell.number_format, cell.protection = copy(source.font), copy(source.border), copy(source.alignment), source.number_format, copy(source.protection)
         cell.fill = PatternFill("solid", fgColor=color)
-        cell.comment = Comment(f"缺失表头；由规则 {sheet_rule.id} 插入", "Excel Auditor")
+        difference = missing_by_name[rule.name]
+        cell.comment = Comment(
+            _repair_provenance_comment("自动插入缺失表头", difference.rule_id or f"{rule.name}.missing_column", difference),
+            "Excel Auditor",
+        )
     return len(plans)
 
 
@@ -354,3 +369,31 @@ def _comment(item: Difference) -> str:
     if item.rule_id:
         parts.append(f"规则：{item.rule_id}")
     return "；".join(parts)[:32000]
+
+
+def _repair_provenance_comment(prefix: str, rule_id: str, difference: Difference | None) -> str:
+    """Build a deterministic, privacy-safe repair comment.
+
+    Difference values have already passed the field masking policy. Never fall
+    back to the actual repair payload here because it may contain sensitive
+    business data that is intentionally absent from reports and comments.
+    """
+    if difference is None:
+        original = standard = "（报告中不可用）"
+    else:
+        original = "（缺失）" if difference.type in {DifferenceType.MISSING_HEADER, DifferenceType.MISSING_RECORD} else _comment_value(difference.excel_raw_value)
+        standard_source = difference.standard_raw_value
+        if standard_source is None and difference.standard_normalized_value is not None:
+            standard_source = difference.standard_normalized_value
+        standard = _comment_value(standard_source)
+    return f"{prefix}；原值：{original}；标准值：{standard}；规则：{rule_id}"
+
+
+def _comment_value(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    # Two values of at most 7,000 Unicode code points remain below Excel's
+    # 32,767 UTF-16 code-unit comment limit even for surrogate-pair characters.
+    return text if len(text) <= 7000 else f"{text[:6999]}…"

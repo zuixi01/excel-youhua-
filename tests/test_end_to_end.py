@@ -720,6 +720,11 @@ def test_explicit_auto_repairs_are_applied_and_public_manifest_is_redacted(tmp_p
     assert result["D2"].value == "=SAFE_TEXT" and result["D2"].data_type != "f"
     assert result["A3"].value == "E2"
     assert result["D3"].value == "@SAFE_TEXT" and result["D3"].data_type != "f"
+    assert all(part in result["A1"].comment.text for part in ["原值：代码", "标准值：编号", "规则：id.rename_confirmed_alias"])
+    assert all(part in result["C2"].comment.text for part in ["原值：9", "标准值：10", "规则：amount.overwrite_mismatch"])
+    assert all(part in result["D1"].comment.text for part in ["原值：（缺失）", "标准值：备注", "note.missing_column"])
+    assert all(part in result["D2"].comment.text for part in ["原值：null", "标准值：=SAFE_TEXT", "规则：note.fill_empty_from_standard"])
+    assert all(part in result["A3"].comment.text for part in ["原值：（缺失）", '"id":"E2"', '"note":"@SAFE_TEXT"', "规则：missing_record.append"])
     embedded_summary = {
         row[0]: row[1]
         for row in rendered["核验报告"].iter_rows(min_row=2, values_only=True)
@@ -753,6 +758,13 @@ def test_explicit_auto_repairs_are_applied_and_public_manifest_is_redacted(tmp_p
     public_manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
     serialized = json.dumps(public_manifest, ensure_ascii=False)
     assert "SAFE_TEXT" not in serialized and '"value"' not in serialized
+    redacted_repairs = [
+        operation for operation in public_manifest["operations"]
+        if operation["type"] in {"set_cell", "set_cell_after_insert", "append_row"}
+    ]
+    assert redacted_repairs and all(operation["comment_values_redacted"] is True for operation in redacted_repairs)
+    assert all("原值和标准值已脱敏" in operation["comment"] for operation in redacted_repairs)
+    assert any("规则：amount.overwrite_mismatch" in operation["comment"] for operation in redacted_repairs)
 
 
 def test_soft_delete_delays_then_purges_terminal_job(tmp_path, monkeypatch):

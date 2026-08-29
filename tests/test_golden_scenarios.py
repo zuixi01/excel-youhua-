@@ -51,5 +51,17 @@ def test_golden_rendered_structure_and_fills(tmp_path, scenario):
     assert [sheet.cell(rules.sheets[0].header.row, index).value for index in range(1, len(expected["rendered_headers"]) + 1)] == expected["rendered_headers"]
     for coordinate, color in expected["fills"].items():
         assert sheet[coordinate].fill.fgColor.rgb.endswith(color)
+    for difference in expected["differences"]:
+        if difference["type"] != "MISSING_HEADER" or difference["repair_status"] != "planned":
+            continue
+        header_cell = next(
+            cell
+            for cell in sheet[rules.sheets[0].header.row]
+            if cell.value == difference["standard_raw_value"]
+        )
+        assert header_cell.comment is not None
+        assert "原值：（缺失）" in header_cell.comment.text
+        assert f"标准值：{difference['standard_raw_value']}" in header_cell.comment.text
+        assert f"{difference['canonical_field']}.missing_column" in header_cell.comment.text
     assert "核验报告" in rendered.sheetnames
     rendered.close()
