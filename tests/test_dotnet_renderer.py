@@ -123,6 +123,9 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     sheet.append(["ID", "Amount"])
     sheet.append(["E1", 1])
     sheet.add_table(Table(displayName="TypedTable", ref="A1:B2"))
+    existing_validation = DataValidation(type="whole", operator="greaterThan", formula1="0")
+    existing_validation.add("B2")
+    sheet.add_data_validation(existing_validation)
     book.save(source)
     manifest = {
         "manifest_version": "1.0",
@@ -153,7 +156,7 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     assert data["C3"].value == 9.75 and data["C3"].data_type == "n"
     assert data["C3"].number_format == "0.00"
     assert data.tables["TypedTable"].ref == "A1:C3"
-    assert str(data.data_validations.dataValidation[0].sqref) == "B2:B3"
+    assert sorted(str(item.sqref) for item in data.data_validations.dataValidation) == ["B2:B3", "C2:C3"]
     assert data.calculate_dimension() == "A1:C3"
     metadata = rendered["__ExcelAuditorMetadata"]
     assert metadata.sheet_state == "veryHidden"

@@ -351,8 +351,11 @@ static void ExtendStructuresForAppendedRow(WorksheetPart worksheetPart, uint row
 static string ExtendRangeRow(string reference, uint appendedRow)
 {
     var match = Regex.Match(reference, @"^(?<start>\$?[A-Z]+\$?\d+):(?<endcol>\$?[A-Z]+)\$?(?<endrow>\d+)$");
-    return match.Success && UInt32.Parse(match.Groups["endrow"].Value) + 1u == appendedRow
-        ? match.Groups["start"].Value + ":" + match.Groups["endcol"].Value + appendedRow
+    if (match.Success && UInt32.Parse(match.Groups["endrow"].Value) + 1u == appendedRow)
+        return match.Groups["start"].Value + ":" + match.Groups["endcol"].Value + appendedRow;
+    var single = Regex.Match(reference, @"^(?<cell>(?<column>\$?[A-Z]+)\$?(?<row>\d+))$");
+    return single.Success && UInt32.Parse(single.Groups["row"].Value) + 1u == appendedRow
+        ? single.Groups["cell"].Value + ":" + single.Groups["column"].Value + appendedRow
         : reference;
 }
 

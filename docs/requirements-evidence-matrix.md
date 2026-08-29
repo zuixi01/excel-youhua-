@@ -36,7 +36,7 @@
 | 场景 | 状态 | 证据 |
 |---|---|---|
 | A 表头缺失和多余 | 本地已证明 | `missing_and_extra_header.xlsx`；完整差异与渲染表头/颜色断言 |
-| B 记录级差异 | 本地已证明 | `extra_and_missing_record.xlsx`；默认不追加与显式 `append_and_mark_green` 端到端测试 |
+| B 记录级差异 | 本地已证明 | `extra_and_missing_record.xlsx`；默认不追加与显式 `append_and_mark_green` 端到端测试；追加行扩展 Table/AutoFilter，并覆盖单格和范围数据验证 `sqref` |
 | C 数值容差 | 本地已证明 | `test_end_to_end.py` 的 `10000.005` 对 `10000.00`、属性边界测试 |
 | D 主键重复 | 本地已证明 | `duplicate_primary_key.xlsx`；两行紫色且不参与一对一匹配 |
 | E 模糊表头 | 本地已证明 | `test_fuzzy_header_suggestion_requires_manual_review` |
