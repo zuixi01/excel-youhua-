@@ -647,9 +647,12 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
 
 
 def _standard_spill_threshold(rules: RuleSet) -> int:
-    return max(
-        10_000,
-        rules.workbook.max_in_memory_cells // max(1, sum(len(sheet.columns) for sheet in rules.sheets)),
+    return min(
+        100_000,
+        max(
+            10_000,
+            rules.workbook.max_in_memory_cells // max(1, sum(len(sheet.columns) for sheet in rules.sheets)),
+        ),
     )
 
 

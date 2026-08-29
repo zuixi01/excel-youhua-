@@ -14,6 +14,8 @@ from excel_auditor.engine import compare_workbook
 from excel_auditor.models import AuditReport, RuleSet
 from excel_auditor.reporting import write_differences_jsonl, write_json_report
 from excel_auditor.models import StandardSourceConfig
+from excel_auditor.rendering import ExcelRenderer
+from excel_auditor.service import AuditService
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.workbook import inspect_workbook
@@ -254,3 +256,128 @@ def test_maximum_standard_comparison_baseline(tmp_path):
             result.close()
         snapshot.close()
         standard.close()
+
+
+@pytest.mark.performance
+def test_maximum_managed_service_pipeline_baseline(tmp_path):
+    if os.environ.get("PERF_RUN_LARGE_SERVICE") != "1":
+        pytest.skip("set PERF_RUN_LARGE_SERVICE=1 to execute the maximum managed service pipeline")
+    record_count = int(os.environ.get("PERF_SERVICE_STANDARD_RECORDS", "500000"))
+    excel_rows = int(os.environ.get("PERF_SERVICE_EXCEL_ROWS", "99999"))
+    page_size = int(os.environ.get("PERF_SERVICE_PAGE_SIZE", "5000"))
+    assert 1 <= excel_rows <= 99_999 and excel_rows <= record_count
+    registry_path = tmp_path / "service-connections.json"
+    registry_path.write_text(json.dumps({"connections": [{
+        "id": "maximum-service",
+        "base_url": "https://standards.example.test/",
+        "allowed_paths": ["/records"],
+        "max_records": record_count,
+        "max_response_bytes": 64 * 1024 * 1024,
+    }]}), encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        start = (page - 1) * size
+        stop = min(record_count, start + size)
+        return httpx.Response(200, json={"data": [{"id": f"R{index:06d}"} for index in range(start, stop)], "total": record_count})
+
+    managed_source = ManagedHttpSource(
+        ConnectionRegistry(registry_path),
+        transport=httpx.MockTransport(handler),
+        resolver=lambda _host: ["93.184.216.34"],
+        spill_after_records=10_000,
+    )
+    rules = RuleSet.model_validate({
+        "schema_id": "maximum-managed-service",
+        "schema_version": "1.0.0",
+        "name": "Maximum managed service",
+        "workbook": {"max_standard_records": record_count},
+        "standard_source": {
+            "type": "managed_http",
+            "connection_id": "maximum-service",
+            "path": "/records",
+            "data_json_path": "$.data",
+            "pagination": {"size": page_size, "total_json_path": "$.total", "max_pages": (record_count // page_size) + 2},
+        },
+        "sheets": [{
+            "id": "data",
+            "name": "Data",
+            "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    workbook_path = tmp_path / "maximum-managed-service.xlsx"
+    book = Workbook(write_only=True)
+    sheet = book.create_sheet("Data")
+    sheet.append(["ID"])
+    for index in range(excel_rows):
+        sheet.append([f"R{index:06d}"])
+    book.save(workbook_path)
+
+    class MustNotRender(ExcelRenderer):
+        def render(self, source, destination, workbook, rules, comparison, report_payload):
+            raise AssertionError("maximum managed pipeline must switch to report-only mode")
+
+    process = psutil.Process()
+    baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stopped = threading.Event()
+
+    def sample_memory():
+        while not stopped.wait(0.02):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
+    started = time.perf_counter()
+    cpu_started = time.process_time()
+    service = AuditService(tmp_path / "service-runtime", renderer=MustNotRender(), managed_http=managed_source)
+    job_id = service.create_job()
+    try:
+        service.run(job_id, workbook_path, None, rules)
+        elapsed = time.perf_counter() - started
+        status = service.status(job_id)
+        assert status["status"] == "completed", status
+        report_path = service.artifact(job_id, "json")
+        jsonl_path = service.artifact(job_id, "differences_jsonl")
+        html_path = service.artifact(job_id, "html")
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            jsonl_lines = sum(1 for _line in handle)
+        metrics = {
+            "benchmark_version": 3,
+            "standard_records": record_count,
+            "excel_rows": excel_rows,
+            "page_size": page_size,
+            "pages": (record_count + page_size - 1) // page_size,
+            "matched_records": status["summary"]["matched_records"],
+            "missing_records": status["summary"]["missing_records"],
+            "differences": status["summary"]["differences"],
+            "mode": status.get("mode"),
+            "cpu_seconds": round(time.process_time() - cpu_started, 3),
+            "elapsed_seconds": round(elapsed, 3),
+            "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2),
+            "report_bytes": report_path.stat().st_size,
+            "jsonl_bytes": jsonl_path.stat().st_size,
+            "html_bytes": html_path.stat().st_size,
+        }
+        print(metrics)
+        if output := os.environ.get("PERF_SERVICE_RESULT_PATH"):
+            Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        assert status["mode"] == "report_only"
+        assert status["summary"]["matched_records"] == excel_rows
+        assert status["summary"]["missing_records"] == record_count - excel_rows
+        assert status["summary"]["differences"] == record_count - excel_rows
+        assert "comparison_storage:disk_standard_records" in status["warnings"]
+        expected_difference_storage = (
+            "disk_differences"
+            if record_count - excel_rows > int(os.environ.get("EXCEL_AUDITOR_DIFFERENCE_SPILL_THRESHOLD", "50000"))
+            else "memory_differences"
+        )
+        assert f"comparison_storage:{expected_difference_storage}" in status["warnings"]
+        assert jsonl_lines == record_count - excel_rows
+        assert elapsed <= float(os.environ.get("PERF_SERVICE_MAX_SECONDS", "900"))
+        assert metrics["peak_rss_delta_mib"] <= float(os.environ.get("PERF_SERVICE_MAX_RSS_MIB", "2048"))
+    finally:
+        stopped.set()
+        sampler.join()

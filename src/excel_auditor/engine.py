@@ -375,7 +375,11 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
     for standard_reference in standard_only:
         summary.missing_records += 1
         if isinstance(standard_records, DiskBackedRecordMap):
-            key, record = standard_records.item_at_join_index(int(standard_reference))
+            if join_backend == "polars_partitioned":
+                key, record = standard_records.item_at_join_index(int(standard_reference))
+            else:
+                key = standard_reference
+                record = standard_records[key]
         else:
             key = standard_reference
             record = standard_records[key]

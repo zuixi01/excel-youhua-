@@ -39,7 +39,8 @@ def test_disk_backed_record_map_supports_mapping_contract_and_cleanup():
 
 def test_large_difference_stream_uses_report_mode_and_keeps_complete_jsonl(tmp_path, monkeypatch):
     monkeypatch.setenv("EXCEL_AUDITOR_DIFFERENCE_SPILL_THRESHOLD", "2")
-    monkeypatch.setenv("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "1")
+    monkeypatch.setenv("EXCEL_AUDITOR_DISK_RECORD_THRESHOLD", "1000")
+    monkeypatch.setenv("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "10000")
     rules = RuleSet.model_validate({
         "schema_id": "difference-spill",
         "schema_version": "1.0.0",
@@ -73,7 +74,7 @@ def test_large_difference_stream_uses_report_mode_and_keeps_complete_jsonl(tmp_p
     status = service.status(job_id)
     assert status["status"] == "completed" and status["mode"] == "report_only"
     assert "comparison_storage:disk_differences" in status["warnings"]
-    assert "comparison_storage:memory_standard_records" in status["warnings"]
+    assert "comparison_storage:disk_standard_records" in status["warnings"]
     manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
     assert manifest["rendering"]["reason"] == "large_difference_report_only"
     report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
