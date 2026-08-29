@@ -197,10 +197,10 @@ static void WriteSafeValue(Cell cell, JsonElement? value, string? fieldType = nu
         return;
     }
     var textValue = value.Value.ToString();
-    if (fieldType is "integer" or "decimal" && Decimal.TryParse(textValue, NumberStyles.Number, CultureInfo.InvariantCulture, out var number))
+    if (fieldType is "integer" or "decimal" && Double.TryParse(textValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && Double.IsFinite(number))
     {
         cell.DataType = CellValues.Number;
-        cell.CellValue = new CellValue(number.ToString(CultureInfo.InvariantCulture));
+        cell.CellValue = new CellValue(number.ToString("R", CultureInfo.InvariantCulture));
         return;
     }
     if (fieldType is "date" or "datetime" && DateTimeOffset.TryParse(textValue, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out var timestamp))
@@ -1071,6 +1071,11 @@ static void ValidateManifest(RenderManifest manifest)
         if (operation.Type == "insert_column" && operation.Value is not null) throw new InvalidDataException("insert_column must not declare value");
         ValidateFieldType(operation.FieldType);
         ValidateNumberFormat(operation.NumberFormat);
+        if (operation.Type is "set_cell" or "set_cell_after_insert")
+        {
+            if (operation.FieldType is null) throw new InvalidDataException($"{operation.Type} requires field_type");
+            ValidateTypedValue(operation.Value, operation.FieldType);
+        }
         if ((operation.Type is "mark_cell" or "mark_row" or "set_cell" or "set_cell_after_insert" or "append_row") && String.IsNullOrWhiteSpace(operation.FillColor)) throw new InvalidDataException($"{operation.Type} requires fill_color");
         if (!String.IsNullOrWhiteSpace(operation.FillColor) && !Regex.IsMatch(operation.FillColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("fill color must be six hexadecimal digits");
         if (operation.Comment?.Length > 32767) throw new InvalidDataException("operation comment exceeds Excel's safe length");
@@ -1102,6 +1107,11 @@ static void ValidateAppendValues(RenderOperation operation)
         ValidateFieldType(value.FieldType);
         ValidateNumberFormat(value.NumberFormat);
         ValidateFormulaTemplate(value.FormulaTemplate, "append_row formula_template");
+        if (value.FormulaTemplate is null)
+        {
+            if (value.FieldType is null) throw new InvalidDataException("append_row values require field_type");
+            ValidateTypedValue(value.Value, value.FieldType);
+        }
     }
 }
 
@@ -1125,7 +1135,7 @@ static void ValidateValidation(RenderValidation validation)
 static decimal? ParseValidationBound(string? value)
 {
     if (value is null) return null;
-    if (!Decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed)) throw new InvalidDataException("validation bounds must be finite invariant decimals");
+    if (!Decimal.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)) throw new InvalidDataException("validation bounds must be finite invariant decimals");
     return parsed;
 }
 
@@ -1142,6 +1152,45 @@ static void ValidateFieldType(string? fieldType)
     if (fieldType is null) return;
     var known = new HashSet<string> { "string", "integer", "decimal", "date", "datetime", "boolean", "enum", "phone", "id_code", "postal_code", "set", "json", "fuzzy_string" };
     if (!known.Contains(fieldType)) throw new InvalidDataException($"unknown field_type: {fieldType}");
+}
+
+static void ValidateTypedValue(JsonElement? value, string fieldType)
+{
+    if (value is null || value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return;
+    var kind = value.Value.ValueKind;
+    if (fieldType is "integer" or "decimal")
+    {
+        if (kind is not (JsonValueKind.Number or JsonValueKind.String)) throw new InvalidDataException($"{fieldType} values must be JSON numbers or numeric strings");
+        var text = kind == JsonValueKind.Number ? value.Value.GetRawText() : value.Value.GetString()!;
+        if (!IsExcelSafeNumericText(text, fieldType == "integer")) throw new InvalidDataException($"{fieldType} value exceeds Excel's safe numeric write precision or range");
+        return;
+    }
+    if (fieldType is "date" or "datetime")
+    {
+        if (kind != JsonValueKind.String || !DateTimeOffset.TryParse(value.Value.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out _))
+            throw new InvalidDataException($"{fieldType} values must be ISO date/time strings");
+        return;
+    }
+    if (fieldType == "boolean")
+    {
+        if (kind is not (JsonValueKind.True or JsonValueKind.False)) throw new InvalidDataException("boolean values must be JSON booleans");
+        return;
+    }
+    if (kind != JsonValueKind.String) throw new InvalidDataException($"{fieldType} values must be JSON strings");
+}
+
+static bool IsExcelSafeNumericText(string text, bool requireInteger)
+{
+    var match = Regex.Match(text, @"^-?(?<coefficient>(?:0|[1-9][0-9]*)(?:\.[0-9]+)?)(?:[eE][+-]?[0-9]+)?$");
+    if (!match.Success) return false;
+    var coefficientDigits = match.Groups["coefficient"].Value.Replace(".", "", StringComparison.Ordinal);
+    var significantDigits = coefficientDigits.TrimStart('0').TrimEnd('0');
+    if (significantDigits.Length > 15) return false;
+    if (!Double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) || !Double.IsFinite(parsed)) return false;
+    if (significantDigits.Length > 0 && parsed == 0d) return false;
+    var absolute = Math.Abs(parsed);
+    if (absolute != 0d && (absolute < 2.2251E-308 || absolute > 9.99999999999999E+307)) return false;
+    return !requireInteger || Math.Truncate(parsed) == parsed;
 }
 
 static void ValidateNumberFormat(string? numberFormat)

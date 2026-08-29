@@ -821,7 +821,8 @@ def _manifest(
         column_rule = next((column for column in sheet_rule.columns if column.name == repair.canonical_field), None)
         if repair.type == "set_cell":
             repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": f"自动修复；规则：{repair.rule_id}", "difference_id": repair.difference_id})
-            repair_operations[-1].update({"field_type": column_rule.type.value if column_rule else None, "number_format": _number_format(column_rule)})
+            header_rename = repair.rule_id.endswith(".rename_confirmed_alias")
+            repair_operations[-1].update({"field_type": "string" if header_rename else column_rule.type.value if column_rule else "string", "number_format": None if header_rename else _number_format(column_rule)})
         elif repair.type == "set_field":
             column = final_columns_by_sheet.get(repair.sheet_id, {}).get(repair.canonical_field or "")
             if column is None or repair.excel_row is None:

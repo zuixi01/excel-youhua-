@@ -4,6 +4,7 @@ import os
 import subprocess
 import zipfile
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -316,6 +317,12 @@ def test_dotnet_renderer_writes_dates_using_the_workbook_epoch(tmp_path, epoch, 
         ("empty-append", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [], "fill_color": "D9EAD3"}], None, "non-empty values"),
         ("cross-row-append", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [{"cell": "A3", "value": "E2", "field_type": "string"}], "fill_color": "D9EAD3"}], None, "declared row"),
         ("unknown-field-type", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1", "field_type": "deciml", "fill_color": "D9EAD3"}], None, "unknown field_type"),
+        ("missing-field-type", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1", "fill_color": "D9EAD3"}], None, "requires field_type"),
+        ("unsafe-integer", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1234567890123456", "field_type": "integer", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
+        ("unsafe-decimal", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "0.1234567890123456", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
+        ("numeric-underflow", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1e-309", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
+        ("numeric-overflow", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1e308", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
+        ("numeric-boolean", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": True, "field_type": "decimal", "fill_color": "D9EAD3"}], None, "must be JSON numbers or numeric strings"),
         ("reserved-report-name", [{"type": "add_or_replace_report_sheet", "name": "__ExcelAuditorMetadata", "source_json": "report.json"}], None, "non-reserved name"),
         ("ignored-field", [{"type": "mark_cell", "sheet": "Data", "cell": "A1", "before": "B", "fill_color": "D9EAD3"}], None, "insert_column-only fields"),
         ("invalid-metadata-hash", [], {"schema_sha256": "not-a-hash"}, "must be SHA-256"),
@@ -407,6 +414,159 @@ def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_va
     assert raw_by_field["active"] == "yes"
     assert raw_by_field["event_at"] == "2026-01-01T00:00:00Z"
     assert raw_by_field["ratio"] == "10%"
+
+
+def test_service_blocks_lossy_numeric_repairs_but_writes_safe_values(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    rules = RuleSet.model_validate({
+        "schema_id": "numeric-write-precision", "schema_version": "1.0.0", "name": "Numeric write precision",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"overwrite_mismatch": True, "missing_record": "append_and_mark_green"},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "big", "title": "Big", "type": "integer"},
+                {"name": "precise", "title": "Precise", "type": "decimal", "compare": {"mode": "numeric"}},
+            ],
+        }],
+    })
+
+    def run_case(name, rows, standard_rows):
+        source, standard = tmp_path / f"{name}.xlsx", tmp_path / f"{name}.json"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Data"
+        sheet.append(["ID", "Big", "Precise"])
+        for row in rows:
+            sheet.append(row)
+        book.save(source)
+        standard.write_text(json.dumps({"data": standard_rows}), encoding="utf-8")
+        service = AuditService(tmp_path / f"{name}-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+        job_id = service.create_job()
+        service.run(job_id, source, standard, rules)
+        return service, job_id
+
+    unsafe_service, unsafe_job = run_case(
+        "unsafe-matched",
+        [["E1", 1, 1]],
+        [{"id": "E1", "big": "1234567890123456", "precise": "0.1234567890123456"}],
+    )
+    unsafe_status = unsafe_service.status(unsafe_job)
+    assert unsafe_status["status"] == "manual_review", unsafe_status
+    assert unsafe_status["summary"]["repairs_planned"] == 0
+    assert "excel" not in unsafe_status["artifacts"]
+    unsafe_report = json.loads(unsafe_service.artifact(unsafe_job, "json").read_text(encoding="utf-8"))
+    unsafe_by_rule = {item["rule_id"]: item for item in unsafe_report["differences"] if item["rule_id"]}
+    assert unsafe_by_rule["big.excel_write_precision"]["standard_raw_value"] == "1234567890123456"
+    assert unsafe_by_rule["precise.excel_write_precision"]["standard_raw_value"] == "0.1234567890123456"
+    assert all(
+        item["repair_status"] == "not_requested"
+        for item in unsafe_report["differences"]
+        if item["type"] == "VALUE_MISMATCH"
+    )
+
+    append_service, append_job = run_case(
+        "unsafe-append",
+        [],
+        [{"id": "E2", "big": "1234567890123456", "precise": "1"}],
+    )
+    append_status = append_service.status(append_job)
+    assert append_status["status"] == "manual_review", append_status
+    assert append_status["summary"]["repairs_planned"] == 0
+    append_report = json.loads(append_service.artifact(append_job, "json").read_text(encoding="utf-8"))
+    assert any(item["rule_id"] == "missing_record.numeric_write_blocked" for item in append_report["differences"])
+    assert any(item["rule_id"] == "big.excel_write_precision" for item in append_report["differences"])
+
+    default_rules = RuleSet.model_validate({
+        "schema_id": "numeric-static-default", "schema_version": "1.0.0", "name": "Numeric static default",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "big", "title": "Big", "type": "integer",
+                    "fill_static_default": True, "static_default": "1234567890123456",
+                },
+            ],
+        }],
+    })
+    default_source, default_standard = tmp_path / "unsafe-default.xlsx", tmp_path / "unsafe-default.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Big"])
+    sheet.append(["E1", None])
+    book.save(default_source)
+    default_standard.write_text(json.dumps({"data": [{"id": "E1"}]}), encoding="utf-8")
+    default_service = AuditService(tmp_path / "unsafe-default-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+    default_job = default_service.create_job()
+    default_service.run(default_job, default_source, default_standard, default_rules)
+    default_status = default_service.status(default_job)
+    assert default_status["status"] == "manual_review", default_status
+    assert default_status["summary"]["repairs_planned"] == 0
+    default_report = json.loads(default_service.artifact(default_job, "json").read_text(encoding="utf-8"))
+    assert any(item["rule_id"] == "big.excel_write_precision" for item in default_report["differences"])
+
+    range_service, range_job = run_case(
+        "unsafe-range",
+        [["E1", 1, 1]],
+        [{"id": "E1", "big": "1", "precise": "1e-309"}],
+    )
+    range_status = range_service.status(range_job)
+    assert range_status["status"] == "manual_review", range_status
+    range_report = json.loads(range_service.artifact(range_job, "json").read_text(encoding="utf-8"))
+    assert any(item["rule_id"] == "precise.excel_write_precision" for item in range_report["differences"])
+
+    safe_service, safe_job = run_case(
+        "safe-matched",
+        [["E1", 1, 1]],
+        [{"id": "E1", "big": "999999999999999", "precise": "0.123456789012345"}],
+    )
+    safe_status = safe_service.status(safe_job)
+    assert safe_status["status"] == "completed", safe_status
+    assert safe_status["summary"]["repairs_applied"] == 2
+    rendered = load_workbook(safe_service.artifact(safe_job, "excel"), data_only=False)
+    result = rendered["Data"]
+    assert result["B2"].value == 999999999999999 and result["B2"].data_type == "n"
+    assert Decimal(str(result["C2"].value)) == Decimal("0.123456789012345") and result["C2"].data_type == "n"
+    rendered.close()
+
+
+def test_service_renames_numeric_column_alias_as_a_string_header(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    rules = RuleSet.model_validate({
+        "schema_id": "numeric-header-alias", "schema_version": "1.0.0", "name": "Numeric header alias",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"rename_confirmed_alias": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "quantity", "title": "Quantity", "aliases": ["Qty"], "type": "integer"},
+            ],
+        }],
+    })
+    source, standard = tmp_path / "numeric-alias.xlsx", tmp_path / "numeric-alias.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Qty"])
+    sheet.append(["E1", 1])
+    book.save(source)
+    standard.write_text(json.dumps({"data": [{"id": "E1", "quantity": 1}]}), encoding="utf-8")
+    service = AuditService(tmp_path / "numeric-alias-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+    job_id = service.create_job()
+    service.run(job_id, source, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    assert rendered["Data"]["B1"].value == "Quantity"
+    assert rendered["Data"]["B1"].data_type == "s"
+    rendered.close()
 
 
 def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_ranges(tmp_path):

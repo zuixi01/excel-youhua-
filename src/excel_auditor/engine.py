@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import os
 from collections import Counter, defaultdict
@@ -27,6 +28,10 @@ from .spill import SpillableSequence
 from .workbook import SheetSnapshot, WorkbookSnapshot, locate_header_row
 from .validators import run_validator
 from .ids import new_ulid
+
+
+_EXCEL_MIN_POSITIVE_NUMBER = Decimal("2.2251E-308")
+_EXCEL_MAX_ABSOLUTE_NUMBER = Decimal("9.99999999999999E307")
 
 
 @dataclass
@@ -249,6 +254,11 @@ def compare_workbook(
         for item in differences
         if item.rule_id and item.rule_id.endswith(".formula_template_mismatch")
     }))
+    manual_review_reasons.extend(sorted({
+        f"{item.sheet_name}: excel_numeric_write_precision:{item.canonical_field}"
+        for item in differences
+        if item.rule_id and item.rule_id.endswith(".excel_write_precision")
+    }))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -436,6 +446,10 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             parsed = parse_excel_value(record.get(name), rule, excel_epoch)
             if parsed.valid and parsed.normalized is None and rule.fill_static_default:
                 cell = f"{get_column_letter(col_index)}{row_number}"
+                default = parse_value(rule.static_default, rule)
+                if not _excel_numeric_write_safe(default, rule):
+                    _append_excel_write_precision_difference(differences, sheet, rule, default, row_number=row_number, cell=cell, key=key)
+                    continue
                 difference = _difference(
                     DifferenceType.NORMALIZED_MATCH,
                     sheet,
@@ -452,7 +466,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                default_value = _excel_write_value(parse_value(rule.static_default, rule), rule)
+                default_value = _excel_write_value(default, rule)
                 repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     append_row = snapshot.max_row + 1
     for standard_reference in standard_only:
@@ -479,11 +493,21 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             )
         ]
         formula_append_blocked = bool(unsafe_formula_fields) and sheet.actions.missing_record == "append_and_mark_green"
+        parsed_record = {name: parse_value(record.get(name), rule) for name, rule in rules_by_name.items()}
+        unsafe_numeric_fields = [
+            name for name, rule in rules_by_name.items()
+            if not _excel_numeric_write_safe(parsed_record[name], rule)
+        ]
+        numeric_append_blocked = bool(unsafe_numeric_fields) and sheet.actions.missing_record == "append_and_mark_green"
+        if numeric_append_blocked:
+            for name in unsafe_numeric_fields:
+                _append_excel_write_precision_difference(differences, sheet, rules_by_name[name], parsed_record[name], key=key)
         append = (
             sheet.actions.missing_record == "append_and_mark_green"
             and not duplicate_in_excel
             and requested_row == append_row
             and not formula_append_blocked
+            and not numeric_append_blocked
         )
         row_number_mismatch = sheet.primary_key_mode == "row_number" and requested_row != append_row
         if row_number_mismatch:
@@ -492,12 +516,16 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             missing_message = "标准数据存在但 Excel 主键重复，禁止自动追加"
         elif formula_append_blocked:
             missing_message = f"标准记录包含无法由受信任模板重建的公式字段 {unsafe_formula_fields}，禁止自动追加"
+        elif numeric_append_blocked:
+            missing_message = f"标准记录包含超出 Excel 安全数值写入精度的字段 {unsafe_numeric_fields}，禁止自动追加"
         else:
             missing_message = "标准数据存在但 Excel 缺失的记录"
         if append:
             missing_rule_id = "missing_record.append"
         elif formula_append_blocked:
             missing_rule_id = "missing_record.formula_template_required"
+        elif numeric_append_blocked:
+            missing_rule_id = "missing_record.numeric_write_blocked"
         else:
             missing_rule_id = None
         difference = _difference(
@@ -514,7 +542,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         differences.append(difference)
         if append:
             write_record = {
-                name: _excel_write_value(parse_value(record.get(name), rule), rule)
+                name: _excel_write_value(parsed_record[name], rule)
                 for name, rule in rules_by_name.items()
             }
             repairs.append(RepairOperation("append_record", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, excel_row=append_row, values=write_record))
@@ -550,10 +578,16 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 write_value = None
                 repair_rule = None
                 if sheet.actions.fill_empty_from_standard and right.valid and right.normalized is not None:
-                    repair_value, write_value, repair_rule = right.raw, _excel_write_value(right, rule), f"{name}.fill_empty_from_standard"
+                    if not _excel_numeric_write_safe(right, rule):
+                        _append_excel_write_precision_difference(differences, sheet, rule, right, row_number=row_number, key=key)
+                    else:
+                        repair_value, write_value, repair_rule = right.raw, _excel_write_value(right, rule), f"{name}.fill_empty_from_standard"
                 elif rule.fill_static_default:
                     default = parse_value(rule.static_default, rule)
-                    repair_value, write_value, repair_rule = rule.static_default, _excel_write_value(default, rule), f"{name}.fill_static_default"
+                    if not _excel_numeric_write_safe(default, rule):
+                        _append_excel_write_precision_difference(differences, sheet, rule, default, row_number=row_number, key=key)
+                    else:
+                        repair_value, write_value, repair_rule = rule.static_default, _excel_write_value(default, rule), f"{name}.fill_static_default"
                 if repair_rule is not None:
                     difference = _difference(
                         DifferenceType.NORMALIZED_MATCH,
@@ -635,6 +669,9 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 can_fill = left.normalized is None and right.normalized is not None and sheet.actions.fill_empty_from_standard
                 can_overwrite = sheet.actions.overwrite_mismatch
                 repair = can_fill or can_overwrite
+                if repair and not _excel_numeric_write_safe(right, rule):
+                    _append_excel_write_precision_difference(differences, sheet, rule, right, row_number=row_number, cell=cell, key=key)
+                    repair = False
                 repair_rule = f"{name}.fill_empty_from_standard" if can_fill else f"{name}.overwrite_mismatch"
                 difference = _difference(
                     DifferenceType.VALUE_MISMATCH,
@@ -656,6 +693,10 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 if repair:
                     repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=_excel_write_value(right, rule)))
             elif left.normalized is None and rule.fill_static_default:
+                default = parse_value(rule.static_default, rule)
+                if not _excel_numeric_write_safe(default, rule):
+                    _append_excel_write_precision_difference(differences, sheet, rule, default, row_number=row_number, cell=cell, key=key)
+                    continue
                 difference = _difference(
                     DifferenceType.NORMALIZED_MATCH,
                     sheet,
@@ -671,7 +712,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                default_value = _excel_write_value(parse_value(rule.static_default, rule), rule)
+                default_value = _excel_write_value(default, rule)
                 repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     if isinstance(standard_records, DiskBackedRecordMap):
         standard_records.close()
@@ -780,6 +821,67 @@ def _safe_value(value: Any, rule: Any) -> Any:
 
 def _safe_record(record: dict[str, Any], rules_by_name: dict[str, Any]) -> dict[str, Any]:
     return {name: _safe_value(value, rules_by_name[name]) if name in rules_by_name else value for name, value in record.items()}
+
+
+def _excel_numeric_write_safe(parsed: ParsedValue, rule: Any) -> bool:
+    """Return whether Excel can round-trip the normalized numeric value exactly.
+
+    Excel stores numeric cells as IEEE-754 doubles and documents 15 significant
+    decimal digits. Comparison can remain arbitrary-precision Decimal, but an
+    authorized repair must not silently round or change a numeric value to text.
+    """
+    if rule.type.value not in {"integer", "decimal"} or not parsed.valid or parsed.normalized is None:
+        return True
+    # Formula-mode values are never written as numeric cells. Their safety is
+    # governed by the separate trusted formula-template checks.
+    if rule.compare.formula_mode == "formula" and is_formula_text(parsed.normalized):
+        return True
+    value = Decimal(str(parsed.normalized))
+    if not value.is_finite():
+        return False
+    absolute = abs(value)
+    if absolute != 0 and (
+        absolute < _EXCEL_MIN_POSITIVE_NUMBER
+        or absolute > _EXCEL_MAX_ABSOLUTE_NUMBER
+    ):
+        return False
+    digits = list(value.as_tuple().digits)
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+    if len(digits) > 15:
+        return False
+    try:
+        as_float = float(value)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(as_float) or (value != 0 and as_float == 0):
+        return False
+    return Decimal(str(as_float)) == value
+
+
+def _append_excel_write_precision_difference(
+    differences: list[Difference] | SpillableSequence[Difference],
+    sheet: SheetRule,
+    rule: Any,
+    parsed: ParsedValue,
+    *,
+    row_number: int | None = None,
+    cell: str | None = None,
+    key: tuple[Any, ...] | None = None,
+) -> None:
+    differences.append(_difference(
+        DifferenceType.UNSUPPORTED_FEATURE,
+        sheet,
+        "标准数值超出 Excel 数值单元格可安全往返的 15 位有效数字或指数范围，禁止自动写回",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet) if key else None,
+        standard_raw_value=_safe_value(parsed.raw, rule),
+        standard_normalized_value=_safe_value(parsed.normalized, rule),
+        rule_id=f"{rule.name}.excel_write_precision",
+        render_action="report_only",
+    ))
 
 
 def _excel_write_value(parsed: ParsedValue, rule: Any) -> Any:
