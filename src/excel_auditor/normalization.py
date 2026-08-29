@@ -239,28 +239,38 @@ def values_equal(left: ParsedValue, right: ParsedValue, rule: ColumnRule) -> boo
         return left.normalized is right.normalized
     if rule.type == FieldType.DECIMAL or rule.compare.mode == "numeric":
         a, b = Decimal(left.normalized), Decimal(right.normalized)
-        if rule.compare.decimal_places is not None:
-            places = rule.compare.decimal_places
-            quantum = Decimal(1).scaleb(-places)
-            required_precision = max(
-                28,
-                len(a.as_tuple().digits),
-                len(b.as_tuple().digits),
-                a.adjusted() + places + 1,
-                b.adjusted() + places + 1,
-            )
-            with localcontext() as context:
-                context.prec = required_precision
-                a, b = a.quantize(quantum), b.quantize(quantum)
-        delta = abs(a - b)
         absolute = rule.compare.absolute_tolerance
-        relative = rule.compare.relative_tolerance * max(abs(a), abs(b))
-        return delta <= absolute or delta <= relative
+        relative = rule.compare.relative_tolerance
+        places = rule.compare.decimal_places
+        with localcontext() as context:
+            context.prec = _decimal_comparison_precision(a, b, absolute, relative, places)
+            if places is not None:
+                quantum = Decimal(1).scaleb(-places)
+                a, b = a.quantize(quantum), b.quantize(quantum)
+            delta = abs(a - b)
+            relative_limit = relative * max(abs(a), abs(b))
+            return delta <= absolute or delta <= relative_limit
     if rule.compare.mode == "ignore_case":
         return str(left.normalized).casefold() == str(right.normalized).casefold()
     if rule.type == FieldType.DATETIME:
         return _truncate_datetime(left.normalized, rule.compare.precision) == _truncate_datetime(right.normalized, rule.compare.precision)
     return left.normalized == right.normalized
+
+
+def _decimal_comparison_precision(
+    left: Decimal,
+    right: Decimal,
+    absolute_tolerance: Decimal,
+    relative_tolerance: Decimal,
+    decimal_places: int | None,
+) -> int:
+    """Choose enough coefficient precision for exact tolerance-boundary decisions."""
+    values = (left, right, absolute_tolerance, relative_tolerance)
+    coefficient_budget = sum(len(value.as_tuple().digits) for value in values) + 8
+    quantize_budget = 0
+    if decimal_places is not None:
+        quantize_budget = max(left.adjusted(), right.adjusted()) + decimal_places + 2
+    return max(28, coefficient_budget, quantize_budget)
 
 
 def _truncate_datetime(value: datetime, precision: str) -> datetime | date:

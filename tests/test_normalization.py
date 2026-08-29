@@ -1,5 +1,5 @@
 import json
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from datetime import date
 
 from excel_auditor.models import ColumnRule
@@ -36,6 +36,23 @@ def test_non_finite_numbers_are_invalid_and_large_decimals_quantize_safely():
     right = parse_value("123456789012345678901234567890.12", decimal_rule)
     assert left.valid and right.valid
     assert values_equal(left, right, decimal_rule)
+
+
+def test_relative_tolerance_does_not_round_up_for_high_precision_values():
+    rule = ColumnRule.model_validate({
+        "name": "amount", "title": "Amount", "type": "decimal",
+        "compare": {"mode": "numeric", "relative_tolerance": "0.000000000000000000000000000001"},
+    })
+    base = Decimal("1234567890123456789012345678901234567890")
+    just_outside = Decimal("1234567890.12345678901234567895")
+    just_inside = Decimal("1234567890.12345678901234567885")
+    with localcontext() as context:
+        context.prec = 120
+        outside_value = base + just_outside
+        inside_value = base + just_inside
+
+    assert not values_equal(parse_value(str(base), rule), parse_value(str(outside_value), rule), rule)
+    assert values_equal(parse_value(str(base), rule), parse_value(str(inside_value), rule), rule)
 
 
 def test_string_primary_key_preserves_leading_zero():
