@@ -114,6 +114,33 @@ def test_managed_connection_rejects_unknown_or_unsafe_configuration(tmp_path):
         _registry(tmp_path, unknown_option=True)
     with pytest.raises(ValueError, match="string_pattern_mismatch"):
         _registry(tmp_path, auth_secret_ref="../escape")
+    with pytest.raises(ValueError, match="dot segments"):
+        _registry(tmp_path, allowed_paths=["/employees/../admin"])
+
+    duplicate = tmp_path / "duplicate-connections.json"
+    duplicate.write_text(
+        '{"connections":[{"id":"hr","base_url":"https://first.example/","base_url":"https://second.example/","allowed_paths":["/employees"]}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate key"):
+        ConnectionRegistry(duplicate)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/employees/../admin",
+        "/employees/%2e%2e/admin",
+        "/employees/%252e%252e/admin",
+        "/employees\\..\\admin",
+        "//example.com/employees",
+        "/employees?admin=true",
+        "/employees//admin",
+    ],
+)
+def test_managed_source_rejects_non_normalized_or_allowlist_bypass_paths(path):
+    with pytest.raises(ValueError, match="path|dot segments|slashes"):
+        StandardSourceConfig(type="managed_http", connection_id="hr", path=path)
 
 
 def test_managed_http_only_maps_declared_task_parameters(tmp_path):

@@ -18,6 +18,21 @@ def test_example_rule_is_valid_and_hash_is_deterministic():
     assert first.sheets[0].primary_key == ["employee_id"]
 
 
+@pytest.mark.parametrize(
+    ("suffix", "document"),
+    [
+        (".json", '{"schema_id":"first","schema_id":"second"}'),
+        (".yaml", "schema_id: first\nschema_id: second\n"),
+    ],
+)
+def test_rule_document_loader_rejects_duplicate_keys(tmp_path, suffix, document):
+    path = tmp_path / f"duplicate{suffix}"
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        load_rules(path)
+
+
 def test_published_version_is_immutable(tmp_path):
     registry = RuleRegistry(tmp_path)
     rules = load_rules(EXAMPLE)
@@ -170,6 +185,41 @@ def test_ignore_case_enum_configuration_rejects_folded_collisions():
     department["enum_values"] = ["HR", "hr"]
     department["enum_aliases"] = {}
     with pytest.raises(ValidationError, match="ambiguous under ignore_case"):
+        RuleSet.model_validate(payload)
+
+
+def test_standard_source_rejects_ignored_or_overlapping_http_configuration():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["standard_source"] = {"type": "upload", "path": "/ignored"}
+    with pytest.raises(ValidationError, match="cannot contain managed HTTP configuration"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["standard_source"] = {
+        "type": "managed_http", "connection_id": "hr", "path": "/employees",
+        "static_parameters": {"department": "D1"},
+        "parameter_mapping": {"department": "department_id"},
+    }
+    with pytest.raises(ValidationError, match="parameters overlap"):
+        RuleSet.model_validate(payload)
+
+    payload["standard_source"] = {
+        "type": "managed_http", "connection_id": "hr", "path": "/employees",
+        "static_parameters": {"page": 1},
+        "pagination": {"page_param": "page", "size_param": "size"},
+    }
+    with pytest.raises(ValidationError, match="pagination parameters overlap"):
+        RuleSet.model_validate(payload)
+
+
+@pytest.mark.parametrize("json_path", ["data.items", "$.data..items", "$.data."])
+def test_standard_source_rejects_json_paths_runtime_cannot_interpret(json_path):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["standard_source"] = {
+        "type": "managed_http", "connection_id": "hr", "path": "/employees",
+        "data_json_path": json_path,
+    }
+    with pytest.raises(ValidationError, match="simple non-empty object path"):
         RuleSet.model_validate(payload)
 
 

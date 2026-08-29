@@ -11,6 +11,7 @@ from typing import Any, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
 
 from .spill import SpillableSequence
+from .source_paths import validate_managed_http_path, validate_parameter_name, validate_simple_json_path
 
 
 class StrictModel(BaseModel):
@@ -432,16 +433,27 @@ class Colors(StrictModel):
 
 class PaginationConfig(StrictModel):
     type: Literal["page_number"] = "page_number"
-    page_param: str = "page"
-    size_param: str = "size"
+    page_param: str = Field(default="page", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    size_param: str = Field(default="size", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     size: int = Field(default=500, ge=1, le=5000)
     total_json_path: str | None = None
     max_pages: int = Field(default=1000, ge=1, le=10000)
 
+    @field_validator("total_json_path")
+    @classmethod
+    def valid_total_json_path(cls, value: str | None) -> str | None:
+        return validate_simple_json_path(value, field_name="pagination.total_json_path")
+
+    @model_validator(mode="after")
+    def distinct_parameter_names(self) -> "PaginationConfig":
+        if self.page_param == self.size_param:
+            raise ValueError("pagination page_param and size_param must be distinct")
+        return self
+
 
 class StandardSourceConfig(StrictModel):
     type: Literal["upload", "managed_http"] = "upload"
-    connection_id: str | None = None
+    connection_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     method: Literal["GET", "POST"] = "GET"
     path: str | None = None
     data_json_path: str = "$.data"
@@ -449,12 +461,47 @@ class StandardSourceConfig(StrictModel):
     parameter_mapping: dict[str, str] = Field(default_factory=dict)
     pagination: PaginationConfig | None = None
 
+    @field_validator("path")
+    @classmethod
+    def valid_managed_path(cls, value: str | None) -> str | None:
+        return validate_managed_http_path(value, field_name="standard_source.path") if value is not None else None
+
+    @field_validator("data_json_path")
+    @classmethod
+    def valid_data_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="standard_source.data_json_path") or "$"
+
     @model_validator(mode="after")
     def validate_source(self) -> "StandardSourceConfig":
         if self.type == "managed_http" and (not self.connection_id or not self.path):
             raise ValueError("managed_http requires connection_id and path")
-        if self.path and ("://" in self.path or not self.path.startswith("/")):
-            raise ValueError("standard source path must be an absolute path without scheme or host")
+        if self.type == "upload":
+            ignored = (
+                self.connection_id is not None
+                or self.path is not None
+                or self.method != "GET"
+                or bool(self.static_parameters)
+                or bool(self.parameter_mapping)
+                or self.pagination is not None
+                or self.data_json_path != "$.data"
+            )
+            if ignored:
+                raise ValueError("upload standard source cannot contain managed HTTP configuration")
+            return self
+
+        for name in self.static_parameters:
+            validate_parameter_name(str(name), field_name="standard_source.static_parameters key")
+        for request_name, task_name in self.parameter_mapping.items():
+            validate_parameter_name(str(request_name), field_name="standard_source.parameter_mapping request name")
+            validate_parameter_name(str(task_name), field_name="standard_source.parameter_mapping task name")
+        overlap = set(self.static_parameters) & set(self.parameter_mapping)
+        if overlap:
+            raise ValueError(f"static and mapped HTTP parameters overlap: {sorted(overlap)}")
+        if self.pagination is not None:
+            occupied = set(self.static_parameters) | set(self.parameter_mapping)
+            collisions = occupied & {self.pagination.page_param, self.pagination.size_param}
+            if collisions:
+                raise ValueError(f"pagination parameters overlap configured HTTP parameters: {sorted(collisions)}")
         return self
 
 

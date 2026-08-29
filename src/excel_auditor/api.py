@@ -16,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from .models import DifferenceType, RuleSet
 from .engine import compare_workbook
 from .workbook import inspect_workbook
-from .rules import DraftRegistry, RuleRegistry
+from .rules import DraftRegistry, RuleRegistry, parse_rule_document
 from .service import AuditService
 from .standard_sources import ConnectionRegistry, ManagedHttpSource
 from .persistence import DatabaseRepository
@@ -24,6 +24,7 @@ from .queueing import RedisJobQueue
 from .storage import S3ArtifactStore
 from .rendering import DotNetOpenXmlRenderer
 from .observability import configure_logging, metrics
+from .strict_serialization import load_json_strict
 
 
 DATA_ROOT = Path(os.environ.get("EXCEL_AUDITOR_DATA", "var")).resolve()
@@ -203,14 +204,11 @@ async def import_schema(request: Request, file: UploadFile = File(...)) -> dict:
         raise HTTPException(413, "RULE_CONFIG_INVALID: import exceeds 1 MiB")
     suffix = Path(file.filename or "rules.json").suffix.lower()
     try:
-        if suffix in {".yaml", ".yml"}:
-            payload = yaml.safe_load(content.decode("utf-8-sig"))
-        elif suffix == ".json":
-            payload = json.loads(content.decode("utf-8-sig"))
-        else:
+        if suffix not in {".yaml", ".yml", ".json"}:
             raise HTTPException(415, "RULE_CONFIG_INVALID: only JSON and YAML are supported")
+        payload = parse_rule_document(content.decode("utf-8-sig"), suffix)
         rules = RuleSet.model_validate(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError, ValidationError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
         raise HTTPException(422, "RULE_CONFIG_INVALID: uploaded rule document is invalid") from exc
     return _draft_registry(request).create(rules.schema_id, rules.model_dump(mode="json"))
 
@@ -348,10 +346,10 @@ async def create_comparison(
     if len(excel_content) > excel_limit:
         raise HTTPException(413, "FILE_LIMIT_EXCEEDED")
     try:
-        parsed_parameters = json.loads(parameters)
+        parsed_parameters = load_json_strict(parameters, context="task parameters JSON")
         if not isinstance(parsed_parameters, dict):
             raise ValueError
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise HTTPException(422, "parameters must be a JSON object") from exc
     excel_suffix = Path(excel_file.filename or "input.xlsx").suffix.lower()
     if excel_suffix not in {".xlsx", ".xlsm"}:
@@ -372,8 +370,8 @@ async def create_comparison(
         if len(encoded) > rules.workbook.max_standard_upload_mib * 1024 * 1024:
             raise HTTPException(413, "STANDARD_DATA_INVALID: payload too large")
         try:
-            inline_payload = json.loads(standard_json)
-        except json.JSONDecodeError as exc:
+            inline_payload = load_json_strict(standard_json, context="inline standard JSON")
+        except ValueError as exc:
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json is not valid JSON") from exc
         if not isinstance(inline_payload, (dict, list)):
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json root must be an object or array")
