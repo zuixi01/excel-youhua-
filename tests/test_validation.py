@@ -438,6 +438,53 @@ def test_excel_datetime_uniqueness_distinguishes_dst_folds(tmp_path):
         snapshot.close()
 
 
+def test_standard_json_field_rejects_duplicate_object_keys():
+    rules = RuleSet.model_validate({
+        "schema_id": "strict-json-field", "schema_version": "1.0.0", "name": "Strict JSON field",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "payload", "title": "Payload", "type": "json"},
+            ],
+        }],
+    })
+
+    with pytest.raises(ValueError, match=r"typed failures.*payload"):
+        StandardDataValidator().validate({"data": [{"id": "E1", "payload": '{"a":1,"a":2}'}]}, rules)
+
+
+def test_excel_json_field_reports_duplicate_object_keys_as_invalid(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "excel-strict-json", "schema_version": "1.0.0", "name": "Excel strict JSON",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "payload", "title": "Payload", "type": "json"},
+            ],
+        }],
+    })
+    path = tmp_path / "duplicate-json-key.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Payload"])
+    sheet.append(["E1", '{"a":1,"a":2}'])
+    book.save(path)
+
+    snapshot = inspect_workbook(path, rules)
+    result = compare_workbook(snapshot, {"data": [{"id": "E1", "payload": {"a": 2}}]}, rules)
+    try:
+        invalid = [item for item in result.differences if item.rule_id == "payload.parse"]
+        assert len(invalid) == 1
+        assert invalid[0].type.value == "INVALID_VALUE"
+        assert "duplicate object key" in invalid[0].message
+    finally:
+        result.close()
+        snapshot.close()
+
+
 def test_field_statistics_use_per_sheet_and_per_issue_denominators(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "field-statistics", "schema_version": "1.0.0", "name": "Field statistics",

@@ -2,6 +2,8 @@ import json
 from decimal import Decimal, localcontext
 from datetime import date
 
+import pytest
+
 from excel_auditor.models import ColumnRule
 from excel_auditor.normalization import excel_datetime_write_safe, parse_value, values_equal
 
@@ -131,6 +133,19 @@ def test_json_rejects_non_finite_numbers():
 
     assert not parse_value('{"amount": NaN}', rule).valid
     assert not parse_value({"amount": float("inf")}, rule).valid
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ['{"a":1,"a":2}', '{"outer":{"a":1,"a":2}}'],
+)
+def test_json_rejects_duplicate_object_keys_at_any_depth(payload):
+    rule = ColumnRule.model_validate({"name": "payload", "title": "Payload", "type": "json"})
+
+    parsed = parse_value(payload, rule)
+
+    assert not parsed.valid
+    assert parsed.error == "JSON field contains duplicate object key"
 
 
 def test_json_preserves_high_precision_numeric_tokens_as_numbers():
