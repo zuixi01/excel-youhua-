@@ -20,7 +20,7 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, is_formula_text, parse_value, values_equal
+from .normalization import ParsedValue, is_formula_text, parse_row_number, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
@@ -699,10 +699,10 @@ def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number
 def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any], row_number: Any = None) -> tuple[tuple[Any, ...], bool]:
     if sheet.primary_key_mode == "row_number":
         try:
-            parsed_row = int(row_number)
+            parsed_row = parse_row_number(row_number)
         except (TypeError, ValueError):
             return tuple(), False
-        return (("row_number", parsed_row),), parsed_row >= 1
+        return (("row_number", parsed_row),), True
     values: list[Any] = []
     for name in sheet.primary_key:
         parsed = parse_value(record.get(name), rules_by_name[name])

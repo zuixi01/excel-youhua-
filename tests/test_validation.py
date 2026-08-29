@@ -262,6 +262,32 @@ def test_row_number_primary_key_never_appends_to_a_different_physical_row(tmp_pa
     assert not result.repairs
 
 
+@pytest.mark.parametrize("invalid_row", [True, False, 2.5, "2.0", " 2 ", 0, -1, 1_048_577])
+def test_row_number_primary_key_rejects_lossy_or_out_of_range_values(invalid_row):
+    rules = RuleSet.model_validate({
+        "schema_id": "strict-row-number", "schema_version": "1.0.0", "name": "Strict row number",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key_mode": "row_number",
+            "columns": [{"name": "value", "title": "Value"}],
+        }],
+    })
+    validator = StandardDataValidator()
+    with pytest.raises(ValueError, match="invalid __row_number__"):
+        validator.validate({"data": [{"__row_number__": invalid_row, "value": "A"}]}, rules)
+
+
+@pytest.mark.parametrize("valid_row", [2, "2", "0002"])
+def test_row_number_primary_key_accepts_exact_integer_csv_representations(valid_row):
+    rules = RuleSet.model_validate({
+        "schema_id": "valid-row-number", "schema_version": "1.0.0", "name": "Valid row number",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key_mode": "row_number",
+            "columns": [{"name": "value", "title": "Value"}],
+        }],
+    })
+    StandardDataValidator().validate({"data": [{"__row_number__": valid_row, "value": "A"}]}, rules)
+
+
 def test_standard_validation_is_chunked_and_checks_uniqueness_across_chunks():
     rules = RuleSet.model_validate({
         "schema_id": "chunked-standard",

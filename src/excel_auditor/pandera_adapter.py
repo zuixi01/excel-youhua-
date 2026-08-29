@@ -9,7 +9,7 @@ import pandas as pd
 import pandera.pandas as pa
 
 from .models import RuleSet, SheetRule
-from .normalization import is_formula_text, parse_value
+from .normalization import is_formula_text, parse_row_number, parse_value
 from .validators import run_validator
 
 
@@ -128,12 +128,13 @@ class StandardDataValidator:
         for row_index, row in enumerate(rows, start=1):
             if sheet.primary_key_mode == "row_number":
                 try:
-                    row_number = int(row.get(sheet.row_number_field))
+                    row_number = parse_row_number(row.get(sheet.row_number_field))
                 except (TypeError, ValueError) as exc:
-                    raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} requires integer {sheet.row_number_field} at record {row_index}") from exc
+                    raise ValueError(
+                        f"STANDARD_DATA_INVALID: {sheet.id} has invalid {sheet.row_number_field} "
+                        f"at record {row_index}: {exc}"
+                    ) from exc
                 composite = (("row_number", row_number),)
-                if row_number < 1:
-                    raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} has invalid row number at record {row_index}")
                 if composite in observed:
                     raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} has duplicate row number at record {row_index}")
                 observed.add(composite)

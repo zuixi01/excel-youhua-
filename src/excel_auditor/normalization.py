@@ -24,6 +24,21 @@ def is_formula_text(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("=")
 
 
+def parse_row_number(value: Any) -> int:
+    """Parse an exact positive Excel row number without lossy coercion."""
+    if isinstance(value, bool):
+        raise ValueError("row number must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        parsed = int(value)
+    else:
+        raise ValueError("row number must be an integer")
+    if not 1 <= parsed <= 1_048_576:
+        raise ValueError("row number is outside the Excel row range")
+    return parsed
+
+
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
