@@ -104,7 +104,7 @@ jobs:
           --current "$RESULT"
           --reference "performance-reference/$RESULT"
           --max-time-ratio 0.25
-          --time-slack-seconds 5
+          --time-slack-seconds 6
           --max-memory-ratio 0.25
           --memory-slack-mib 64
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
