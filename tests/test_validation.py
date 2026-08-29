@@ -169,7 +169,9 @@ def test_empty_primary_key_policy_can_match_by_row_number_without_silent_default
     })
     path = tmp_path / "empty-key.xlsx"
     book = Workbook(); sheet = book.active; sheet.title = "Data"; sheet.append(["ID", "Value"]); sheet.append([None, "A"]); sheet.append([None, "B"]); book.save(path)
-    result = compare_workbook(inspect_workbook(path, rules), {"data": [{"id": None, "value": "A"}, {"id": None, "value": "B"}]}, rules)
+    standard = {"data": [{"id": None, "value": "A"}, {"id": None, "value": "B"}]}
+    StandardDataValidator().validate(standard, rules)
+    result = compare_workbook(inspect_workbook(path, rules), standard, rules)
     assert result.summary.matched_records == 2
     assert all(item.type.value != "EMPTY_PRIMARY_KEY" for item in result.differences)
 
@@ -177,12 +179,31 @@ def test_empty_primary_key_policy_can_match_by_row_number_without_silent_default
 def test_empty_primary_key_policy_can_explicitly_skip_rows(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "skip-key", "schema_version": "1.0.0", "name": "Skip key",
-        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "empty_primary_key_action": "skip_row", "columns": [{"name": "id", "title": "ID", "required": True}]}],
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "empty_primary_key_action": "skip_row", "columns": [
+            {"name": "id", "title": "ID", "required": True},
+            {"name": "required_value", "title": "Required value", "required": True},
+        ]}],
     })
     path = tmp_path / "skip-key.xlsx"
-    book = Workbook(); sheet = book.active; sheet.title = "Data"; sheet.append(["ID"]); sheet.append([None]); book.save(path)
-    result = compare_workbook(inspect_workbook(path, rules), {"data": [{"id": None}]}, rules)
+    book = Workbook(); sheet = book.active; sheet.title = "Data"; sheet.append(["ID", "Required value"]); sheet.append([None, "ignored"]); book.save(path)
+    standard = {"data": [{"id": None}]}
+    StandardDataValidator().validate(standard, rules)
+    result = compare_workbook(inspect_workbook(path, rules), standard, rules)
     assert result.summary.differences == 0 and result.summary.matched_records == 0
+
+
+def test_row_number_fallback_only_relaxes_the_empty_business_key():
+    rules = RuleSet.model_validate({
+        "schema_id": "row-fallback-validation", "schema_version": "1.0.0", "name": "Fallback validation",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "empty_primary_key_action": "use_row_number", "columns": [
+            {"name": "id", "title": "ID", "required": True},
+            {"name": "amount", "title": "Amount", "type": "integer", "required": True},
+        ]}],
+    })
+    validator = StandardDataValidator()
+    validator.validate({"data": [{"id": None, "amount": "1"}]}, rules)
+    with pytest.raises(ValueError, match="typed failures.*amount"):
+        validator.validate({"data": [{"id": None, "amount": "not-an-integer"}]}, rules)
 
 
 def test_standard_validation_is_chunked_and_checks_uniqueness_across_chunks():
