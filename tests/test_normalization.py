@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 from datetime import date
 
@@ -84,3 +85,16 @@ def test_json_rejects_non_finite_numbers():
 
     assert not parse_value('{"amount": NaN}', rule).valid
     assert not parse_value({"amount": float("inf")}, rule).valid
+
+
+def test_json_preserves_high_precision_numeric_tokens_as_numbers():
+    rule = ColumnRule.model_validate({"name": "payload", "title": "Payload", "type": "json"})
+    exact = Decimal("1234567890.1234567890123456789")
+
+    from_text = parse_value('{"amount":1234567890.1234567890123456789}', rule)
+    from_object = parse_value({"amount": exact}, rule)
+
+    assert from_text.valid and from_object.valid
+    assert from_text.normalized == from_object.normalized
+    assert '"amount":"' not in from_text.normalized
+    assert json.loads(from_text.normalized, parse_float=Decimal)["amount"] == exact

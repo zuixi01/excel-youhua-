@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from openpyxl.utils.datetime import from_excel
 
 from .models import ColumnRule, FieldType
+from .strict_serialization import dump_json_exact
 
 
 @dataclass(frozen=True)
@@ -131,8 +132,12 @@ def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
                 items = str(normalized).split(rule.separator)
             return ParsedValue(value, tuple(sorted({str(item).strip() for item in items if str(item).strip()})), True)
         if rule.type == FieldType.JSON:
-            obj = normalized if isinstance(normalized, (dict, list)) else json.loads(str(normalized))
-            stable = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            obj = normalized if isinstance(normalized, (dict, list)) else json.loads(
+                str(normalized),
+                parse_float=Decimal,
+                parse_constant=lambda token: (_ for _ in ()).throw(ValueError(f"non-finite JSON number: {token}")),
+            )
+            stable = dump_json_exact(obj, ensure_ascii=False, sort_keys=True)
             return ParsedValue(value, stable, True)
         raise ValueError(f"unsupported type: {rule.type}")
     except (ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:

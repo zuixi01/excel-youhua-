@@ -24,7 +24,7 @@ from .queueing import RedisJobQueue
 from .storage import S3ArtifactStore
 from .rendering import DotNetOpenXmlRenderer
 from .observability import configure_logging, metrics
-from .strict_serialization import load_json_strict
+from .strict_serialization import dump_json_exact, load_json_strict
 
 
 DATA_ROOT = Path(os.environ.get("EXCEL_AUDITOR_DATA", "var")).resolve()
@@ -382,12 +382,10 @@ async def create_comparison(
         # Canonicalize the inline payload for idempotency while retaining exact
         # Decimal text. The staged JSON parser accepts decimal strings, and the
         # immutable snapshot uses the same representation.
-        standard_content = json.dumps(
+        standard_content = dump_json_exact(
             inline_payload,
             ensure_ascii=False,
             sort_keys=True,
-            separators=(",", ":"),
-            default=str,
         ).encode("utf-8")
         standard_suffix = ".json"
     elif rules.standard_source.type != "managed_http":
