@@ -199,7 +199,21 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
             check=False,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"RENDER_FAILED: {completed.stderr[:1000]}")
+            try:
+                failure = json.loads(completed.stderr)
+            except json.JSONDecodeError:
+                raise RuntimeError("RENDER_FAILED: renderer process failed without structured JSON")
+            error_code = failure.get("error_code")
+            known_codes = {
+                "ARGUMENT_INVALID",
+                "MANIFEST_OR_STRUCTURE_INVALID",
+                "OUTPUT_VERIFICATION_FAILED",
+                "RENDER_FAILED",
+                "UNSUPPORTED_FEATURE",
+            }
+            if error_code not in known_codes:
+                raise RuntimeError("RENDER_FAILED: renderer returned an unknown error code")
+            raise RuntimeError(f"{error_code}: renderer process failed")
         try:
             payload = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:

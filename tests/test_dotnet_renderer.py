@@ -15,7 +15,7 @@ from openpyxl.workbook.defined_name import DefinedName
 
 from excel_auditor.models import RuleSet
 from excel_auditor.rendering import DotNetOpenXmlRenderer
-from excel_auditor.service import AuditService
+from excel_auditor.service import AuditService, _safe_error_code
 
 
 def test_dotnet_renderer_self_check_contract():
@@ -23,6 +23,75 @@ def test_dotnet_renderer_self_check_contract():
     if not command:
         pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
     assert DotNetOpenXmlRenderer(Path(command)).self_check() == "0.1.0"
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["ARGUMENT_INVALID", "MANIFEST_OR_STRUCTURE_INVALID", "OUTPUT_VERIFICATION_FAILED", "RENDER_FAILED", "UNSUPPORTED_FEATURE"],
+)
+def test_dotnet_renderer_adapter_preserves_structured_error_codes(tmp_path, monkeypatch, error_code):
+    command = tmp_path / "renderer.exe"
+    command.write_bytes(b"placeholder")
+    renderer = DotNetOpenXmlRenderer(command)
+    rules = RuleSet.model_validate({
+        "schema_id": "renderer-errors", "schema_version": "1.0.0", "name": "Renderer errors",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: subprocess.CompletedProcess(
+        args=[],
+        returncode=1,
+        stdout="",
+        stderr=json.dumps({"success": False, "error_code": error_code, "message": "private detail"}),
+    ))
+
+    with pytest.raises(RuntimeError, match=f"^{error_code}:") as raised:
+        renderer.render(tmp_path / "input.xlsx", tmp_path / "output.xlsx", None, rules, None, {})
+    assert "private detail" not in str(raised.value)
+    assert _safe_error_code(raised.value) == error_code
+
+
+def test_dotnet_renderer_cli_rejects_invalid_arguments_and_same_path_without_mutation(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+
+    unknown = subprocess.run([command, "--unknown", "value"], capture_output=True, text=True, check=False)
+    assert unknown.returncode != 0
+    assert json.loads(unknown.stderr)["error_code"] == "ARGUMENT_INVALID"
+
+    duplicate = subprocess.run(
+        [command, "--input", "one.xlsx", "--input", "two.xlsx", "--output", "out.xlsx", "--manifest", "manifest.json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert duplicate.returncode != 0
+    assert json.loads(duplicate.stderr)["error_code"] == "ARGUMENT_INVALID"
+
+    source, manifest_path = tmp_path / "input.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID"])
+    book.save(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_same_path",
+        "input_sha256": source_hash,
+        "operations": [],
+    }), encoding="utf-8")
+    same_path = subprocess.run(
+        [command, "--input", str(source), "--output", str(source), "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert same_path.returncode != 0
+    assert json.loads(same_path.stderr)["error_code"] == "ARGUMENT_INVALID"
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
 
 
 def test_dotnet_renderer_marks_sparse_row_across_used_columns(tmp_path):

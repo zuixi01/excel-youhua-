@@ -907,7 +907,7 @@ def _column_letter(index: int) -> str:
 
 def _safe_error_code(exc: Exception) -> str:
     message = str(exc)
-    known = ["FILE_UNSUPPORTED_FORMAT", "FILE_CORRUPTED", "FILE_LIMIT_EXCEEDED", "WORKBOOK_PROTECTED", "STANDARD_TOO_LARGE", "STANDARD_DATA_INVALID", "STANDARD_SOURCE_FAILED", "MANUAL_REVIEW_REQUIRED", "RENDER_FAILED", "OUTPUT_VERIFICATION_FAILED"]
+    known = ["FILE_UNSUPPORTED_FORMAT", "FILE_CORRUPTED", "FILE_LIMIT_EXCEEDED", "WORKBOOK_PROTECTED", "STANDARD_TOO_LARGE", "STANDARD_DATA_INVALID", "STANDARD_SOURCE_FAILED", "MANUAL_REVIEW_REQUIRED", "OUTPUT_VERIFICATION_FAILED", "UNSUPPORTED_FEATURE", "MANIFEST_OR_STRUCTURE_INVALID", "ARGUMENT_INVALID", "RENDER_FAILED"]
     return next((code for code in known if code in message), "COMPARISON_FAILED")
 
 
@@ -923,6 +923,9 @@ def _safe_error_message(error_code: str) -> str:
         "MANUAL_REVIEW_REQUIRED": "The workbook requires manual review.",
         "RENDER_FAILED": "Workbook rendering failed.",
         "OUTPUT_VERIFICATION_FAILED": "The rendered workbook failed output verification.",
+        "UNSUPPORTED_FEATURE": "The workbook contains a feature the renderer cannot modify safely.",
+        "MANIFEST_OR_STRUCTURE_INVALID": "The render request or workbook structure is invalid.",
+        "ARGUMENT_INVALID": "The renderer invocation is invalid.",
         "COMPARISON_FAILED": "The comparison failed.",
     }
     return messages.get(error_code, messages["COMPARISON_FAILED"])

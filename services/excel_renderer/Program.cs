@@ -18,11 +18,13 @@ if (args.Length == 1 && args[0] == "--version")
     return 0;
 }
 
-var arguments = Args.Parse(args);
 var operationResults = new List<OperationResult>();
-var temporaryOutput = Path.GetFullPath(arguments.Output) + ".auditor-" + Guid.NewGuid().ToString("N") + ".tmp";
+string? temporaryOutput = null;
 try
 {
+    var arguments = Args.Parse(args);
+    ValidateInvocation(arguments);
+    temporaryOutput = Path.GetFullPath(arguments.Output) + ".auditor-" + Guid.NewGuid().ToString("N") + ".tmp";
     var manifest = JsonSerializer.Deserialize<RenderManifest>(File.ReadAllText(arguments.Manifest), JsonOptions.Default)
         ?? throw new InvalidDataException("manifest is empty");
     ValidateManifest(manifest);
@@ -81,13 +83,14 @@ catch (Exception exception)
 {
     var code = exception.Message.Contains("OUTPUT_VERIFICATION_FAILED", StringComparison.Ordinal) ? "OUTPUT_VERIFICATION_FAILED"
         : exception.Message.StartsWith("UNSUPPORTED_FEATURE:", StringComparison.Ordinal) ? "UNSUPPORTED_FEATURE"
+        : exception is ArgumentException or FileNotFoundException ? "ARGUMENT_INVALID"
         : exception is InvalidDataException ? "MANIFEST_OR_STRUCTURE_INVALID" : "RENDER_FAILED";
     Console.Error.WriteLine(JsonSerializer.Serialize(new { success = false, error_code = code, message = exception.Message, operation_results = operationResults }, JsonOptions.Default));
     return 1;
 }
 finally
 {
-    if (File.Exists(temporaryOutput)) File.Delete(temporaryOutput);
+    if (temporaryOutput is not null && File.Exists(temporaryOutput)) File.Delete(temporaryOutput);
 }
 
 static void ApplyMark(WorkbookPart workbookPart, RenderOperation operation, Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
@@ -1144,18 +1147,45 @@ static bool IsValidCellReference(string? reference)
 
 static bool IsValidSheetName(string? name) => !String.IsNullOrWhiteSpace(name) && name.Length <= 31 && !name.Any(character => "[]:*?/\\".Contains(character)) && name[0] != '\'' && name[^1] != '\'';
 
+static void ValidateInvocation(Args arguments)
+{
+    var input = Path.GetFullPath(arguments.Input);
+    var output = Path.GetFullPath(arguments.Output);
+    var manifest = Path.GetFullPath(arguments.Manifest);
+    var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    if (!File.Exists(input)) throw new FileNotFoundException("input workbook does not exist");
+    if (!File.Exists(manifest)) throw new FileNotFoundException("manifest does not exist");
+    if (comparer.Equals(input, output)) throw new ArgumentException("input and output paths must be different");
+    if (comparer.Equals(manifest, output)) throw new ArgumentException("manifest and output paths must be different");
+    var inputExtension = Path.GetExtension(input);
+    var outputExtension = Path.GetExtension(output);
+    if (!new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".xlsx", ".xlsm" }.Contains(inputExtension) || !StringComparer.OrdinalIgnoreCase.Equals(inputExtension, outputExtension))
+        throw new ArgumentException("input and output must use the same supported Excel extension");
+    var outputDirectory = Path.GetDirectoryName(output);
+    if (String.IsNullOrWhiteSpace(outputDirectory) || !Directory.Exists(outputDirectory)) throw new ArgumentException("output directory does not exist");
+}
+
 sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 {
     public static Args Parse(string[] values)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var known = new HashSet<string>(StringComparer.Ordinal) { "--input", "--output", "--manifest" };
         var dryRun = false;
         for (var index = 0; index < values.Length; index++)
         {
-            if (values[index] == "--dry-run") { dryRun = true; continue; }
+            if (values[index] == "--dry-run")
+            {
+                if (dryRun) throw new ArgumentException("duplicate argument: --dry-run");
+                dryRun = true;
+                continue;
+            }
+            if (!known.Contains(values[index])) throw new ArgumentException($"unknown argument: {values[index]}");
             if (index + 1 >= values.Length) throw new ArgumentException($"missing value for {values[index]}");
-            map[values[index]] = values[++index];
+            if (!map.TryAdd(values[index], values[++index])) throw new ArgumentException($"duplicate argument: {values[index - 1]}");
         }
+        foreach (var required in known)
+            if (!map.ContainsKey(required)) throw new ArgumentException($"missing required argument: {required}");
         return new Args(map["--input"], map["--output"], map["--manifest"], dryRun);
     }
 }
