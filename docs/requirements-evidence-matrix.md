@@ -24,7 +24,7 @@
 | 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `08afd68` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33251264106) 及 JUnit 制品已通过 | Microsoft Excel 桌面验收记录 |
 | 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试 | 生产审计抽样 |
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
-| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地生产 Renderer `146 passed, 6 skipped`；提交 `08afd68` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33251264106) 七项与 [性能基线 v3](https://github.com/zuixi01/excel-youhua-/actions/runs/33251352911) 七项全部绿色并保存制品；500k 标准/400,001 差异完整比较与报告通过；小型人工标注 precision/recall | 业务标注基准；500k 受管接口服务全链路负载 |
+| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地生产 Renderer 完整回归通过；提交 `0534ff2` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33252789525) 七项与 [性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33252958226) 八项全部绿色并保存制品；500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；小型人工标注 precision/recall | 业务标注基准 |
 | 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `08afd68` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |
 | 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送；生产 Compose 强制 tag | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
 | 18 | 精确回滚版本与命令 | 待外部验收 | `docs/deployment.md`、release manifest 生成逻辑 | 发布前后真实 digest 和一次回滚演练记录 |

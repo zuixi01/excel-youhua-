@@ -18,10 +18,10 @@
 | Web | pnpm 9.15.9 frozen install、Vue/TypeScript production build 成功；pnpm 无 High 漏洞 |
 | NuGet | locked restore；direct/transitive vulnerability 列表为空 |
 | 配置 | GitHub Actions/Compose 标准 YAML 解析通过；生产 Compose `config --quiet` 通过 |
-| 性能回归门禁 | 相对阈值判定器 3 个单元测试通过；release 强制要求上一成功 main 同场景制品 |
+| 性能回归门禁 | 相对阈值判定器 4 个单元测试通过；release 强制要求上一成功 main 同场景制品；工作簿场景使用 v4 CPU 校准归一化 |
 | 性能记录 | 10k×50：12.297 秒/52.13 MiB；100k×100：37.783 秒/252.79 MiB；100k×200、50% 差异：51.325 秒/422.52 MiB；5 工作表 50k×50：11.232 秒/30.96 MiB；分页源 50,000 条：0.119 秒 |
 
-完整测试命令使用 `services/excel_renderer/bin/Release/net8.0/win-x64/publish/ExcelRenderer.exe` 作为 `EXCEL_RENDERER_COMMAND`。条件跳过项为两个性能基线、两个真实基础设施测试和 LibreOffice 兼容性测试；性能用例已另行显式执行并记录，但仍必须由专用远程作业对发布 SHA 复验。
+完整测试命令使用 `services/excel_renderer/bin/Release/net8.0/win-x64/publish/ExcelRenderer.exe` 作为 `EXCEL_RENDERER_COMMAND`。条件跳过项为四个性能基线、两个真实基础设施测试和 LibreOffice 兼容性测试；性能用例已另行显式执行并记录，并由专用远程作业对当前提交复验。
 
 ## 本轮修复后的关键安全契约
 
