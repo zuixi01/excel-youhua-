@@ -226,6 +226,16 @@ def excel_datetime_write_safe(value: datetime, timezone_name: str | None) -> boo
     return restored.astimezone(timezone.utc) == value.astimezone(timezone.utc)
 
 
+def normalized_uniqueness_key(parsed: ParsedValue, rule: ColumnRule) -> tuple[str, Any] | None:
+    """Return a hashable key with the same normalized value semantics on every path."""
+    value = parsed.normalized
+    if value is None:
+        return None
+    if rule.type == FieldType.DATETIME and isinstance(value, datetime) and value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return rule.type.value, value
+
+
 def _to_python_format(value: str) -> str:
     tokens = {"yyyy": "%Y", "MM": "%m", "dd": "%d", "HH": "%H", "mm": "%M", "ss": "%S", "M": "%m", "d": "%d"}
     pattern = re.compile("|".join(sorted(tokens, key=len, reverse=True)))

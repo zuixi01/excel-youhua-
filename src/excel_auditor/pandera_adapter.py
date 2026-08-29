@@ -8,7 +8,7 @@ import pandas as pd
 import pandera.pandas as pa
 
 from .models import RuleSet, SheetRule
-from .normalization import is_formula_text, parse_row_number, parse_value
+from .normalization import is_formula_text, normalized_uniqueness_key, parse_row_number, parse_value
 from .validators import run_validator
 
 
@@ -181,7 +181,7 @@ class StandardDataValidator:
                 parsed = parse_value(row.get(rule.name), rule)
                 if parsed.normalized is None:
                     continue
-                normalized = parsed.normalized
+                normalized = normalized_uniqueness_key(parsed, rule)
                 if normalized in observed:
                     raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id}.{rule.name} is not unique at record {row_index}")
                 observed.add(normalized)

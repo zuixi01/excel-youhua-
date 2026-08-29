@@ -373,6 +373,71 @@ def test_standard_decimal_uniqueness_uses_normalized_numeric_equality(equivalent
         StandardDataValidator(chunk_size=1).validate({"data": rows}, rules)
 
 
+def test_datetime_uniqueness_distinguishes_dst_folds_but_matches_equal_instants():
+    rules = RuleSet.model_validate({
+        "schema_id": "datetime-unique", "schema_version": "1.0.0", "name": "Datetime unique",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "event_at", "title": "Event", "type": "datetime",
+                    "compare": {"mode": "datetime", "timezone": "America/New_York"},
+                    "validation": {"unique": True},
+                },
+            ],
+        }],
+    })
+    distinct_folds = [
+        {"id": "E1", "event_at": "2024-11-03T01:30:00-04:00"},
+        {"id": "E2", "event_at": "2024-11-03T01:30:00-05:00"},
+    ]
+    StandardDataValidator(chunk_size=1).validate({"data": distinct_folds}, rules)
+
+    equal_instants = [
+        {"id": "E1", "event_at": "2024-11-03T01:30:00-04:00"},
+        {"id": "E2", "event_at": "2024-11-03T05:30:00Z"},
+    ]
+    with pytest.raises(ValueError, match=r"data\.event_at is not unique at record 2"):
+        StandardDataValidator(chunk_size=1).validate({"data": equal_instants}, rules)
+
+
+def test_excel_datetime_uniqueness_distinguishes_dst_folds(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "excel-datetime-unique", "schema_version": "1.0.0", "name": "Excel datetime unique",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "event_at", "title": "Event", "type": "datetime",
+                    "compare": {"mode": "datetime", "timezone": "America/New_York"},
+                    "validation": {"unique": True},
+                },
+            ],
+        }],
+    })
+    path = tmp_path / "dst-fold-unique.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Event"])
+    sheet.append(["E1", "2024-11-03T01:30:00-04:00"])
+    sheet.append(["E2", "2024-11-03T01:30:00-05:00"])
+    book.save(path)
+
+    snapshot = inspect_workbook(path, rules)
+    result = compare_workbook(snapshot, {"data": [
+        {"id": "E1", "event_at": "2024-11-03T01:30:00-04:00"},
+        {"id": "E2", "event_at": "2024-11-03T01:30:00-05:00"},
+    ]}, rules)
+    try:
+        assert not any(item.rule_id == "event_at.unique" for item in result.differences)
+    finally:
+        result.close()
+        snapshot.close()
+
+
 def test_field_statistics_use_per_sheet_and_per_issue_denominators(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "field-statistics", "schema_version": "1.0.0", "name": "Field statistics",

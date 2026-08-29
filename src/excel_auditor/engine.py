@@ -21,7 +21,7 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, excel_datetime_write_safe, is_formula_text, parse_excel_value, parse_row_number, parse_value, values_equal
+from .normalization import ParsedValue, excel_datetime_write_safe, is_formula_text, normalized_uniqueness_key, parse_excel_value, parse_row_number, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
@@ -776,7 +776,7 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
             if validation_message:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, validation_message, cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), excel_normalized_value=_safe_value(parsed.normalized, rule), rule_id=f"{name}.validation", render_action=sheet.actions.invalid_value))
             if rule.validation.unique and parsed.normalized is not None:
-                unique_values[name][parsed.normalized].append((row_number, key))
+                unique_values[name][normalized_uniqueness_key(parsed, rule)].append((row_number, key))
         _validate_cross_fields(sheet, columns, row_number, key, parsed_record, rules_by_name, differences)
     for name, values in unique_values.items():
         for _value, occurrences in values.items():
