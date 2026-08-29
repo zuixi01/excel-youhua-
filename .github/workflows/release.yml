@@ -1,0 +1,109 @@
+name: release-images
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+
+  performance:
+    uses: ./.github/workflows/performance.yml
+    with:
+      require_reference: true
+
+  images:
+    needs: [tests, performance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build API locally
+        id: api-image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}
+      - name: Scan API image
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # immutable v7.4.0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: high
+      - name: Generate API image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}
+          artifact-name: excel-auditor-api-${{ github.sha }}.spdx.json
+      - name: Smoke test API image and Linux renderer
+        run: |
+          docker run --rm \
+            --entrypoint python \
+            ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }} \
+            -c "from pathlib import Path; import hashlib,json,subprocess; from openpyxl import Workbook,load_workbook; p=Path('/tmp/input.xlsx'); o=Path('/tmp/output.xlsx'); m=Path('/tmp/manifest.json'); b=Workbook(); b.active.append(['ok']); b.save(p); m.write_text(json.dumps({'manifest_version':'1.0','job_id':'smoke','input_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'operations':[]})); r=subprocess.run(['/app/renderer/ExcelRenderer','--input',str(p),'--output',str(o),'--manifest',str(m)],capture_output=True,text=True); assert r.returncode == 0, r.stderr; load_workbook(o,read_only=True).close()"
+      - name: Build web locally
+        id: web-image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.web
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
+      - name: Scan web image
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # immutable v7.4.0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: high
+      - name: Generate web image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
+          artifact-name: excel-auditor-web-${{ github.sha }}.spdx.json
+      - name: Smoke test web image
+        run: |
+          docker run --rm --detach --name excel-auditor-web-smoke --add-host api:127.0.0.1 -p 18080:8080 ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
+          trap 'docker stop excel-auditor-web-smoke >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 20); do curl --fail --silent http://127.0.0.1:18080/ >/dev/null && exit 0; sleep 1; done
+          docker logs excel-auditor-web-smoke
+          exit 1
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push only validated immutable images
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}
+      - name: Record immutable release and rollback targets
+        run: |
+          API_REF="ghcr.io/${{ github.repository_owner }}/excel-auditor-api:${{ github.sha }}"
+          WEB_REF="ghcr.io/${{ github.repository_owner }}/excel-auditor-web:${{ github.sha }}"
+          API_DIGEST="$(docker buildx imagetools inspect "$API_REF" --format '{{json .Manifest}}' | jq -r '.digest')"
+          WEB_DIGEST="$(docker buildx imagetools inspect "$WEB_REF" --format '{{json .Manifest}}' | jq -r '.digest')"
+          test "${#API_DIGEST}" -eq 71 && test "${API_DIGEST#sha256:}" != "$API_DIGEST"
+          test "${#WEB_DIGEST}" -eq 71 && test "${WEB_DIGEST#sha256:}" != "$WEB_DIGEST"
+          jq -n \
+            --arg git_sha "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg api "$API_REF@$API_DIGEST" \
+            --arg web "$WEB_REF@$WEB_DIGEST" \
+            --arg api_sbom "excel-auditor-api-${{ github.sha }}.spdx.json" \
+            --arg web_sbom "excel-auditor-web-${{ github.sha }}.spdx.json" \
+            '{git_sha:$git_sha, workflow_run_id:$run_id, images:{api:$api,web:$web}, sboms:{api:$api_sbom,web:$web_sbom}, rollback:"restore IMAGE_TAG or image digest recorded before deployment, then run docker compose pull && docker compose up -d --remove-orphans"}' \
+            > release-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-manifest-${{ github.sha }}
+          path: release-manifest.json

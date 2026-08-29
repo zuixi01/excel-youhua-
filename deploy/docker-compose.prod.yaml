@@ -1,0 +1,62 @@
+name: excel-auditor
+services:
+  api:
+    image: ${REGISTRY:?set REGISTRY}/excel-auditor-api:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    pull_policy: always
+    environment:
+      EXCEL_AUDITOR_ENV: production
+      EXCEL_AUDITOR_DATA: /data
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      EXCEL_RENDERER_COMMAND: /app/renderer/ExcelRenderer
+      EXCEL_AUDITOR_CONNECTIONS: /run/excel-auditor/connections.json
+      EXCEL_AUDITOR_SECRET_DIR: /run/secrets/excel-auditor
+      EXCEL_AUDITOR_REQUIRE_AUTH: "1"
+      EXCEL_AUDITOR_API_TOKEN: ${EXCEL_AUDITOR_API_TOKEN:?set EXCEL_AUDITOR_API_TOKEN}
+      S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-AES256}
+      AWS_REGION: ${AWS_REGION:-}
+    volumes:
+      - auditor-data:/data
+      - ${STANDARD_CONNECTIONS_FILE:-./connections.empty.json}:/run/excel-auditor/connections.json:ro
+      - ${STANDARD_SECRETS_DIR:-./standard-secrets.empty}:/run/secrets/excel-auditor:ro
+    restart: unless-stopped
+  worker:
+    image: ${REGISTRY:?set REGISTRY}/excel-auditor-api:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    pull_policy: always
+    command: ["excel-auditor-worker"]
+    environment:
+      EXCEL_AUDITOR_ENV: production
+      EXCEL_AUDITOR_DATA: /data
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      EXCEL_RENDERER_COMMAND: /app/renderer/ExcelRenderer
+      EXCEL_AUDITOR_CONNECTIONS: /run/excel-auditor/connections.json
+      EXCEL_AUDITOR_SECRET_DIR: /run/secrets/excel-auditor
+      EXCEL_AUDITOR_REQUIRE_AUTH: "1"
+      EXCEL_AUDITOR_API_TOKEN: ${EXCEL_AUDITOR_API_TOKEN:?set EXCEL_AUDITOR_API_TOKEN}
+      S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-AES256}
+      AWS_REGION: ${AWS_REGION:-}
+    volumes:
+      - auditor-data:/data
+      - ${STANDARD_CONNECTIONS_FILE:-./connections.empty.json}:/run/excel-auditor/connections.json:ro
+      - ${STANDARD_SECRETS_DIR:-./standard-secrets.empty}:/run/secrets/excel-auditor:ro
+    healthcheck:
+      test: ["CMD-SHELL", "rq info --url \"$$REDIS_URL\" >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  web:
+    image: ${REGISTRY:?set REGISTRY}/excel-auditor-web:${IMAGE_TAG:?set immutable IMAGE_TAG}
+    pull_policy: always
+    depends_on:
+      api:
+        condition: service_healthy
+    ports: ["8080:8080"]
+    restart: unless-stopped
+volumes:
+  auditor-data:

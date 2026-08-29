@@ -1,0 +1,33 @@
+FROM mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim@sha256:bb32ba3ba3ea36e38572d9d8db76fa15f7cbf722f3f886e06bca6d528bd4fba8 AS renderer-build
+WORKDIR /src
+COPY services/excel_renderer/ ./
+RUN dotnet restore ExcelRenderer.csproj --locked-mode --nologo \
+    && dotnet publish ExcelRenderer.csproj -c Release -r linux-musl-x64 --self-contained true --no-restore -o /renderer --nologo
+
+FROM python:3.14.7-alpine3.23@sha256:6b8f06d04d5305c1d1288435388df9165ab41e681fae6439d6349d8053cc3f83 AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache libstdc++ \
+    && addgroup -S auditor \
+    && adduser -S -G auditor -h /home/auditor auditor
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md alembic.ini ./
+COPY src ./src
+COPY migrations ./migrations
+COPY --from=renderer-build /renderer /app/renderer
+RUN python -m pip install uv==0.12.5 \
+    && uv sync --frozen --no-dev --no-editable \
+    && python -m pip uninstall -y uv
+RUN chmod 0555 /app/renderer/ExcelRenderer && mkdir -p /data && chown -R auditor:auditor /data /app
+USER auditor
+ENV EXCEL_AUDITOR_DATA=/data \
+    EXCEL_RENDERER_COMMAND=/app/renderer/ExcelRenderer \
+    EXCEL_AUDITOR_HOST=0.0.0.0 \
+    PATH=/app/.venv/bin:$PATH
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
+CMD ["excel-auditor-server"]

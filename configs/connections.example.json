@@ -1,0 +1,15 @@
+{
+  "connections": [
+    {
+      "id": "hr-system",
+      "base_url": "https://hr.example.com/",
+      "allowed_paths": ["/api/v1/employees"],
+      "auth_secret_ref": "hr_api_token",
+      "timeout_seconds": 15,
+      "max_response_bytes": 16777216,
+      "max_records": 500000,
+      "allow_private_network": false,
+      "allow_insecure_http": false
+    }
+  ]
+}

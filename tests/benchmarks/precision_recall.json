@@ -1,0 +1,54 @@
+{
+  "minimum_precision": 0.99,
+  "minimum_recall": 0.99,
+  "header_cases": [
+    {"headers": ["编号", "姓名", "手机号"], "expected": {"1": "id", "2": "name", "3": "phone"}},
+    {"headers": ["id", "name", "phone"], "expected": {"1": "id", "2": "name", "3": "phone"}},
+    {"headers": ["编号", "姓 名", "手机号码"], "expected": {"1": "id"}},
+    {"headers": ["未知字段", "备注"], "expected": {}}
+  ],
+  "record_field_repair_case": {
+    "rule": {
+      "schema_id": "precision-records",
+      "schema_version": "1.0.0",
+      "name": "Manually annotated record benchmark",
+      "sheets": [{
+        "id": "data",
+        "name": "Data",
+        "primary_key": ["id"],
+        "actions": {"overwrite_mismatch": true, "missing_record": "append_and_mark_green"},
+        "columns": [
+          {"name": "id", "title": "ID", "required": true},
+          {"name": "name", "title": "Name"},
+          {"name": "amount", "title": "Amount", "type": "decimal", "compare": {"mode": "numeric"}}
+        ]
+      }]
+    },
+    "excel": {
+      "headers": ["ID", "Name", "Amount"],
+      "rows": [
+        ["E001", "Alice", 10],
+        ["E002", "Bob", 19],
+        ["E003", "Extra", 5]
+      ]
+    },
+    "standard": {
+      "data": [
+        {"id": "E001", "name": "Alice", "amount": 10},
+        {"id": "E002", "name": "Bob", "amount": 20},
+        {"id": "E004", "name": "Missing", "amount": 30}
+      ]
+    },
+    "expected_record_labels": [
+      ["EXTRA_RECORD", "E003"],
+      ["MISSING_RECORD", "E004"]
+    ],
+    "expected_field_labels": [
+      ["VALUE_MISMATCH", "E002", "amount"]
+    ],
+    "expected_repair_labels": [
+      ["set_cell", "E002", "amount"],
+      ["append_record", "E004", null]
+    ]
+  }
+}

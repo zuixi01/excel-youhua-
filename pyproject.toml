@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-standard-auditor"
+version = "0.1.0"
+description = "Configuration-driven Excel standard-data audit and safe repair platform"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic==1.19.1",
+  "fastapi==0.141.1",
+  "boto3==1.43.82",
+  "datacompy==1.0.4",
+  "httpx==0.28.1",
+  "openpyxl==3.1.5",
+  "pandera[pandas]==0.32.1",
+  "polars==1.43.2",
+  "pydantic==2.13.4",
+  "python-multipart==0.0.32",
+  "PyYAML==6.0.3",
+  "rapidfuzz==3.14.5",
+  "redis==8.1.0",
+  "rq==2.11.0",
+  "SQLAlchemy==2.0.52",
+  "psycopg[binary]==3.3.4",
+  "uvicorn==0.52.4",
+]
+
+[project.optional-dependencies]
+test = ["hypothesis==6.165.10", "psutil==7.2.2", "pytest==9.1.1", "pytest-cov==7.1.0"]
+security = ["pip-audit==2.10.1", "pip-licenses==5.5.5"]
+
+[project.scripts]
+excel-auditor-api = "excel_auditor.api:run"
+excel-auditor-server = "excel_auditor.startup:run"
+excel-auditor-worker = "excel_auditor.worker:run"
+excel-auditor-retention = "excel_auditor.retention:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["performance: opt-in performance baseline tests", "integration: opt-in real infrastructure tests"]
+filterwarnings = [
+  "ignore::starlette.exceptions.StarletteDeprecationWarning",
+]

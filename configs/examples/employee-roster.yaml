@@ -1,0 +1,79 @@
+schema_id: employee-roster
+schema_version: 1.0.0
+name: 员工花名册标准
+workbook:
+  allowed_extensions: [xlsx]
+  preserve_macros: false
+  reject_protected: true
+  unsupported_feature_action: manual_review
+sheets:
+  - id: employees
+    name: 人员信息
+    required: true
+    header:
+      row: 2
+      auto_detect: false
+      fuzzy_suggestion_threshold: 92
+    data_region:
+      start_row: 3
+      end_strategy: used_range
+      include_hidden_rows: true
+    primary_key: [employee_id]
+    columns:
+      - name: employee_id
+        title: 员工编号
+        aliases: [工号, 员工ID]
+        required: true
+        type: string
+        normalize: [trim, unicode_nfkc, uppercase]
+        validation:
+          nullable: false
+          unique: true
+          regex: '^[A-Z0-9-]{3,32}$'
+        missing_column_action: insert
+      - name: employee_name
+        title: 姓名
+        aliases: [员工姓名]
+        required: true
+        type: string
+        normalize: [trim, unicode_nfkc, collapse_spaces]
+        missing_column_action: insert
+      - name: salary
+        title: 工资
+        aliases: [月薪]
+        required: true
+        type: decimal
+        normalize: [trim, remove_group_separator, remove_currency_symbol]
+        compare:
+          mode: numeric
+          absolute_tolerance: '0.01'
+          relative_tolerance: '0'
+        validation:
+          min: '0'
+        format: '#,##0.00'
+        missing_column_action: insert
+      - name: hire_date
+        title: 入职日期
+        required: false
+        type: date
+        normalize: [trim]
+        parse_formats: ['yyyy-MM-dd', 'yyyy/MM/dd', 'yyyy年M月d日']
+        compare:
+          mode: date
+        format: 'yyyy-mm-dd'
+      - name: department
+        title: 部门
+        required: true
+        type: enum
+        enum_values: [技术部, 财务部, 人事部]
+        enum_aliases:
+          技术: 技术部
+          财务: 财务部
+          HR: 人事部
+        missing_column_action: insert
+colors:
+  extra: F4CCCC
+  inserted: D9EAD3
+  mismatch: FFE599
+  invalid: F9CB9C
+  ambiguous: D9D2E9

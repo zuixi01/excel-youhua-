@@ -1,0 +1,14 @@
+.git
+.github
+.hypothesis
+.pytest_cache
+.tools
+.venv
+**/__pycache__
+**/bin
+**/obj
+apps/web/dist
+apps/web/node_modules
+var
+*.log
+performance-*.json

@@ -1,0 +1,143 @@
+{
+  "typed_compound": {
+    "input_sha256": "4568e24c6391e8e9e19ff1dbeb22ea47a1615ca3d05b123ff2ac08b3772b4b3c",
+    "rule": {
+      "schema_id": "golden-typed-compound",
+      "schema_version": "1.0.0",
+      "name": "Typed compound-key Golden",
+      "sheets": [{
+        "id": "orders",
+        "name": "订单",
+        "primary_key": ["employee_id", "period"],
+        "columns": [
+          {"name": "employee_id", "title": "员工编号", "required": true, "normalize": ["trim", "unicode_nfkc", "uppercase"]},
+          {"name": "period", "title": "期间", "required": true},
+          {"name": "postal_code", "title": "代码", "type": "postal_code"},
+          {"name": "amount", "title": "金额", "type": "decimal", "normalize": ["trim", "remove_group_separator", "remove_currency_symbol"], "compare": {"mode": "numeric", "absolute_tolerance": "0.01"}},
+          {"name": "ratio", "title": "百分比", "type": "decimal", "normalize": ["trim", "percent_to_decimal"], "compare": {"mode": "numeric", "absolute_tolerance": "0.0001"}},
+          {"name": "business_date", "title": "日期", "type": "date", "parse_formats": ["yyyy-MM-dd"], "compare": {"mode": "date"}},
+          {"name": "event_time", "title": "时间", "type": "datetime", "compare": {"mode": "datetime", "timezone": "Asia/Shanghai", "precision": "minute"}},
+          {"name": "active", "title": "启用", "type": "boolean"},
+          {"name": "department", "title": "部门", "type": "enum", "enum_values": ["技术部", "财务部"], "enum_aliases": {"技术": "技术部"}},
+          {"name": "tags", "title": "标签", "type": "set", "compare": {"mode": "set"}},
+          {"name": "payload", "title": "JSON", "type": "json", "compare": {"mode": "json"}}
+        ]
+      }]
+    },
+    "standard": {
+      "orders": [{
+        "employee_id": "E001",
+        "period": "202608",
+        "postal_code": "00123",
+        "amount": "10000.00",
+        "ratio": "0.125",
+        "business_date": "2026-08-28",
+        "event_time": "2026-08-28T02:30:00Z",
+        "active": true,
+        "department": "技术部",
+        "tags": "B,A",
+        "payload": {"a": 1, "b": 2}
+      }]
+    },
+    "expected_counts": {}
+  },
+  "structured_multisheet": {
+    "input_sha256": "8857caff5a5fb88b114b7acce536619f5357fa135b0f84cfeb10fafa5429bc55",
+    "rule": {
+      "schema_id": "golden-structured",
+      "schema_version": "1.0.0",
+      "name": "Structured workbook Golden",
+      "sheets": [
+        {
+          "id": "data",
+          "name": "结构",
+          "primary_key": ["id"],
+          "columns": [
+            {"name": "id", "title": "编号", "required": true},
+            {"name": "amount", "title": "金额", "type": "decimal", "compare": {"mode": "numeric"}},
+            {"name": "total", "title": "合计", "compare": {"formula_mode": "formula"}}
+          ]
+        },
+        {
+          "id": "notes",
+          "name": "说明",
+          "primary_key": ["id"],
+          "columns": [
+            {"name": "id", "title": "编号", "required": true},
+            {"name": "note", "title": "备注"}
+          ]
+        }
+      ]
+    },
+    "standard": {
+      "data": [
+        {"id": "E001", "amount": 5, "total": "=B2*2"},
+        {"id": "E002", "amount": 6, "total": "=B3*2"}
+      ],
+      "notes": [{"id": "N001", "note": "固定说明"}]
+    },
+    "expected_counts": {}
+  },
+  "merged_header_manual_review": {
+    "input_sha256": "f6e46cceacfb08a3883c81612362dc363e795f78968c11aceb41fb76707940f1",
+    "rule": {
+      "schema_id": "golden-merged-header",
+      "schema_version": "1.0.0",
+      "name": "Merged header Golden",
+      "sheets": [{
+        "id": "merged",
+        "name": "合并表头",
+        "primary_key": ["id"],
+        "columns": [
+          {"name": "id", "title": "编号", "required": true},
+          {"name": "name", "title": "姓名", "required": true}
+        ]
+      }]
+    },
+    "standard": {"merged": [{"id": "E001", "name": "张三"}]},
+    "expected_status": "manual_review"
+  },
+  "large_report_only": {
+    "input_sha256": "6e40f190daf32452d340413bed8db5c9ec47b6ad0dcf965399cb868b02936873",
+    "standard_snapshot": "large_report_only.standard.jsonl",
+    "standard_sha256": "41be47f3d39e01d544de0f7086d17013347d21b5eb673a0c78efcc0491956688",
+    "standard_record_count": 10000,
+    "rule": {
+      "schema_id": "golden-large-report-only",
+      "schema_version": "1.0.0",
+      "name": "Large report-only Golden",
+      "workbook": {
+        "max_in_memory_cells": 10000,
+        "large_file_action": "report_only"
+      },
+      "sheets": [{
+        "id": "large",
+        "name": "大数据",
+        "primary_key": ["id"],
+        "columns": [
+          {"name": "id", "title": "ID", "required": true},
+          {"name": "f1", "title": "F1"},
+          {"name": "f2", "title": "F2"},
+          {"name": "f3", "title": "F3"},
+          {"name": "f4", "title": "F4"},
+          {"name": "f5", "title": "F5"},
+          {"name": "f6", "title": "F6"},
+          {"name": "f7", "title": "F7"},
+          {"name": "f8", "title": "F8"},
+          {"name": "f9", "title": "F9"},
+          {"name": "f10", "title": "F10"},
+          {"name": "f11", "title": "F11"},
+          {"name": "f12", "title": "F12"},
+          {"name": "f13", "title": "F13"},
+          {"name": "f14", "title": "F14"},
+          {"name": "f15", "title": "F15"},
+          {"name": "f16", "title": "F16"},
+          {"name": "f17", "title": "F17"},
+          {"name": "f18", "title": "F18"},
+          {"name": "f19", "title": "F19"}
+        ]
+      }]
+    },
+    "expected_counts": {}
+  }
+}

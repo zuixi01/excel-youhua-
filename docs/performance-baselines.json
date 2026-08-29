@@ -1,0 +1,80 @@
+{
+  "recorded_at": "2026-08-29",
+  "runtime": "CPython 3.12 / Windows x64",
+  "notes": "Measurements cover workbook inspection, deterministic comparison, Polars partitioned key joins when the per-sheet threshold is reached, and JSON report serialization. XLSX fixture creation is excluded. Density controls populated non-key fields so documented row/column boundaries can be exercised within bounded memory.",
+  "baselines": [
+    {
+      "rows": 10000,
+      "columns": 50,
+      "sheets": 1,
+      "density": 1.0,
+      "difference_rate": 0.1,
+      "join_backends": ["python_in_memory"],
+      "inspect_seconds": 10.021,
+      "compare_and_report_seconds": 2.276,
+      "elapsed_seconds": 12.297,
+      "peak_rss_delta_mib": 52.13,
+      "report_bytes": 699344
+    },
+    {
+      "rows": 100000,
+      "columns": 100,
+      "sheets": 1,
+      "density": 0.1,
+      "difference_rate": 0.1,
+      "join_backends": ["polars_partitioned"],
+      "inspect_seconds": 24.783,
+      "compare_and_report_seconds": 13.0,
+      "elapsed_seconds": 37.783,
+      "peak_rss_delta_mib": 252.79,
+      "report_bytes": 6940302
+    },
+    {
+      "rows": 100000,
+      "columns": 200,
+      "sheets": 1,
+      "density": 0.05,
+      "difference_rate": 0.5,
+      "join_backends": ["polars_partitioned"],
+      "inspect_seconds": 25.084,
+      "compare_and_report_seconds": 26.241,
+      "elapsed_seconds": 51.325,
+      "peak_rss_delta_mib": 422.52,
+      "report_bytes": 34886602
+    },
+    {
+      "rows": 100000,
+      "columns": 200,
+      "sheets": 1,
+      "density": 0.01,
+      "difference_rate": 0.01,
+      "join_backends": ["polars_partitioned"],
+      "inspect_seconds": 5.766,
+      "compare_and_report_seconds": 14.493,
+      "elapsed_seconds": 20.259,
+      "peak_rss_delta_mib": 185.79,
+      "report_bytes": 738596
+    },
+    {
+      "rows": 50000,
+      "columns": 50,
+      "sheets": 5,
+      "density": 0.1,
+      "difference_rate": 0.1,
+      "join_backends": ["python_in_memory"],
+      "inspect_seconds": 7.916,
+      "compare_and_report_seconds": 3.317,
+      "elapsed_seconds": 11.232,
+      "peak_rss_delta_mib": 30.96,
+      "report_bytes": 3534488
+    }
+  ],
+  "paginated_standard_source": {
+    "records": 50000,
+    "page_size": 500,
+    "pages": 100,
+    "elapsed_seconds": 0.119,
+    "response_bytes": 852400,
+    "transport_note": "Local deterministic MockTransport isolates pagination and payload processing; production network latency is measured separately through per-page metadata and metrics."
+  }
+}

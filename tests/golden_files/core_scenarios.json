@@ -1,0 +1,139 @@
+{
+  "rule": {
+    "schema_id": "golden-core",
+    "schema_version": "1.0.0",
+    "name": "Golden Core",
+    "sheets": [{
+      "id": "staff",
+      "name": "员工",
+      "primary_key": ["id"],
+      "columns": [
+        {"name": "id", "title": "编号", "required": true, "missing_column_action": "insert"},
+        {"name": "name", "title": "姓名", "aliases": ["员工姓名"], "required": true, "missing_column_action": "insert"},
+        {"name": "phone", "title": "手机号", "required": true, "type": "phone", "missing_column_action": "insert"}
+      ]
+    }]
+  },
+  "scenarios": [
+    {
+      "name": "perfect_match",
+      "input_sha256": "ec15c5cf8c8f0bfc87b67b5b87e34d41fafd0b9e4e739c62f8a442e2f82773c8",
+      "headers": ["编号", "姓名", "手机号"],
+      "rows": [["E001", "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {}
+    },
+    {
+      "name": "missing_first_column",
+      "input_sha256": "f9cfa210798ba0b1ccec49e28998d48239294df1a0fcbfcc15a8d8391241001d",
+      "headers": ["姓名", "手机号"],
+      "rows": [["张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"MISSING_HEADER": 1}
+    },
+    {
+      "name": "missing_middle_column",
+      "input_sha256": "21c4b0adb8cb7a24cd95115696c44019ae2fb3cbbe88c5e8e03cd2fa44b56386",
+      "headers": ["编号", "手机号"],
+      "rows": [["E001", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"MISSING_HEADER": 1}
+    },
+    {
+      "name": "missing_last_column",
+      "input_sha256": "0e48804148801b2963f0f7ec7ec0717ec2d79b22d69770416d54ab68196f97c5",
+      "headers": ["编号", "姓名"],
+      "rows": [["E001", "张三"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"MISSING_HEADER": 1}
+    },
+    {
+      "name": "missing_and_extra_header",
+      "input_sha256": "a7822351a8360e81a9a0159ad1b565e32d977b559eb9a5a3b4a8831fc80b46b5",
+      "headers": ["编号", "姓名", "备注"],
+      "rows": [["E001", "张三", "保留"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"MISSING_HEADER": 1, "EXTRA_HEADER": 1}
+    },
+    {
+      "name": "extra_and_missing_record",
+      "input_sha256": "638abcdeb6089616f9ccb057b84d44bf58b148148b26fef9403b0f00f0bdab03",
+      "headers": ["编号", "姓名", "手机号"],
+      "rows": [["E001", "张三", "13800138000"], ["E003", "王五", "13700137000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}, {"id": "E002", "name": "李四", "phone": "13900139000"}],
+      "expected": {"EXTRA_RECORD": 1, "MISSING_RECORD": 1}
+    },
+    {
+      "name": "duplicate_primary_key",
+      "input_sha256": "0e72503768a24505484afc1bd64e486d8992cf7f0696a562a34db672ed63d007",
+      "headers": ["编号", "姓名", "手机号"],
+      "rows": [["E001", "张三", "13800138000"], ["E001", "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"DUPLICATE_PRIMARY_KEY": 2, "MISSING_RECORD": 1}
+    },
+    {
+      "name": "extra_first_header",
+      "input_sha256": "83549145df853044df5a9755af2b2d7c2777c78fdfec083b67e9beeb21c7e5f3",
+      "headers": ["备注", "编号", "姓名", "手机号"],
+      "rows": [["保留", "E001", "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"EXTRA_HEADER": 1}
+    },
+    {
+      "name": "extra_middle_header",
+      "input_sha256": "024d3b3f3cd0179b1f31ad561b2b8bb260e84f4b5cee88334e101916801b0122",
+      "headers": ["编号", "姓名", "备注", "手机号"],
+      "rows": [["E001", "张三", "保留", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"EXTRA_HEADER": 1}
+    },
+    {
+      "name": "extra_last_header",
+      "input_sha256": "551cb3d141a13d4770d275ce9a9b50d0aa051922f9be2dac4890af84cbe49bc6",
+      "headers": ["编号", "姓名", "手机号", "备注"],
+      "rows": [["E001", "张三", "13800138000", "保留"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"EXTRA_HEADER": 1}
+    },
+    {
+      "name": "confirmed_alias_and_unicode_whitespace",
+      "input_sha256": "b1d6004529566a083e04cca89c03c7b6ee8b93b8c510ee40c44668ce7c3834e2",
+      "headers": ["编号", "　员工姓名 \n", "手机号"],
+      "rows": [["E001", "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {}
+    },
+    {
+      "name": "duplicate_header",
+      "input_sha256": "c70af34f0fc1e3c9dd8992e856db71f806238507286afb9fb875637a1662c72e",
+      "headers": ["编号", "姓名", "姓名", "手机号"],
+      "rows": [["E001", "张三", "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"DUPLICATE_HEADER": 2, "MISSING_HEADER": 1}
+    },
+    {
+      "name": "empty_primary_key",
+      "input_sha256": "71d4e60e56555bd6800a81edca5607ea4298910ecd4780a2d80edfbe1572c595",
+      "headers": ["编号", "姓名", "手机号"],
+      "rows": [[null, "张三", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"EMPTY_PRIMARY_KEY": 1, "MISSING_RECORD": 1}
+    },
+    {
+      "name": "value_mismatch",
+      "input_sha256": "058c5fb2085bb8bc468d4b3ef9408da4038969715919afaef315f01f37b724b0",
+      "headers": ["编号", "姓名", "手机号"],
+      "rows": [["E001", "张三", "13800138001"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"VALUE_MISMATCH": 1}
+    },
+    {
+      "name": "header_order_mismatch",
+      "input_sha256": "d14a75585993ab873c1600325c92bb15e47cab0c6e0728d8f35c232222c998a0",
+      "headers": ["姓名", "编号", "手机号"],
+      "rows": [["张三", "E001", "13800138000"]],
+      "standard": [{"id": "E001", "name": "张三", "phone": "13800138000"}],
+      "expected": {"HEADER_ORDER_MISMATCH": 1}
+    }
+  ]
+}
