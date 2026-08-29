@@ -367,9 +367,19 @@ class SheetRule(StrictModel):
             raise ValueError(f"primary key fields do not exist: {sorted(missing)}")
         by_name = {column.name: column for column in self.columns}
         for key in self.primary_key:
-            if not by_name[key].required:
+            key_rule = by_name[key]
+            if not key_rule.required:
                 raise ValueError(f"primary key field {key!r} must be required")
-            lossy = set(by_name[key].normalize) & {"collapse_spaces", "remove_group_separator", "remove_currency_symbol"}
+            if key_rule.type == FieldType.FUZZY_STRING:
+                raise ValueError(f"primary key field {key!r} cannot use fuzzy_string")
+            if key_rule.compare.mode != "exact":
+                raise ValueError(
+                    f"primary key field {key!r} must use compare.mode=exact; "
+                    "matching keys cannot use comparison-only equivalence rules"
+                )
+            if key_rule.compare.formula_mode != "reject":
+                raise ValueError(f"primary key field {key!r} must reject formulas")
+            lossy = set(key_rule.normalize) & {"collapse_spaces", "remove_group_separator", "remove_currency_symbol"}
             if lossy:
                 raise ValueError(f"primary key field {key!r} uses potentially lossy normalizers: {sorted(lossy)}")
         for cross_rule in self.cross_field_rules:

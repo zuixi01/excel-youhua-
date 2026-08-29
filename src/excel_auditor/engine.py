@@ -200,6 +200,11 @@ def compare_workbook(
         for item in differences
         if item.rule_id and item.rule_id.endswith(".fuzzy_suggestion")
     }))
+    manual_review_reasons.extend(sorted({
+        f"{item.sheet_name}: formula_primary_key:{item.canonical_field}"
+        for item in differences
+        if item.rule_id and item.rule_id.endswith(".formula_primary_key")
+    }))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -299,6 +304,26 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             continue
         record = {name: values[index - 1] for name, index in columns.items() if index <= len(values) and values[index - 1] not in {None, ""}}
         if all(value is None or value == "" for value in record.values()):
+            continue
+        formula_key_fields = [
+            name
+            for name in sheet.primary_key
+            if isinstance(record.get(name), str) and record[name].startswith("=")
+        ]
+        if formula_key_fields:
+            for name in formula_key_fields:
+                col = columns.get(name)
+                differences.append(_difference(
+                    DifferenceType.UNSUPPORTED_FEATURE,
+                    sheet,
+                    "Primary-key formulas are not evaluated and cannot participate in automatic record matching",
+                    cell=f"{get_column_letter(col)}{row_number}" if col else None,
+                    excel_row=row_number,
+                    canonical_field=name,
+                    excel_raw_value=_safe_value(record.get(name), rules_by_name[name]),
+                    rule_id=f"{name}.formula_primary_key",
+                    render_action="mark_purple",
+                ))
             continue
         key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number)
         if not key_valid:

@@ -56,6 +56,21 @@ def test_primary_key_rejects_lossy_normalizers():
         RuleSet.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("field_update", "message"),
+    [
+        ({"compare": {"mode": "ignore_case"}}, "compare.mode=exact"),
+        ({"compare": {"formula_mode": "formula"}}, "must reject formulas"),
+        ({"type": "fuzzy_string"}, "cannot use fuzzy_string"),
+    ],
+)
+def test_primary_key_rejects_non_deterministic_matching_modes(field_update, message):
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][0].update(field_update)
+    with pytest.raises(ValidationError, match=message):
+        RuleSet.model_validate(payload)
+
+
 def test_cross_field_rule_must_reference_existing_fields():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["cross_field_rules"] = [{"rule_id": "bad", "validator": "conditional_required", "params": {"when_field": "missing", "equals": "x", "required_field": "salary"}}]

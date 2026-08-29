@@ -185,6 +185,40 @@ def test_missing_formula_cache_routes_to_manual_review(tmp_path):
     assert "formula_cached_value_missing" in " ".join(status["warnings"])
 
 
+def test_formula_primary_key_is_excluded_from_record_matching(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "formula-key", "schema_version": "1.0.0", "name": "Formula key",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+            {"name": "value", "title": "Value"},
+        ]}],
+    })
+    excel, standard = tmp_path / "formula-key.xlsx", tmp_path / "formula-key.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Value"])
+    sheet.append(['="E1"', "same"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [{"id": "E1", "value": "same"}]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "formula-key-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+
+    status = service.status(job_id)
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    primary_key_differences = [
+        item for item in report["differences"]
+        if item.get("rule_id") == "id.formula_primary_key"
+    ]
+    assert status["status"] == "manual_review"
+    assert "formula_primary_key:id" in " ".join(status["warnings"])
+    assert len(primary_key_differences) == 1
+    assert primary_key_differences[0]["type"] == "UNSUPPORTED_FEATURE"
+    assert report["record_summary"]["matched"] == 0
+
+
 def test_csv_standard_source_maps_display_headers_and_aliases(tmp_path):
     excel = tmp_path / "input.xlsx"
     standard = tmp_path / "standard.csv"
