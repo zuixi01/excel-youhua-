@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 import yaml
 from yaml.nodes import MappingNode
 
 
-def load_json_strict(document: str | bytes, *, context: str = "JSON document") -> Any:
+def load_json_strict(
+    document: str | bytes,
+    *,
+    context: str = "JSON document",
+    preserve_decimal: bool = False,
+) -> Any:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -24,6 +30,7 @@ def load_json_strict(document: str | bytes, *, context: str = "JSON document") -
             document,
             object_pairs_hook=unique_object,
             parse_constant=finite_number,
+            parse_float=Decimal if preserve_decimal else float,
         )
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"{context} is malformed") from exc

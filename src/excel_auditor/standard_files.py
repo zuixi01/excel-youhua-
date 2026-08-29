@@ -152,13 +152,13 @@ def _load_json(path: Path, rules: RuleSet, spill_after_records: int) -> dict[str
                 accumulator = _RecordAccumulator(sheet, spill_after_records)
                 accumulators.append(accumulator)
                 count = 0
-                for row in ijson.items(handle, "item", use_float=True):
+                for row in ijson.items(handle, "item", use_float=False):
                     count = _append(accumulator, row, count, rules)
                 result[sheet.id] = accumulator.detach()
                 return result
             if marker != b"{":
                 raise ValueError("STANDARD_DATA_INVALID: root must be an object or array")
-            parser = iter(ijson.parse(handle, use_float=True))
+            parser = iter(ijson.parse(handle, use_float=False))
             _expect(next(parser), "start_map", "STANDARD_DATA_INVALID: root must be an object or array")
             count = 0
             seen_input_keys: set[str] = set()

@@ -17,14 +17,14 @@
 | 5 | 缺失列确定插入并标绿，多余列保留标红 | 本地已证明 | 首/中/末 Golden 的完整表头和填充断言；Renderer before/after 合约；缺失公式列使用解析后的实际表头、数据起始行及非空目标行清单，标准公式与受信任模板不一致时转人工审核 | Excel 客户端视觉抽验 |
 | 6 | 单主键和联合主键准确匹配 | 本地已证明 | `engine.py`、属性测试；`typed_compound.xlsx` 固定 Golden；规则拒绝非精确/模糊/公式主键模式，运行时公式主键排除匹配并转人工审核 | 人工标注业务基准集 |
 | 7 | 多余/缺失记录、空/重复主键 | 本地已证明 | 核心 Golden、`test_end_to_end.py`；空主键报告/跳过/行号回退在标准校验和比较层语义一致，且行号回退不放宽其他字段校验；显式行号主键通过上传标准端到端验证并禁止错位追加，严格拒绝布尔/小数/空白/越界值；多个缺失记录验证连续行分配且互不覆盖 | 业务异常样例 |
-| 8 | 类型化比较字符串、数值、日期时间、布尔、枚举、集合 | 本地已证明 | `normalization.py`、单元/属性测试；高级类型 Golden；公式文本模式支持非字符串字段、双向公式存在性差异及标准字段省略；未格式化 Excel 日期/日期时间序列按 1900/1904 工作簿 epoch 解析；规则发布拒绝空集合分隔符和标准化后不可达的值别名/枚举；非有限 Decimal、大精度量化和大小写枚举对抗回归；自动修复按规范类型写回布尔、枚举、百分比 Decimal、时区日期时间、集合和稳定 JSON，同时保留原始审计值 | 人工标注业务基准集 |
+| 8 | 类型化比较字符串、数值、日期时间、布尔、枚举、集合 | 本地已证明 | `normalization.py`、单元/属性测试；高级类型 Golden；公式文本模式支持非字符串字段、双向公式存在性差异及标准字段省略；未格式化 Excel 日期/日期时间序列按 1900/1904 工作簿 epoch 解析；上传、内联及受管 HTTP 标准 JSON 的高精度小数 token 不经过二进制 float；规则发布拒绝空集合分隔符和标准化后不可达的值别名/枚举；非有限 Decimal、大精度量化和大小写枚举对抗回归；自动修复按规范类型写回布尔、枚举、百分比 Decimal、时区日期时间、集合和稳定 JSON，同时保留原始审计值 | 人工标注业务基准集 |
 | 9 | 字段及跨字段数据质量规则 | 本地已证明 | `pandera_adapter.py`、注册校验器；标准/Excel 统一基于规范化值校验长度、正则、枚举和可空唯一字段；发布时拒绝字段类型不支持的长度/正则/日期时间精度及无效解析格式；内置跨字段规则严格校验参数集合、条件值、字段类型和规则 ID 唯一性；`test_validation.py`、`test_adapters.py` | 业务规则清单 |
 | 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试；标准记录省略可选字段不会清空 Excel，显式空值才进入授权覆盖 | 业务方修复策略签署 |
 | 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言 | 客户端下载抽验 |
 | 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `e66788d` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 及 JUnit 制品已通过；Excel COM 自动打开/另存、关键宏部件哈希和独立人工签核工具已就绪 | Microsoft Excel 桌面实际运行及人工验收记录 |
 | 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试；最终 JSON 与 Excel 内嵌修复状态逐项一致，隐藏元数据锁定规则/输入/标准哈希及结果内容哈希；字段统计按工作表隔离同名字段，差异/校验率使用各自准确分母且内存/磁盘口径一致 | 生产审计抽样 |
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
-| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；当前本地生产 Renderer 完整回归 `264 passed, 8 skipped`；提交 `b3c04e9` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；9 组表头与 2 组记录/字段/修复人工标注 precision/recall 基准，阈值均为 99% | 本轮核心精度补强的远端 CI；业务标注基准 |
+| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；当前本地生产 Renderer 完整回归 `266 passed, 8 skipped`；提交 `b3c04e9` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；9 组表头与 2 组记录/字段/修复人工标注 precision/recall 基准，阈值均为 99% | 本轮核心精度补强的远端 CI；业务标注基准 |
 | 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `e66788d` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |
 | 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送并验证版本标签指向当前 SHA；生产 Compose 强制 API/Web 独立完整镜像引用 | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
 | 18 | 精确回滚版本与命令 | 待外部验收 | `release_manifest.py` 严格校验 API/Web 独立 digest 并生成 `release.env`；`docs/deployment.md` 使用发布前后环境制品执行精确回滚 | 发布前后真实 digest 和一次回滚演练记录 |

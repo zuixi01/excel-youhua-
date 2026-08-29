@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -59,6 +60,28 @@ def test_managed_http_spills_paginated_records_and_transfers_ownership(tmp_path)
         assert metadata["record_storage"] == "disk_spill"
     finally:
         records.close()
+
+
+def test_managed_http_preserves_high_precision_decimal_tokens(tmp_path):
+    content = b'{"data":[{"id":"1","amount":1234567890.1234567890123456789}]}'
+    source = ManagedHttpSource(
+        _registry(tmp_path),
+        httpx.MockTransport(lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=content,
+        )),
+        resolver=lambda _host: ["93.184.216.34"],
+    )
+    config = StandardSourceConfig(
+        type="managed_http",
+        connection_id="hr",
+        path="/employees",
+        data_json_path="$.data",
+    )
+
+    records = source.fetch(config)
+    assert records[0]["amount"] == Decimal("1234567890.1234567890123456789")
 
 
 def test_managed_http_closes_spill_when_record_limit_aborts(tmp_path, monkeypatch):

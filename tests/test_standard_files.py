@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,30 @@ def test_root_array_and_csv_are_streamed_for_single_sheet(tmp_path):
     finally:
         _close(json_standard)
         _close(csv_standard)
+
+
+def test_uploaded_json_preserves_high_precision_decimal_tokens(tmp_path):
+    path = tmp_path / "precise.json"
+    path.write_text(
+        '{"data":[{"id":"E1","amount":1234567890.1234567890123456789}]}',
+        encoding="utf-8",
+    )
+    rules = RuleSet.model_validate({
+        "schema_id": "precise", "schema_version": "1.0.0", "name": "Precise",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "decimal"},
+            ],
+        }],
+    })
+
+    standard = load_standard_file(path, rules, spill_after_records=10)
+    try:
+        assert standard["data"][0]["amount"] == Decimal("1234567890.1234567890123456789")
+    finally:
+        _close(standard)
 
 
 @pytest.mark.parametrize("suffix", [".json", ".csv"])

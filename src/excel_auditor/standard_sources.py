@@ -249,7 +249,11 @@ def _load_secret(reference: str) -> str:
 
 def _strict_json_loads(content: bytes) -> Any:
     try:
-        return load_json_strict(content, context="STANDARD_SOURCE_FAILED: response JSON")
+        return load_json_strict(
+            content,
+            context="STANDARD_SOURCE_FAILED: response JSON",
+            preserve_decimal=True,
+        )
     except ValueError as exc:
         if "duplicate key" in str(exc):
             raise ValueError("STANDARD_SOURCE_FAILED: response JSON has a duplicate object key") from exc

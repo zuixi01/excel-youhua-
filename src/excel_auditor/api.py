@@ -370,12 +370,25 @@ async def create_comparison(
         if len(encoded) > rules.workbook.max_standard_upload_mib * 1024 * 1024:
             raise HTTPException(413, "STANDARD_DATA_INVALID: payload too large")
         try:
-            inline_payload = load_json_strict(standard_json, context="inline standard JSON")
+            inline_payload = load_json_strict(
+                standard_json,
+                context="inline standard JSON",
+                preserve_decimal=True,
+            )
         except ValueError as exc:
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json is not valid JSON") from exc
         if not isinstance(inline_payload, (dict, list)):
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json root must be an object or array")
-        standard_content = json.dumps(inline_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        # Canonicalize the inline payload for idempotency while retaining exact
+        # Decimal text. The staged JSON parser accepts decimal strings, and the
+        # immutable snapshot uses the same representation.
+        standard_content = json.dumps(
+            inline_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
         standard_suffix = ".json"
     elif rules.standard_source.type != "managed_http":
         raise HTTPException(422, "standard_data is required for upload-based rules")

@@ -87,13 +87,20 @@ def test_publish_create_and_download_api(tmp_path, monkeypatch):
         data={
             "schema_id": "employee-roster",
             "schema_version": "1.0.0",
-            "standard_json": json.dumps({"employees": [{"employee_id": "E001", "employee_name": "张三", "salary": "100", "department": "技术部"}]}),
+            "standard_json": '{"employees":[{"employee_id":"E001","employee_name":"张三","salary":100.1234567890123456789,"department":"技术部"}]}',
         },
         files={"excel_file": ("input.xlsx", workbook_path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     )
     assert inline.status_code == 202, inline.text
     inline_job = inline.json()["job_id"]
     assert client.get(f"/api/v1/comparisons/{inline_job}").json()["status"] == "completed"
+    inline_report = client.get(f"/api/v1/comparisons/{inline_job}/artifacts/json").json()
+    salary_mismatch = next(
+        item
+        for item in inline_report["differences"]
+        if item["canonical_field"] == "salary" and item["type"] == "VALUE_MISMATCH"
+    )
+    assert salary_mismatch["standard_raw_value"] == "100.1234567890123456789"
     duplicate_inline = client.post(
         "/api/v1/comparisons",
         data={
