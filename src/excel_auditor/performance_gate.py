@@ -83,7 +83,11 @@ def main() -> int:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--max-time-ratio", type=float, default=0.25)
     parser.add_argument("--time-slack-seconds", type=float, default=5.0)
-    parser.add_argument("--time-metric", choices=("elapsed_seconds", "cpu_seconds"), default="elapsed_seconds")
+    parser.add_argument(
+        "--time-metric",
+        choices=("elapsed_seconds", "cpu_seconds", "normalized_cpu_units"),
+        default="elapsed_seconds",
+    )
     parser.add_argument("--max-memory-ratio", type=float)
     parser.add_argument("--memory-slack-mib", type=float, default=64.0)
     args = parser.parse_args()

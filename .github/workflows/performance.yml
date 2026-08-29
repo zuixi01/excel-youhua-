@@ -87,10 +87,10 @@ jobs:
           RESULT: performance-${{ matrix.rows }}x${{ matrix.columns }}-${{ matrix.sheets }}s-${{ matrix.density }}-${{ matrix.difference_rate }}.json
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir performance-reference
-          if jq -e '.benchmark_version == 3' "performance-reference/$RESULT" >/dev/null; then
+          if jq -e '.benchmark_version == 4 and has("normalized_cpu_units")' "performance-reference/$RESULT" >/dev/null; then
             echo "compatible=1" >> "$GITHUB_OUTPUT"
           elif [ "$REQUIRE_REFERENCE" = "1" ]; then
-            echo "A release requires a benchmark-version 3 performance reference." >&2
+            echo "A release requires a benchmark-version 4 normalized performance reference." >&2
             exit 1
           else
             echo "compatible=0" >> "$GITHUB_OUTPUT"
@@ -115,7 +115,7 @@ jobs:
           uv run --frozen python -m excel_auditor.performance_gate
           --current "$RESULT"
           --reference "performance-reference/$RESULT"
-          --time-metric cpu_seconds
+          --time-metric normalized_cpu_units
           --max-time-ratio 0.25
           --time-slack-seconds 5
           --max-memory-ratio 0.25

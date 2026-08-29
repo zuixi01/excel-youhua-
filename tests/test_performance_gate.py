@@ -1,6 +1,9 @@
+import json
+import sys
+
 import pytest
 
-from excel_auditor.performance_gate import MetricLimit, PerformanceGateError, compare_performance
+from excel_auditor.performance_gate import MetricLimit, PerformanceGateError, compare_performance, main
 
 
 def _workbook(elapsed=10.0, memory=100.0, **overrides):
@@ -48,3 +51,19 @@ def test_performance_gate_refuses_mismatched_or_invalid_reference():
         compare_performance(_workbook(benchmark_version=3), _workbook(benchmark_version=2), [MetricLimit("elapsed_seconds", 0.25, 5.0)])
     with pytest.raises(PerformanceGateError, match="must be positive"):
         compare_performance(_workbook(), _workbook(elapsed=0), [MetricLimit("elapsed_seconds", 0.25, 5.0)])
+
+
+def test_cli_accepts_normalized_cpu_metric(tmp_path, monkeypatch):
+    reference = _workbook(benchmark_version=4, normalized_cpu_units=50.0)
+    current = _workbook(benchmark_version=4, normalized_cpu_units=55.0)
+    reference_path = tmp_path / "reference.json"
+    current_path = tmp_path / "current.json"
+    reference_path.write_text(json.dumps(reference), encoding="utf-8")
+    current_path.write_text(json.dumps(current), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "performance-gate",
+        "--current", str(current_path),
+        "--reference", str(reference_path),
+        "--time-metric", "normalized_cpu_units",
+    ])
+    assert main() == 0

@@ -74,6 +74,7 @@ def test_configured_workbook_baseline(tmp_path):
             worksheet.append([excel_record.get(column["name"]) for column in columns])
             global_index += 1
     book.save(path)
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
     process = psutil.Process()
     baseline_rss = process.memory_info().rss
     peak_rss = [baseline_rss]
@@ -93,7 +94,7 @@ def test_configured_workbook_baseline(tmp_path):
     elapsed = time.perf_counter() - started
     cpu_seconds = time.process_time() - cpu_started
     stopped.set(); sampler.join()
-    metrics = {"benchmark_version": 3, "rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "cpu_seconds": round(cpu_seconds, 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
+    metrics = {"benchmark_version": 4, "rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "cpu_calibration_seconds": round(cpu_calibration_seconds, 6), "cpu_seconds": round(cpu_seconds, 3), "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
     print(metrics)
     if output := os.environ.get("PERF_RESULT_PATH"):
         Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
