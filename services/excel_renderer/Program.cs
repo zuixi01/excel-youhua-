@@ -546,6 +546,28 @@ static void UpdateColumnDependentReferences(WorkbookPart workbookPart, Worksheet
         foreach (var cell in formulaPart.Worksheet?.Descendants<Cell>() ?? [])
             if (cell.CellFormula?.Text is string formula)
                 cell.CellFormula.Text = ShiftFormulaForInsertedColumn(formula, currentSheetName, sheetName, target);
+        if (!ReferenceEquals(formulaPart, worksheetPart))
+        {
+            foreach (var validation in formulaPart.Worksheet?.Descendants<DataValidation>() ?? [])
+            {
+                if (validation.Formula1?.Text is string formula1) validation.Formula1.Text = ShiftFormulaForInsertedColumn(formula1, currentSheetName, sheetName, target);
+                if (validation.Formula2?.Text is string formula2) validation.Formula2.Text = ShiftFormulaForInsertedColumn(formula2, currentSheetName, sheetName, target);
+            }
+            foreach (var conditional in formulaPart.Worksheet?.Elements<ConditionalFormatting>() ?? [])
+                foreach (var formula in conditional.Descendants<Formula>())
+                    if (formula.Text is string text) formula.Text = ShiftFormulaForInsertedColumn(text, currentSheetName, sheetName, target);
+            foreach (var hyperlink in formulaPart.Worksheet?.Descendants<Hyperlink>() ?? [])
+                if (hyperlink.Location?.Value is string location)
+                    hyperlink.Location = ShiftFormulaForInsertedColumn(location, currentSheetName, sheetName, target);
+        }
+        foreach (var tablePart in formulaPart.TableDefinitionParts)
+        {
+            foreach (var formula in tablePart.Table?.Descendants<CalculatedColumnFormula>() ?? [])
+                if (formula.Text is string text) formula.Text = ShiftFormulaForInsertedColumn(text, currentSheetName, sheetName, target);
+            foreach (var formula in tablePart.Table?.Descendants<TotalsRowFormula>() ?? [])
+                if (formula.Text is string text) formula.Text = ShiftFormulaForInsertedColumn(text, currentSheetName, sheetName, target);
+            tablePart.Table?.Save();
+        }
         formulaPart.Worksheet?.Save();
     }
     var targetSheetIndex = (workbook.Sheets?.Elements<Sheet>() ?? []).Select((item, index) => (item, index))
@@ -579,6 +601,27 @@ static void EnsureInsertCanBeMaintained(WorkbookPart workbookPart, WorksheetPart
             || HasUnsupportedFormulaReference(formula.Text ?? ""))
             throw new InvalidDataException("UNSUPPORTED_FEATURE: complex, shared, or array formulas cannot be safely rewritten during column insertion");
     }
+    foreach (var worksheet in workbookPart.WorksheetParts)
+    {
+        foreach (var validation in worksheet.Worksheet?.Descendants<DataValidation>() ?? [])
+        {
+            EnsureDependentFormulaCanBeShifted(validation.Formula1?.Text, "data validation");
+            EnsureDependentFormulaCanBeShifted(validation.Formula2?.Text, "data validation");
+        }
+        foreach (var conditional in worksheet.Worksheet?.Elements<ConditionalFormatting>() ?? [])
+            foreach (var formula in conditional.Descendants<Formula>())
+                EnsureDependentFormulaCanBeShifted(formula.Text, "conditional formatting");
+        foreach (var hyperlink in worksheet.Worksheet?.Descendants<Hyperlink>() ?? [])
+            EnsureDependentFormulaCanBeShifted(hyperlink.Location?.Value, "internal hyperlink");
+    }
+    foreach (var definedName in workbookPart.Workbook?.DefinedNames?.Elements<DefinedName>() ?? [])
+        EnsureDependentFormulaCanBeShifted(definedName.Text, "defined name");
+}
+
+static void EnsureDependentFormulaCanBeShifted(string? formula, string source)
+{
+    if (!String.IsNullOrWhiteSpace(formula) && HasUnsupportedFormulaReference(formula))
+        throw new InvalidDataException($"UNSUPPORTED_FEATURE: complex {source} formula cannot be safely rewritten during column insertion");
 }
 
 static bool HasUnsupportedFormulaReference(string formula) =>

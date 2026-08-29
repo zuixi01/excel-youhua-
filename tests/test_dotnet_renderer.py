@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table
@@ -188,6 +189,7 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     validation = DataValidation(type="whole", operator="greaterThan", formula1="0")
     validation.add("C2:C3")
     sheet.add_data_validation(validation)
+    sheet.conditional_formatting.add("B2:B3", FormulaRule(formula=["B2>0"]))
     sheet.auto_filter.ref = "A1:E3"
     sheet.auto_filter.add_filter_column(2, ["5"])
     sheet.freeze_panes = "C2"
@@ -199,6 +201,10 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     other = book.create_sheet("汇总")
     other["A1"] = "=结构!B2+'结构'!C2"
     other["A2"] = "=B1"
+    other.conditional_formatting.add("A1", FormulaRule(formula=["结构!B2>0"]))
+    cross_validation = DataValidation(type="custom", formula1="=结构!B2>0")
+    cross_validation.add("A1")
+    other.add_data_validation(cross_validation)
     sheet["G2"] = "=汇总!B1+结构!B2"
     book.save(source)
     manifest_path.write_text(json.dumps({
@@ -212,6 +218,9 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     assert result_sheet.tables["DataTable"].ref == "A1:D3"
     assert [column.name for column in result_sheet.tables["DataTable"].tableColumns] == ["编号", "部门", "数量", "单价"]
     assert str(result_sheet.data_validations.dataValidation[0].sqref) == "D2:D3"
+    target_conditional = next(iter(result_sheet.conditional_formatting))
+    assert str(target_conditional.sqref) == "C2:C3"
+    assert result_sheet.conditional_formatting[target_conditional][0].formula == ["C2>0"]
     assert result_sheet.auto_filter.ref == "A1:F3"
     assert result_sheet.auto_filter.filterColumn[0].colId == 3
     assert result_sheet.freeze_panes == "D2"
@@ -226,7 +235,38 @@ def test_dotnet_renderer_updates_table_validation_defined_name_and_formula_range
     assert result_sheet["H2"].value == "=汇总!B1+结构!C2"
     assert rendered["汇总"]["A1"].value == "=结构!C2+'结构'!D2"
     assert rendered["汇总"]["A2"].value == "=B1"
+    cross_sheet = rendered["汇总"]
+    cross_conditional = next(iter(cross_sheet.conditional_formatting))
+    assert str(cross_conditional.sqref) == "A1"
+    assert cross_sheet.conditional_formatting[cross_conditional][0].formula == ["结构!C2>0"]
+    assert cross_sheet.data_validations.dataValidation[0].formula1 == "=结构!C2>0"
     rendered.close()
+
+
+def test_dotnet_renderer_rejects_complex_conditional_formatting_formula(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "conditional.xlsx", tmp_path / "conditional-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["E1", 1])
+    sheet.conditional_formatting.add("B2", FormulaRule(formula=["SUM(B:B)>0"]))
+    book.save(source)
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0", "job_id": "job_conditional", "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "score", "header_row": 1, "header_value": "Score", "fill_color": "D9EAD3"}],
+    }), encoding="utf-8")
+
+    completed = subprocess.run([command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)], capture_output=True, text=True, check=False)
+
+    assert completed.returncode != 0
+    failure = json.loads(completed.stderr)
+    assert failure["error_code"] == "UNSUPPORTED_FEATURE"
+    assert "conditional formatting" in failure["message"]
+    assert not output.exists()
 
 
 def test_dotnet_renderer_supports_insert_after_contract(tmp_path):
