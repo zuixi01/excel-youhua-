@@ -333,7 +333,7 @@ class SheetRule(StrictModel):
     data_region: DataRegionRule = Field(default_factory=DataRegionRule)
     primary_key: list[str] = Field(default_factory=list)
     primary_key_mode: Literal["fields", "row_number"] = "fields"
-    row_number_field: str = "__row_number__"
+    row_number_field: str = Field(default="__row_number__", min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
     empty_primary_key_action: Literal["report_invalid", "skip_row", "use_row_number"] = "report_invalid"
     columns: list[ColumnRule] = Field(min_length=1)
     cross_field_rules: list[CrossFieldRule] = Field(default_factory=list)
@@ -362,6 +362,8 @@ class SheetRule(StrictModel):
             raise ValueError("field primary key mode requires at least one primary key field")
         if self.primary_key_mode == "row_number" and self.primary_key:
             raise ValueError("row_number primary key mode must not also declare primary_key fields")
+        if self.primary_key_mode == "row_number" and self.empty_primary_key_action != "report_invalid":
+            raise ValueError("row_number primary key mode cannot use an empty primary key fallback action")
         missing = set(self.primary_key) - set(names)
         if missing:
             raise ValueError(f"primary key fields do not exist: {sorted(missing)}")
@@ -395,6 +397,12 @@ class SheetRule(StrictModel):
                 if owner is not None and owner != column.name:
                     raise ValueError(f"header alias collision: {raw!r} maps to {owner!r} and {column.name!r}")
                 normalized[key] = column.name
+        if self.primary_key_mode == "row_number":
+            row_field_owner = normalized.get(normalize_header(self.row_number_field))
+            if row_field_owner is not None and row_field_owner != self.row_number_field:
+                raise ValueError(
+                    f"row_number_field {self.row_number_field!r} collides with column {row_field_owner!r}"
+                )
         return self
 
 

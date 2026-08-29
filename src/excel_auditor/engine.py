@@ -449,11 +449,23 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             key = standard_reference
             record = standard_records[key]
         duplicate_in_excel = key in excel_duplicates
-        append = sheet.actions.missing_record == "append_and_mark_green" and not duplicate_in_excel
+        requested_row = key[0][1] if sheet.primary_key_mode == "row_number" else append_row
+        append = (
+            sheet.actions.missing_record == "append_and_mark_green"
+            and not duplicate_in_excel
+            and requested_row == append_row
+        )
+        row_number_mismatch = sheet.primary_key_mode == "row_number" and requested_row != append_row
+        if row_number_mismatch:
+            missing_message = "标准数据行号与可追加物理行不一致，禁止自动追加"
+        elif duplicate_in_excel:
+            missing_message = "标准数据存在但 Excel 主键重复，禁止自动追加"
+        else:
+            missing_message = "标准数据存在但 Excel 缺失的记录"
         difference = _difference(
             DifferenceType.MISSING_RECORD,
             sheet,
-            "标准数据存在但 Excel 主键重复，禁止自动追加" if duplicate_in_excel else "标准数据存在但 Excel 缺失的记录",
+            missing_message,
             excel_row=append_row if append else None,
             business_key=_business_key(key, sheet),
             standard_raw_value=_safe_record(record, rules_by_name),

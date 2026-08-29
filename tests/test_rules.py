@@ -112,6 +112,22 @@ def test_unsafe_schema_id_and_cross_sheet_alias_collision_are_rejected():
     with pytest.raises(ValidationError, match="shared by sheets"):
         RuleSet.model_validate(payload)
 
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0].update({"primary_key": [], "primary_key_mode": "row_number", "row_number_field": "../row"})
+    with pytest.raises(ValidationError, match="row_number_field"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0].update({"primary_key": [], "primary_key_mode": "row_number", "row_number_field": "row", "empty_primary_key_action": "skip_row"})
+    with pytest.raises(ValidationError, match="fallback action"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][0]["aliases"].append("row")
+    payload["sheets"][0].update({"primary_key": [], "primary_key_mode": "row_number", "row_number_field": "row"})
+    with pytest.raises(ValidationError, match="collides with column"):
+        RuleSet.model_validate(payload)
+
 
 def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
     payload = load_rules(EXAMPLE).model_dump(mode="json")

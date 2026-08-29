@@ -84,6 +84,15 @@ def canonicalize_standard_row(
                     f"STANDARD_DATA_INVALID: {sheet.id}.{column.name} has conflicting field representations{location}"
                 )
         canonical[column.name] = row[matched_keys[0]]
+    if sheet.primary_key_mode == "row_number" and sheet.row_number_field not in canonical:
+        matched_row_fields = normalized_keys.get(normalize_header(sheet.row_number_field), [])
+        if len(matched_row_fields) > 1:
+            location = f" at record {record_index}" if record_index is not None else ""
+            raise ValueError(
+                f"STANDARD_DATA_INVALID: {sheet.id}.{sheet.row_number_field} has conflicting field representations{location}"
+            )
+        if matched_row_fields:
+            canonical[sheet.row_number_field] = row[matched_row_fields[0]]
     return canonical
 
 

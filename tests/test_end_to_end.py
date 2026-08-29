@@ -233,6 +233,36 @@ def test_csv_standard_source_maps_display_headers_and_aliases(tmp_path):
     assert status["summary"]["mismatched_cells"] == 0
 
 
+def test_row_number_primary_key_survives_uploaded_standard_canonicalization(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "row-number", "schema_version": "1.0.0", "name": "Row number",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key_mode": "row_number",
+            "columns": [{"name": "value", "title": "Value"}],
+        }],
+    })
+    excel, standard = tmp_path / "row-number.xlsx", tmp_path / "row-number.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Value"])
+    sheet.append(["A"])
+    sheet.append(["B"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [
+        {"__row_number__": 2, "value": "A"},
+        {"__row_number__": 3, "value": "B"},
+    ]}), encoding="utf-8")
+    service = AuditService(tmp_path / "row-number-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["matched_records"] == 2
+    assert status["summary"]["differences"] == 0
+
+
 def test_fuzzy_header_suggestion_requires_manual_review(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "fuzzy-header", "schema_version": "1.0.0", "name": "Fuzzy header",

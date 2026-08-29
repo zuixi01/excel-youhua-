@@ -207,6 +207,36 @@ def test_row_number_fallback_only_relaxes_the_empty_business_key():
         validator.validate({"data": [{"id": None, "amount": "not-an-integer"}]}, rules)
 
 
+def test_row_number_primary_key_never_appends_to_a_different_physical_row(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "row-number-append", "schema_version": "1.0.0", "name": "Row append",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key_mode": "row_number",
+            "actions": {"missing_record": "append_and_mark_green"},
+            "columns": [{"name": "value", "title": "Value"}],
+        }],
+    })
+    path = tmp_path / "row-number-append.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Value"])
+    sheet.append(["A"])
+    book.save(path)
+    standard = {"data": [
+        {"__row_number__": 2, "value": "A"},
+        {"__row_number__": 5, "value": "must-not-be-written-to-row-3"},
+    ]}
+
+    result = compare_workbook(inspect_workbook(path, rules), standard, rules)
+    missing = next(item for item in result.differences if item.type.value == "MISSING_RECORD")
+    assert missing.business_key == {"__row_number__": 5}
+    assert missing.render_action == "report_only"
+    assert missing.repair_status == "not_requested"
+    assert "物理行不一致" in missing.message
+    assert not result.repairs
+
+
 def test_standard_validation_is_chunked_and_checks_uniqueness_across_chunks():
     rules = RuleSet.model_validate({
         "schema_id": "chunked-standard",
