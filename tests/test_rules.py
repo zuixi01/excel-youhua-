@@ -98,7 +98,14 @@ def test_builtin_cross_field_rules_have_strict_typed_parameter_contracts():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     rule = {"rule_id": "order", "validator": "date_order", "params": {"start_field": "hire_date", "end_field": "employee_name"}}
     payload["sheets"][0]["cross_field_rules"] = [rule]
-    with pytest.raises(ValidationError, match="requires date fields of the same type"):
+    with pytest.raises(ValidationError, match="requires comparable date fields of the same type"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][3]["compare"]["formula_mode"] = "formula"
+    rule = {"rule_id": "formula-order", "validator": "date_order", "params": {"start_field": "hire_date", "end_field": "hire_date"}}
+    payload["sheets"][0]["cross_field_rules"] = [rule]
+    with pytest.raises(ValidationError, match="requires comparable date fields"):
         RuleSet.model_validate(payload)
 
     payload = load_rules(EXAMPLE).model_dump(mode="json")

@@ -20,7 +20,7 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, parse_value, values_equal
+from .normalization import ParsedValue, is_formula_text, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
@@ -220,6 +220,11 @@ def compare_workbook(
         f"{item.sheet_name}: formula_primary_key:{item.canonical_field}"
         for item in differences
         if item.rule_id and item.rule_id.endswith(".formula_primary_key")
+    }))
+    manual_review_reasons.extend(sorted({
+        f"{item.sheet_name}: formula_append_requires_trusted_template"
+        for item in differences
+        if item.rule_id == "missing_record.formula_template_required"
     }))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
@@ -435,18 +440,38 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             record = standard_records[key]
         duplicate_in_excel = key in excel_duplicates
         requested_row = key[0][1] if sheet.primary_key_mode == "row_number" else append_row
+        unsafe_formula_fields = [
+            name
+            for name, rule in rules_by_name.items()
+            if rule.compare.formula_mode == "formula"
+            and is_formula_text(record.get(name))
+            and (
+                rule.formula_template is None
+                or rule.formula_template.replace("{row}", str(append_row)) != record.get(name)
+            )
+        ]
+        formula_append_blocked = bool(unsafe_formula_fields) and sheet.actions.missing_record == "append_and_mark_green"
         append = (
             sheet.actions.missing_record == "append_and_mark_green"
             and not duplicate_in_excel
             and requested_row == append_row
+            and not formula_append_blocked
         )
         row_number_mismatch = sheet.primary_key_mode == "row_number" and requested_row != append_row
         if row_number_mismatch:
             missing_message = "标准数据行号与可追加物理行不一致，禁止自动追加"
         elif duplicate_in_excel:
             missing_message = "标准数据存在但 Excel 主键重复，禁止自动追加"
+        elif formula_append_blocked:
+            missing_message = f"标准记录包含无法由受信任模板重建的公式字段 {unsafe_formula_fields}，禁止自动追加"
         else:
             missing_message = "标准数据存在但 Excel 缺失的记录"
+        if append:
+            missing_rule_id = "missing_record.append"
+        elif formula_append_blocked:
+            missing_rule_id = "missing_record.formula_template_required"
+        else:
+            missing_rule_id = None
         difference = _difference(
             DifferenceType.MISSING_RECORD,
             sheet,
@@ -454,7 +479,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             excel_row=append_row if append else None,
             business_key=_business_key(key, sheet),
             standard_raw_value=_safe_record(record, rules_by_name),
-            rule_id="missing_record.append" if append else None,
+            rule_id=missing_rule_id,
             render_action="append_row_green" if append else "report_only",
             repair_status="planned" if append else "not_requested",
         )
@@ -505,26 +530,6 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             left_raw = excel_record.get(name)
             right_raw = standard_record.get(name)
             cell = f"{get_column_letter(col_index)}{row_number}"
-            if isinstance(left_raw, str) and left_raw.startswith("="):
-                if rule.compare.formula_mode == "reject":
-                    continue
-                if rule.compare.formula_mode == "formula":
-                    if left_raw != right_raw:
-                        differences.append(_difference(
-                            DifferenceType.VALUE_MISMATCH,
-                            sheet,
-                            "公式文本与标准公式不一致；系统未执行公式",
-                            cell=cell,
-                            excel_row=row_number,
-                            canonical_field=name,
-                            business_key=_business_key(key, sheet),
-                            excel_raw_value=_safe_value(left_raw, rule),
-                            standard_raw_value=_safe_value(right_raw, rule),
-                            rule_id=f"{name}.formula_text",
-                            render_action=sheet.actions.mismatched_value,
-                        ))
-                    continue
-                left_raw = snapshot.cached_values.get(cell)
             # An omitted optional standard field means the source supplied no
             # authoritative value. Preserve the distinction from an explicit
             # null/empty value so overwrite_mismatch cannot silently clear data.
@@ -532,6 +537,28 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 (left_raw is None or left_raw == "") and rule.fill_static_default
             ):
                 continue
+            left_is_formula = is_formula_text(left_raw)
+            right_is_formula = is_formula_text(right_raw)
+            if rule.compare.formula_mode == "formula" and (left_is_formula or right_is_formula):
+                if not (left_is_formula and right_is_formula and left_raw == right_raw):
+                    differences.append(_difference(
+                        DifferenceType.VALUE_MISMATCH,
+                        sheet,
+                        "公式存在性或公式文本与标准不一致；系统未执行公式",
+                        cell=cell,
+                        excel_row=row_number,
+                        canonical_field=name,
+                        business_key=_business_key(key, sheet),
+                        excel_raw_value=_safe_value(left_raw, rule),
+                        standard_raw_value=_safe_value(right_raw, rule),
+                        rule_id=f"{name}.formula_text",
+                        render_action=sheet.actions.mismatched_value,
+                    ))
+                continue
+            if left_is_formula:
+                if rule.compare.formula_mode == "reject":
+                    continue
+                left_raw = snapshot.cached_values.get(cell)
             if (left_raw is None or left_raw == "") and (right_raw is None or right_raw == "") and not rule.fill_static_default:
                 continue
             left = parse_value(left_raw, rule)

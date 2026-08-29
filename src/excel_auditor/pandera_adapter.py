@@ -9,7 +9,7 @@ import pandas as pd
 import pandera.pandas as pa
 
 from .models import RuleSet, SheetRule
-from .normalization import parse_value
+from .normalization import is_formula_text, parse_value
 from .validators import run_validator
 
 
@@ -86,8 +86,11 @@ class StandardDataValidator:
             if StandardDataValidator._skip_empty_primary_key_row(row, sheet):
                 continue
             for rule in sheet.columns:
-                parsed = parse_value(row.get(rule.name), rule)
+                raw = row.get(rule.name)
+                parsed = parse_value(raw, rule)
                 invalid = not parsed.valid
+                if rule.compare.formula_mode == "formula" and is_formula_text(raw):
+                    continue
                 if parsed.valid and parsed.normalized is None:
                     row_number_fallback = (
                         sheet.primary_key_mode == "fields"

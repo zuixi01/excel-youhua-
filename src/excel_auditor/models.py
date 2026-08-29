@@ -512,9 +512,14 @@ class SheetRule(StrictModel):
             if cross_rule.validator == "date_order":
                 start_rule = by_name[cross_rule.params["start_field"]]
                 end_rule = by_name[cross_rule.params["end_field"]]
-                if start_rule.type not in {FieldType.DATE, FieldType.DATETIME} or end_rule.type != start_rule.type:
+                if (
+                    start_rule.type not in {FieldType.DATE, FieldType.DATETIME}
+                    or end_rule.type != start_rule.type
+                    or start_rule.compare.formula_mode == "formula"
+                    or end_rule.compare.formula_mode == "formula"
+                ):
                     raise ValueError(
-                        f"cross-field rule {cross_rule.rule_id!r} requires date fields of the same type"
+                        f"cross-field rule {cross_rule.rule_id!r} requires comparable date fields of the same type"
                     )
         cross_rule_ids = [rule.rule_id for rule in self.cross_field_rules]
         if len(cross_rule_ids) != len(set(cross_rule_ids)):

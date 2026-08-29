@@ -20,6 +20,10 @@ class ParsedValue:
     error: str | None = None
 
 
+def is_formula_text(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
@@ -51,6 +55,8 @@ def apply_normalizers(value: Any, names: list[str]) -> Any:
 
 def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
     try:
+        if rule.compare.formula_mode == "formula" and is_formula_text(value):
+            return ParsedValue(value, value, True)
         normalized = apply_normalizers(value, rule.normalize)
         if rule.regex_replacements and normalized is not None:
             text = str(normalized)

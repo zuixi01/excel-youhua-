@@ -161,6 +161,102 @@ def test_formula_text_mode_compares_without_executing_formula(tmp_path):
     rendered.close()
 
 
+def test_formula_text_mode_supports_typed_fields_and_is_symmetric(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "typed-formula", "schema_version": "1.0.0", "name": "Typed formula",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"overwrite_mismatch": True},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "decimal", "compare": {"mode": "numeric", "formula_mode": "formula"}},
+            ],
+        }],
+    })
+    excel, standard = tmp_path / "typed-formula.xlsx", tmp_path / "typed-formula.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["E1", "=1+1"])
+    sheet.append(["E2", 2])
+    sheet.append(["E3", "=2+2"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [
+        {"id": "E1", "amount": "=1+1"},
+        {"id": "E2", "amount": "=1+1"},
+        {"id": "E3"},
+    ]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "typed-formula-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["mismatched_cells"] == 1
+    assert status["summary"]["repairs_planned"] == 0
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    mismatch = next(item for item in report["differences"] if item["type"] == "VALUE_MISMATCH")
+    assert mismatch["business_key"] == {"id": "E2"}
+    assert mismatch["rule_id"] == "amount.formula_text"
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    assert rendered["Data"]["B2"].value == "=1+1"
+    assert rendered["Data"]["B3"].value == 2
+    assert rendered["Data"]["B4"].value == "=2+2"
+    rendered.close()
+
+
+def test_formula_record_append_requires_a_matching_trusted_template(tmp_path):
+    def rules_for(template=None):
+        column = {
+            "name": "amount", "title": "Amount", "type": "decimal",
+            "compare": {"mode": "numeric", "formula_mode": "formula"},
+        }
+        if template is not None:
+            column["formula_template"] = template
+        return RuleSet.model_validate({
+            "schema_id": "formula-append", "schema_version": "1.0.0", "name": "Formula append",
+            "sheets": [{
+                "id": "data", "name": "Data", "primary_key": ["id"],
+                "actions": {"missing_record": "append_and_mark_green"},
+                "columns": [{"name": "id", "title": "ID", "required": True}, column],
+            }],
+        })
+
+    excel = tmp_path / "formula-append.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    book.save(excel)
+    unsafe_standard = tmp_path / "unsafe-formula.json"
+    unsafe_standard.write_text(json.dumps({"data": [{"id": "E1", "amount": "=1+1"}]}), encoding="utf-8")
+    unsafe_service = AuditService(tmp_path / "unsafe-formula-runtime")
+    unsafe_job = unsafe_service.create_job()
+    unsafe_service.run(unsafe_job, excel, unsafe_standard, rules_for())
+    unsafe_status = unsafe_service.status(unsafe_job)
+    assert unsafe_status["status"] == "manual_review"
+    assert "excel" not in unsafe_status["artifacts"]
+    unsafe_report = json.loads(unsafe_service.artifact(unsafe_job, "json").read_text(encoding="utf-8"))
+    missing = next(item for item in unsafe_report["differences"] if item["type"] == "MISSING_RECORD")
+    assert missing["rule_id"] == "missing_record.formula_template_required"
+    assert missing["repair_status"] == "not_requested"
+
+    trusted_standard = tmp_path / "trusted-formula.json"
+    trusted_standard.write_text(json.dumps({"data": [{"id": "E1", "amount": "=ROW()+2"}]}), encoding="utf-8")
+    trusted_service = AuditService(tmp_path / "trusted-formula-runtime")
+    trusted_job = trusted_service.create_job()
+    trusted_service.run(trusted_job, excel, trusted_standard, rules_for("=ROW()+{row}"))
+    trusted_status = trusted_service.status(trusted_job)
+    assert trusted_status["status"] == "completed", trusted_status
+    assert trusted_status["summary"]["repairs_applied"] == 1
+    rendered = load_workbook(trusted_service.artifact(trusted_job, "excel"), data_only=False)
+    assert rendered["Data"]["A2"].value == "E1"
+    assert rendered["Data"]["B2"].value == "=ROW()+2"
+    assert rendered["Data"]["B2"].data_type == "f"
+    rendered.close()
+
+
 def test_missing_formula_cache_routes_to_manual_review(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "formula-cache", "schema_version": "1.0.0", "name": "Formula Cache",
@@ -320,6 +416,51 @@ def test_duplicate_primary_key_is_never_auto_appended(tmp_path):
     assert "禁止自动追加" in missing["message"]
     rendered = load_workbook(service.artifact(job_id, "excel"))
     assert rendered["Data"].max_row == 3
+    rendered.close()
+
+
+def test_multiple_missing_records_append_to_distinct_consecutive_rows(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "multi-append", "schema_version": "1.0.0", "name": "Multi append",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "actions": {"missing_record": "append_and_mark_green"},
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "name", "title": "Name"},
+            ],
+        }],
+    })
+    excel, standard = tmp_path / "multi-append.xlsx", tmp_path / "multi-append.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Name"])
+    sheet.append(["E0", "Existing"])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [
+        {"id": "E0", "name": "Existing"},
+        {"id": "E1", "name": "First"},
+        {"id": "E2", "name": "Second"},
+        {"id": "E3", "name": "Third"},
+    ]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "multi-append-runtime")
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["missing_records"] == 3
+    assert status["summary"]["repairs_applied"] == 3
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    appended_rows = sorted(
+        item["excel_row"] for item in report["differences"]
+        if item["type"] == "MISSING_RECORD" and item["repair_status"] == "applied"
+    )
+    assert appended_rows == [3, 4, 5]
+    rendered = load_workbook(service.artifact(job_id, "excel"))
+    assert [rendered["Data"].cell(row, 1).value for row in range(2, 6)] == ["E0", "E1", "E2", "E3"]
+    assert [rendered["Data"].cell(row, 2).value for row in range(2, 6)] == ["Existing", "First", "Second", "Third"]
     rendered.close()
 
 
