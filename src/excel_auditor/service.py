@@ -849,6 +849,15 @@ def _manifest(
                 "number_format": None if header_rename else _number_format(column_rule),
                 "timezone": None if header_rename else _datetime_timezone(column_rule),
             })
+        elif repair.type == "set_number_format":
+            repair_operations.append({
+                "type": "set_number_format",
+                "sheet": repair.sheet_name,
+                "cell": repair.cell,
+                "number_format": repair.value,
+                "comment": repair_comment,
+                "difference_id": repair.difference_id,
+            })
         elif repair.type == "set_field":
             column = final_columns_by_sheet.get(repair.sheet_id, {}).get(repair.canonical_field or "")
             if column is None or repair.excel_row is None:

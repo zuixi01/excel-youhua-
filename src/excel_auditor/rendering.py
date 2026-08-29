@@ -101,11 +101,14 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 _set_audit_comment(sheet.cell(difference.excel_row, 1), _comment(difference))
                 operation_count += 1
         for repair in comparison.repairs:
-            if repair.type != "set_cell" or repair.sheet_name not in book.sheetnames or not repair.cell:
+            if repair.type not in {"set_cell", "set_number_format"} or repair.sheet_name not in book.sheetnames or not repair.cell:
                 continue
             cell = book[repair.sheet_name][repair.cell]
-            _set_safe_value(cell, repair.value)
-            cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
+            if repair.type == "set_cell":
+                _set_safe_value(cell, repair.value)
+                cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
+            else:
+                cell.number_format = str(repair.value)
             _set_audit_comment(
                 cell,
                 _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),

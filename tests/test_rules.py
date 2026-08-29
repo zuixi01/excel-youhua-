@@ -371,6 +371,20 @@ def test_parse_formats_reject_unknown_tokens_or_missing_date_components(parse_fo
         RuleSet.model_validate(payload)
 
 
+def test_display_format_normalization_requires_numeric_or_temporal_type_and_explicit_format():
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][1]["normalize_display_format"] = True
+    payload["sheets"][0]["columns"][1]["format"] = "0.00"
+    with pytest.raises(ValidationError, match="normalize_display_format is incompatible with string"):
+        RuleSet.model_validate(payload)
+
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    payload["sheets"][0]["columns"][2]["normalize_display_format"] = True
+    payload["sheets"][0]["columns"][2]["format"] = None
+    with pytest.raises(ValidationError, match="without an explicit format"):
+        RuleSet.model_validate(payload)
+
+
 def test_enum_aliases_and_static_repair_defaults_must_satisfy_the_rule():
     payload = load_rules(EXAMPLE).model_dump(mode="json")
     payload["sheets"][0]["columns"][4]["enum_aliases"]["未知"] = "不存在"

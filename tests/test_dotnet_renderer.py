@@ -12,6 +12,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table
@@ -463,6 +464,8 @@ def test_dotnet_renderer_writes_dates_using_the_workbook_epoch(tmp_path, epoch, 
         ("cross-row-append", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [{"cell": "A3", "value": "E2", "field_type": "string"}], "fill_color": "D9EAD3"}], None, "declared row"),
         ("unknown-field-type", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1", "field_type": "deciml", "fill_color": "D9EAD3"}], None, "unknown field_type"),
         ("missing-field-type", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1", "fill_color": "D9EAD3"}], None, "requires field_type"),
+        ("missing-number-format", [{"type": "set_number_format", "sheet": "Data", "cell": "A1"}], None, "requires number_format"),
+        ("format-with-fill", [{"type": "set_number_format", "sheet": "Data", "cell": "A1", "number_format": "0.00", "fill_color": "D9EAD3"}], None, "must not declare fill_color"),
         ("unsafe-integer", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1234567890123456", "field_type": "integer", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
         ("unsafe-decimal", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "0.1234567890123456", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
         ("numeric-underflow", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1e-309", "field_type": "decimal", "fill_color": "D9EAD3"}], None, "exceeds Excel's safe numeric"),
@@ -550,6 +553,137 @@ def test_dotnet_renderer_rejects_side_effect_formula_templates(tmp_path):
         assert completed.returncode != 0
         assert json.loads(completed.stderr)["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
         assert not output.exists()
+
+
+def test_dotnet_renderer_normalizes_formula_display_format_without_changing_formula_or_style(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source = tmp_path / "formula-format.xlsx"
+    output = tmp_path / "formula-format-output.xlsx"
+    repeated_output = tmp_path / "formula-format-repeated.xlsx"
+    manifest_path = tmp_path / "formula-format-manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "Amount"
+    sheet["A2"] = "=1+1"
+    sheet["A2"].font = Font(name="Arial", bold=True, color="FF123456")
+    sheet["A2"].fill = PatternFill("solid", fgColor="FFABCDEF")
+    sheet["A2"].border = Border(left=Side(style="thin", color="FF654321"))
+    book.save(source)
+
+    def write_manifest(input_path):
+        manifest_path.write_text(json.dumps({
+            "manifest_version": "1.0",
+            "job_id": "job_formula_format",
+            "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+            "operations": [{
+                "type": "set_number_format", "sheet": "Data", "cell": "A2",
+                "number_format": "0.00", "comment": "format audit",
+            }],
+        }), encoding="utf-8")
+
+    write_manifest(source)
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    rendered = load_workbook(output, data_only=False)
+    cell = rendered["Data"]["A2"]
+    assert cell.value == "=1+1" and cell.data_type == "f"
+    assert cell.number_format == "0.00"
+    assert cell.font.name == "Arial" and cell.font.bold is True and cell.font.color.rgb == "FF123456"
+    assert cell.fill.fgColor.rgb == "FFABCDEF"
+    assert cell.border.left.style == "thin" and cell.border.left.color.rgb == "FF654321"
+    first_style_count = len(rendered._cell_styles)
+    rendered.close()
+
+    write_manifest(output)
+    repeated = subprocess.run(
+        [command, "--input", str(output), "--output", str(repeated_output), "--manifest", str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert repeated.returncode == 0, repeated.stderr
+    rerendered = load_workbook(repeated_output, data_only=False)
+    assert rerendered["Data"]["A2"].value == "=1+1"
+    assert rerendered["Data"]["A2"].number_format == "0.00"
+    assert len(rerendered._cell_styles) == first_style_count
+    rerendered.close()
+
+
+def test_service_repairs_authorized_display_format_without_rewriting_numeric_value(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    rules = RuleSet.model_validate({
+        "schema_id": "display-format", "schema_version": "1.0.0", "name": "Display format",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "amount", "title": "Amount", "type": "decimal",
+                    "compare": {"mode": "numeric"}, "format": "0.00",
+                    "normalize_display_format": True,
+                },
+                {
+                    "name": "event_date", "title": "Event Date", "type": "date",
+                    "compare": {"mode": "date"}, "format": "yyyy-mm-dd",
+                    "normalize_display_format": True,
+                },
+            ],
+        }],
+    })
+    source, standard = tmp_path / "display-format.xlsx", tmp_path / "display-format.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount", "Event Date"])
+    sheet.append(["E1", 12.5, date(2026, 8, 30)])
+    sheet.append(["E2", "not-a-decimal", date(2026, 8, 31)])
+    sheet["B2"].font = Font(name="Arial", bold=True, color="FF123456")
+    sheet["B2"].fill = PatternFill("solid", fgColor="FFABCDEF")
+    sheet["B2"].border = Border(left=Side(style="thin", color="FF654321"))
+    assert sheet["B2"].number_format == "General"
+    sheet["C2"].number_format = "m/d/yy"
+    sheet["C3"].number_format = "yyyy-mm-dd"
+    book.save(source)
+    standard.write_text(json.dumps({"data": [
+        {"id": "E1", "amount": "12.50", "event_date": "2026-08-30"},
+        {"id": "E2", "amount": "20", "event_date": "2026-08-31"},
+    ]}), encoding="utf-8")
+    service = AuditService(tmp_path / "display-format-runtime", renderer=DotNetOpenXmlRenderer(Path(command)))
+    job_id = service.create_job()
+    service.run(job_id, source, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["repairs_applied"] == 2
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    cell = rendered["Data"]["B2"]
+    assert cell.value == 12.5 and cell.data_type == "n"
+    assert cell.number_format == "0.00"
+    assert cell.font.name == "Arial" and cell.font.bold is True and cell.font.color.rgb == "FF123456"
+    assert cell.fill.fgColor.rgb == "FFABCDEF"
+    assert cell.border.left.style == "thin" and cell.border.left.color.rgb == "FF654321"
+    assert rendered["Data"]["C2"].value.date() == date(2026, 8, 30)
+    assert rendered["Data"]["C2"].number_format == "yyyy-mm-dd"
+    assert rendered["Data"]["B3"].value == "not-a-decimal"
+    rendered.close()
+    report = json.loads(service.artifact(job_id, "json").read_text(encoding="utf-8"))
+    difference = next(item for item in report["differences"] if item["rule_id"] == "amount.normalize_display_format")
+    assert difference["excel_raw_value"] == "General"
+    assert difference["standard_raw_value"] == "0.00"
+    assert any(item["rule_id"] == "event_date.normalize_display_format" for item in report["differences"])
+    assert not any(
+        item["rule_id"] == "amount.normalize_display_format" and item["cell"] == "B3"
+        for item in report["differences"]
+    )
+    public_manifest = json.loads(service.artifact(job_id, "manifest").read_text(encoding="utf-8"))
+    operation = next(item for item in public_manifest["operations"] if item["type"] == "set_number_format")
+    assert operation["cell"] == "B2" and operation["number_format"] == "0.00"
 
 
 def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_values(tmp_path):

@@ -238,6 +238,7 @@ class ColumnRule(StrictModel):
     boolean_false_values: list[str] = Field(default_factory=lambda: ["false", "0", "no", "n", "否", "假"])
     parse_formats: list[str] = Field(default_factory=list, max_length=32)
     format: str | None = Field(default=None, min_length=1, max_length=255)
+    normalize_display_format: bool = False
     formula_template: str | None = None
     separator: str = Field(default=",", min_length=1, max_length=16)
     missing_column_action: Literal["insert", "report_only"] | None = None
@@ -388,6 +389,15 @@ class ColumnRule(StrictModel):
             raise ValueError(f"parse_formats are incompatible with {self.type.value}")
         for parse_format in self.parse_formats:
             to_python_datetime_format(parse_format)
+        if self.normalize_display_format:
+            if self.type not in {FieldType.INTEGER, FieldType.DECIMAL, FieldType.DATE, FieldType.DATETIME}:
+                raise ValueError(
+                    f"normalize_display_format is incompatible with {self.type.value}"
+                )
+            if self.format is None:
+                raise ValueError(
+                    f"field {self.name!r} enables normalize_display_format without an explicit format"
+                )
         textual = self.type in {
             FieldType.STRING,
             FieldType.PHONE,

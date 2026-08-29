@@ -401,6 +401,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         columns,
         rules_by_name,
         differences,
+        repairs,
         excel_epoch,
     )
     join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
@@ -785,6 +786,7 @@ def _validate_excel_records(
     columns: dict[str, int],
     rules_by_name: dict[str, Any],
     differences: list[Difference],
+    repairs: list[RepairOperation],
     excel_epoch: Any,
 ) -> int:
     unique_values: dict[str, dict[Any, list[tuple[int, tuple[Any, ...]]]]] = defaultdict(lambda: defaultdict(list))
@@ -828,6 +830,10 @@ def _validate_excel_records(
             if isinstance(raw, str) and raw.startswith("="):
                 if rule.compare.formula_mode == "formula":
                     parsed_record[name] = ParsedValue(raw, raw, True)
+                    _append_display_format_repair(
+                        sheet, snapshot, rule, differences, repairs,
+                        row_number=row_number, cell=cell, key=key,
+                    )
                     continue
                 if rule.compare.formula_mode == "cached_value":
                     raw = snapshot.cached_values.get(cell)
@@ -843,6 +849,10 @@ def _validate_excel_records(
             if not parsed.valid:
                 differences.append(_difference(DifferenceType.INVALID_VALUE, sheet, f"Excel 值无法按 {rule.type.value} 解析：{parsed.error}", cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), rule_id=f"{name}.parse", render_action=sheet.actions.invalid_value))
                 continue
+            _append_display_format_repair(
+                sheet, snapshot, rule, differences, repairs,
+                row_number=row_number, cell=cell, key=key,
+            )
             validation_message = _validate(parsed, rule)
             if validation_message:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, validation_message, cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), excel_normalized_value=_safe_value(parsed.normalized, rule), rule_id=f"{name}.validation", render_action=sheet.actions.invalid_value))
@@ -856,6 +866,50 @@ def _validate_excel_records(
             for row_number, key in occurrences:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, "字段值不唯一", cell=f"{get_column_letter(columns[name])}{row_number}", excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), rule_id=f"{name}.unique", render_action=sheet.actions.invalid_value))
     return validated_records
+
+
+def _append_display_format_repair(
+    sheet: SheetRule,
+    snapshot: SheetSnapshot,
+    rule: Any,
+    differences: list[Difference],
+    repairs: list[RepairOperation],
+    *,
+    row_number: int,
+    cell: str,
+    key: tuple[Any, ...],
+) -> None:
+    actual_format = snapshot.format_mismatches.get(cell)
+    if actual_format is None or not rule.normalize_display_format or rule.format is None:
+        return
+    difference = _difference(
+        DifferenceType.NORMALIZED_MATCH,
+        sheet,
+        "已授权规范化 Excel 单元格显示格式",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet),
+        excel_raw_value=actual_format,
+        standard_raw_value=rule.format,
+        rule_id=f"{rule.name}.normalize_display_format",
+        severity="info",
+        render_action="set_number_format",
+        repair_status="planned",
+    )
+    differences.append(difference)
+    repairs.append(
+        RepairOperation(
+            "set_number_format",
+            sheet.id,
+            sheet.name,
+            difference.rule_id or "",
+            difference.difference_id,
+            cell=cell,
+            canonical_field=rule.name,
+            value=rule.format,
+        )
+    )
 
 
 def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number: int, key: tuple[Any, ...], parsed: dict[str, ParsedValue], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:

@@ -6,6 +6,7 @@ import re
 import tempfile
 import zipfile
 from array import array
+from collections import Counter
 from datetime import datetime
 from xml.parsers import expat
 from dataclasses import dataclass, field
@@ -92,6 +93,7 @@ class SheetSnapshot:
     hidden_rows: set[int] = field(default_factory=set)
     risky_features: list[str] = field(default_factory=list)
     cached_values: dict[str, Any] = field(default_factory=dict)
+    format_mismatches: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -312,6 +314,19 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
                     close_existing_rows()
             book.close()
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")
+        format_mismatches: dict[str, str] = {}
+        format_targets = _format_normalization_targets(
+            matching_rule,
+            rows[resolved_header_row - 1][1] if len(rows) >= resolved_header_row else [],
+        )
+        if large_mode and format_targets:
+            warnings.append(f"{sheet.title}: format_normalization_skipped_large_mode")
+        elif format_targets:
+            for row_index in range(actual_data_start, max_row + 1):
+                for column_index, expected_format in format_targets.items():
+                    cell = sheet.cell(row_index, column_index)
+                    if cell.value not in {None, ""} and cell.number_format != expected_format:
+                        format_mismatches[cell.coordinate] = cell.number_format
         if not large_mode and sheet.merged_cells.ranges and any(
             merged.min_row <= resolved_header_row <= merged.max_row
             for merged in sheet.merged_cells.ranges
@@ -340,7 +355,15 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         hidden_rows = set() if large_mode else {index for index, dimension in sheet.row_dimensions.items() if dimension.hidden}
         if large_mode and not matching_rule.data_region.include_hidden_rows:
             risky.append("large_mode_hidden_row_filter_unavailable")
-        snapshots[sheet.title] = SheetSnapshot(sheet.title, max_row, max_column, rows, hidden_rows, risky)
+        snapshots[sheet.title] = SheetSnapshot(
+            sheet.title,
+            max_row,
+            max_column,
+            rows,
+            hidden_rows,
+            risky,
+            format_mismatches=format_mismatches,
+        )
         warnings.extend(f"{sheet.title}: {feature}" for feature in risky)
         manual_review_reasons.extend(
             f"{sheet.title}: {feature}"
@@ -387,6 +410,37 @@ def sheet_rule_for_name(rules: RuleSet, name: str) -> Any:
         (sheet for sheet in rules.sheets if folded_name in {candidate.casefold() for candidate in [sheet.name, *sheet.aliases]}),
         rules.sheets[0],
     )
+
+
+def _format_normalization_targets(sheet: SheetRule, header_values: list[Any]) -> dict[int, str]:
+    """Return unambiguous physical columns explicitly authorized for style repair."""
+    normalized_values = [normalize_header(value) for value in header_values]
+    duplicate_headers = {
+        value
+        for value, count in Counter(value for value in normalized_values if value).items()
+        if count > 1
+    }
+    exact: dict[str, Any] = {}
+    for column in sheet.columns:
+        for candidate in [column.name, column.title, *column.aliases]:
+            exact.setdefault(normalize_header(candidate), column)
+    candidates: list[tuple[int, Any]] = []
+    for index, normalized in enumerate(normalized_values, start=1):
+        column = exact.get(normalized)
+        if (
+            normalized
+            and normalized not in duplicate_headers
+            and column is not None
+            and column.normalize_display_format
+            and column.format is not None
+        ):
+            candidates.append((index, column))
+    canonical_counts = Counter(column.name for _index, column in candidates)
+    return {
+        index: str(column.format)
+        for index, column in candidates
+        if canonical_counts[column.name] == 1
+    }
 
 
 def _detect_sheet_xml_features(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> set[str]:

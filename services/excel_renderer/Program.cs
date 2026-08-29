@@ -49,6 +49,7 @@ try
                 {
                     case "mark_cell": case "mark_row": ApplyMark(workbookPart, operation, styleCache); break;
                     case "set_cell": case "set_cell_after_insert": ApplySetCell(workbookPart, operation, styleCache); break;
+                    case "set_number_format": ApplyNumberFormat(workbookPart, operation, styleCache); break;
                     case "insert_column": InsertColumn(workbookPart, operation, styleCache); break;
                     case "append_row": AppendRow(workbookPart, operation, styleCache); break;
                     case "add_or_replace_report_sheet": AddReportSheet(workbookPart, operation, Path.GetDirectoryName(Path.GetFullPath(arguments.Manifest))!); break;
@@ -134,6 +135,15 @@ static void ApplySetCell(WorkbookPart workbookPart, RenderOperation operation, D
     cell.StyleIndex = FillStyle(workbookPart, cell.StyleIndex, operation.FillColor!, operation.NumberFormat, styleCache);
     if (!String.IsNullOrWhiteSpace(operation.Comment)) AddOrReplaceComment(worksheetPart, operation.Cell!, operation.Comment!);
     RecalculateDimension(worksheetPart.Worksheet!);
+    (worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing")).Save();
+}
+
+static void ApplyNumberFormat(WorkbookPart workbookPart, RenderOperation operation, Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+{
+    var worksheetPart = Worksheet(workbookPart, operation.Sheet!);
+    var cell = FindOrCreateCell(worksheetPart, operation.Cell!);
+    cell.StyleIndex = FillStyle(workbookPart, cell.StyleIndex, "", operation.NumberFormat, styleCache);
+    if (!String.IsNullOrWhiteSpace(operation.Comment)) AddOrReplaceComment(worksheetPart, operation.Cell!, operation.Comment!);
     (worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing")).Save();
 }
 
@@ -1061,6 +1071,15 @@ static uint FillStyle(WorkbookPart workbookPart, UInt32Value? sourceStyleIndex, 
         }
         format.NumberFormatId = formatId; format.ApplyNumberFormat = true;
     }
+    var existingFormat = formats.Elements<CellFormat>()
+        .Select((item, index) => (item, index))
+        .FirstOrDefault(item => item.item.OuterXml == format.OuterXml);
+    if (existingFormat.item is not null)
+    {
+        var existingIndex = (uint)existingFormat.index;
+        cache[cacheKey] = existingIndex;
+        return existingIndex;
+    }
     formats.Append(format); formats.Count = (uint)formats.ChildElements.Count;
     styles.Stylesheet.Save();
     var created = formats.Count - 1;
@@ -1151,7 +1170,7 @@ static string CellColumn(string reference) => new(reference.TakeWhile(Char.IsLet
 static int ColumnNumber(string name) { var value = 0; foreach (var c in name.ToUpperInvariant()) value = value * 26 + c - 'A' + 1; return value; }
 static string ColumnName(int number) { var value = ""; while (number > 0) { number--; value = (char)('A' + number % 26) + value; number /= 26; } return value; }
 
-static int OperationPhase(string type) => type switch { "mark_cell" or "mark_row" => 0, "set_cell" => 1, "insert_column" => 2, "set_cell_after_insert" => 3, "append_row" => 4, "add_or_replace_report_sheet" => 5, _ => 99 };
+static int OperationPhase(string type) => type switch { "mark_cell" or "mark_row" => 0, "set_number_format" or "set_cell" => 1, "insert_column" => 2, "set_cell_after_insert" => 3, "append_row" => 4, "add_or_replace_report_sheet" => 5, _ => 99 };
 
 static void ValidateManifest(RenderManifest manifest)
 {
@@ -1160,14 +1179,14 @@ static void ValidateManifest(RenderManifest manifest)
         throw new InvalidDataException("manifest identity or input hash is invalid");
     if (manifest.Operations is null) throw new InvalidDataException("manifest operations are required");
     ValidateMetadata(manifest.Metadata);
-    var known = new HashSet<string> { "mark_cell", "mark_row", "set_cell", "insert_column", "set_cell_after_insert", "append_row", "add_or_replace_report_sheet" };
+    var known = new HashSet<string> { "mark_cell", "mark_row", "set_cell", "set_number_format", "insert_column", "set_cell_after_insert", "append_row", "add_or_replace_report_sheet" };
     foreach (var operation in manifest.Operations)
     {
         if (operation is null) throw new InvalidDataException("manifest operations must not contain null items");
         if (!known.Contains(operation.Type)) throw new InvalidDataException($"unknown operation type: {operation.Type}");
         if (operation.Type is not "add_or_replace_report_sheet" && String.IsNullOrWhiteSpace(operation.Sheet)) throw new InvalidDataException($"{operation.Type} requires sheet");
         if (operation.Type == "add_or_replace_report_sheet" && operation.Sheet is not null) throw new InvalidDataException("report operation must not declare sheet");
-        if (operation.Type is "mark_cell" or "set_cell" or "set_cell_after_insert")
+        if (operation.Type is "mark_cell" or "set_cell" or "set_number_format" or "set_cell_after_insert")
         {
             if (!IsValidCellReference(operation.Cell)) throw new InvalidDataException($"{operation.Type} requires a valid Excel cell");
         }
@@ -1201,11 +1220,15 @@ static void ValidateManifest(RenderManifest manifest)
             if (operation.FillColor is not null || operation.Comment is not null) throw new InvalidDataException("report operation contains unsupported presentation fields");
         }
         else if (operation.Name is not null || operation.SourceJson is not null) throw new InvalidDataException($"{operation.Type} contains report-only fields");
-        if (operation.Type is not ("set_cell" or "set_cell_after_insert" or "insert_column") && (operation.Value is not null || operation.FieldType is not null || operation.NumberFormat is not null))
+        if (operation.Type is not ("set_cell" or "set_cell_after_insert" or "set_number_format" or "insert_column") && (operation.Value is not null || operation.FieldType is not null || operation.NumberFormat is not null))
             throw new InvalidDataException($"{operation.Type} contains typed-cell-only fields");
         if (operation.Type is not ("set_cell" or "set_cell_after_insert") && operation.Timezone is not null)
             throw new InvalidDataException($"{operation.Type} contains typed-value-only timezone");
         if (operation.Type == "insert_column" && operation.Value is not null) throw new InvalidDataException("insert_column must not declare value");
+        if (operation.Type == "set_number_format" && (operation.Value is not null || operation.FieldType is not null || String.IsNullOrWhiteSpace(operation.NumberFormat)))
+            throw new InvalidDataException("set_number_format requires number_format and must not declare value or field_type");
+        if (operation.Type == "set_number_format" && operation.FillColor is not null)
+            throw new InvalidDataException("set_number_format must not declare fill_color");
         ValidateFieldType(operation.FieldType);
         ValidateNumberFormat(operation.NumberFormat);
         if (operation.Type is "set_cell" or "set_cell_after_insert")

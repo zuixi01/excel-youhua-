@@ -657,6 +657,43 @@ def test_development_renderer_inserts_and_fills_missing_column_on_sheet_alias(tm
     rendered.close()
 
 
+def test_development_renderer_normalizes_authorized_display_format_without_rewriting_value(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "dev-display-format", "schema_version": "1.0.0", "name": "Dev display format",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {
+                    "name": "amount", "title": "Amount", "type": "decimal",
+                    "compare": {"mode": "numeric"}, "format": "0.00",
+                    "normalize_display_format": True,
+                },
+            ],
+        }],
+    })
+    excel, standard = tmp_path / "dev-format.xlsx", tmp_path / "dev-format.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Amount"])
+    sheet.append(["E1", 12.5])
+    book.save(excel)
+    standard.write_text(json.dumps({"data": [{"id": "E1", "amount": "12.50"}]}), encoding="utf-8")
+
+    service = AuditService(tmp_path / "dev-format-runtime", renderer=OpenPyxlDevelopmentRenderer())
+    job_id = service.create_job()
+    service.run(job_id, excel, standard, rules)
+
+    status = service.status(job_id)
+    assert status["status"] == "completed", status
+    assert status["summary"]["repairs_applied"] == 1
+    rendered = load_workbook(service.artifact(job_id, "excel"), data_only=False)
+    assert rendered["Data"]["B2"].value == 12.5
+    assert rendered["Data"]["B2"].number_format == "0.00"
+    rendered.close()
+
+
 def test_insert_order_preserves_extra_column_around_canonical_fields(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "headers", "schema_version": "1.0.0", "name": "Headers",
