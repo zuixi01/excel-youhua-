@@ -360,7 +360,8 @@ class ColumnRule(StrictModel):
                 raise ValueError(f"formula_template for {self.name!r} must start with '=' and be at most 512 characters")
             if re.search(r"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", formula, re.IGNORECASE):
                 raise ValueError(f"formula_template for {self.name!r} contains an external or forbidden function")
-            if set(re.findall(r"\{([^{}]+)\}", formula)) - {"row"}:
+            without_row_placeholder = formula.replace("{row}", "")
+            if "{" in without_row_placeholder or "}" in without_row_placeholder:
                 raise ValueError(f"formula_template for {self.name!r} only permits the {{row}} placeholder")
         return self
 

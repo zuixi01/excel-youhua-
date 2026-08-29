@@ -239,6 +239,13 @@ def test_formula_templates_require_formula_text_mode_and_exclude_static_defaults
     with pytest.raises(ValidationError, match="cannot be combined with fill_static_default"):
         RuleSet.model_validate(payload)
 
+    payload = load_rules(EXAMPLE).model_dump(mode="json")
+    amount = payload["sheets"][0]["columns"][2]
+    amount["compare"]["formula_mode"] = "formula"
+    amount["formula_template"] = "={row"
+    with pytest.raises(ValidationError, match=r"only permits the \{row\} placeholder"):
+        RuleSet.model_validate(payload)
+
 
 def test_decimal_tolerance_requires_string_and_risky_regex_is_rejected():
     payload = load_rules(EXAMPLE).model_dump(mode="json")

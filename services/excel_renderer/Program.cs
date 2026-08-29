@@ -1007,20 +1007,142 @@ static void ValidateManifest(RenderManifest manifest)
     if (manifest.ManifestVersion != "1.0") throw new InvalidDataException("unsupported manifest version");
     if (String.IsNullOrWhiteSpace(manifest.JobId) || String.IsNullOrWhiteSpace(manifest.InputSha256) || !Regex.IsMatch(manifest.InputSha256, "^[0-9a-fA-F]{64}$"))
         throw new InvalidDataException("manifest identity or input hash is invalid");
+    if (manifest.Operations is null) throw new InvalidDataException("manifest operations are required");
+    ValidateMetadata(manifest.Metadata);
     var known = new HashSet<string> { "mark_cell", "mark_row", "set_cell", "insert_column", "set_cell_after_insert", "append_row", "add_or_replace_report_sheet" };
     foreach (var operation in manifest.Operations)
     {
+        if (operation is null) throw new InvalidDataException("manifest operations must not contain null items");
         if (!known.Contains(operation.Type)) throw new InvalidDataException($"unknown operation type: {operation.Type}");
         if (operation.Type is not "add_or_replace_report_sheet" && String.IsNullOrWhiteSpace(operation.Sheet)) throw new InvalidDataException($"{operation.Type} requires sheet");
-        if ((operation.Type is "mark_cell" or "set_cell" or "set_cell_after_insert") && String.IsNullOrWhiteSpace(operation.Cell)) throw new InvalidDataException($"{operation.Type} requires cell");
-        if ((operation.Type is "mark_row" or "append_row") && operation.Row is null) throw new InvalidDataException($"{operation.Type} requires row");
-        if (operation.Type == "insert_column" && ((String.IsNullOrWhiteSpace(operation.Before) == String.IsNullOrWhiteSpace(operation.After)) || operation.HeaderRow is null || String.IsNullOrWhiteSpace(operation.FillColor))) throw new InvalidDataException("insert_column requires exactly one of before/after, plus header_row and fill_color");
+        if (operation.Type == "add_or_replace_report_sheet" && operation.Sheet is not null) throw new InvalidDataException("report operation must not declare sheet");
+        if (operation.Type is "mark_cell" or "set_cell" or "set_cell_after_insert")
+        {
+            if (!IsValidCellReference(operation.Cell)) throw new InvalidDataException($"{operation.Type} requires a valid Excel cell");
+        }
+        else if (operation.Cell is not null) throw new InvalidDataException($"{operation.Type} must not declare cell");
+        if (operation.Type is "mark_row" or "append_row")
+        {
+            if (!IsValidRow(operation.Row)) throw new InvalidDataException($"{operation.Type} requires a valid Excel row");
+        }
+        else if (operation.Row is not null) throw new InvalidDataException($"{operation.Type} must not declare row");
+        if (operation.Type == "insert_column" && (
+            (String.IsNullOrWhiteSpace(operation.Before) == String.IsNullOrWhiteSpace(operation.After))
+            || !IsValidRow(operation.HeaderRow)
+            || String.IsNullOrWhiteSpace(operation.CanonicalField)
+            || String.IsNullOrWhiteSpace(operation.HeaderValue)
+            || String.IsNullOrWhiteSpace(operation.FillColor)))
+            throw new InvalidDataException("insert_column requires exactly one valid before/after column, canonical_field, header_row, header_value and fill_color");
+        if (operation.Type == "insert_column" && !IsValidColumnReference(operation.Before ?? operation.After)) throw new InvalidDataException("insert_column anchor must be an Excel column from A to XFD");
+        if (operation.Type == "insert_column" && operation.After is not null && ColumnNumber(operation.After) == 16384) throw new InvalidDataException("insert_column cannot insert after XFD");
         if (operation.Type == "insert_column" && operation.DataStartRow is not null && operation.DataStartRow <= operation.HeaderRow) throw new InvalidDataException("insert_column data_start_row must be after header_row");
         if (operation.Type == "insert_column" && operation.FormulaRows?.Any(row => row < (operation.DataStartRow ?? (operation.HeaderRow ?? 1u) + 1u) || row > 1048576u) == true) throw new InvalidDataException("insert_column formula_rows must be valid data rows");
-        if (operation.Type == "add_or_replace_report_sheet" && (String.IsNullOrWhiteSpace(operation.Name) || String.IsNullOrWhiteSpace(operation.SourceJson))) throw new InvalidDataException("report operation requires name and source_json");
+        if (operation.Type == "insert_column" && operation.FormulaRows is not null && (String.IsNullOrWhiteSpace(operation.FormulaTemplate) || operation.FormulaRows.Count != operation.FormulaRows.Distinct().Count())) throw new InvalidDataException("insert_column formula_rows require a formula_template and must be unique");
+        if (operation.Type == "insert_column") ValidateFormulaTemplate(operation.FormulaTemplate, "insert_column formula_template");
+        else if (operation.Before is not null || operation.After is not null || operation.CanonicalField is not null || operation.HeaderRow is not null || operation.HeaderValue is not null || operation.Validation is not null || operation.FormulaTemplate is not null || operation.DataStartRow is not null || operation.FormulaRows is not null)
+            throw new InvalidDataException($"{operation.Type} contains insert_column-only fields");
+        if (operation.Type == "insert_column" && operation.Validation is not null) ValidateValidation(operation.Validation);
+        if (operation.Type == "append_row") ValidateAppendValues(operation);
+        else if (operation.Values is not null) throw new InvalidDataException($"{operation.Type} must not declare values");
+        if (operation.Type == "add_or_replace_report_sheet")
+        {
+            if (!IsValidSheetName(operation.Name) || operation.Name == "__ExcelAuditorMetadata" || String.IsNullOrWhiteSpace(operation.SourceJson)) throw new InvalidDataException("report operation requires a valid non-reserved name and source_json");
+            if (operation.FillColor is not null || operation.Comment is not null) throw new InvalidDataException("report operation contains unsupported presentation fields");
+        }
+        else if (operation.Name is not null || operation.SourceJson is not null) throw new InvalidDataException($"{operation.Type} contains report-only fields");
+        if (operation.Type is not ("set_cell" or "set_cell_after_insert" or "insert_column") && (operation.Value is not null || operation.FieldType is not null || operation.NumberFormat is not null))
+            throw new InvalidDataException($"{operation.Type} contains typed-cell-only fields");
+        if (operation.Type == "insert_column" && operation.Value is not null) throw new InvalidDataException("insert_column must not declare value");
+        ValidateFieldType(operation.FieldType);
+        ValidateNumberFormat(operation.NumberFormat);
+        if ((operation.Type is "mark_cell" or "mark_row" or "set_cell" or "set_cell_after_insert" or "append_row") && String.IsNullOrWhiteSpace(operation.FillColor)) throw new InvalidDataException($"{operation.Type} requires fill_color");
         if (!String.IsNullOrWhiteSpace(operation.FillColor) && !Regex.IsMatch(operation.FillColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("fill color must be six hexadecimal digits");
+        if (operation.Comment?.Length > 32767) throw new InvalidDataException("operation comment exceeds Excel's safe length");
     }
 }
+
+static void ValidateMetadata(RenderMetadata? metadata)
+{
+    if (metadata is null) return;
+    foreach (var (name, value) in new[] {
+        ("schema_sha256", metadata.SchemaSha256),
+        ("standard_sha256", metadata.StandardSha256),
+        ("result_sha256", metadata.ResultSha256),
+    })
+        if (value is not null && !Regex.IsMatch(value, "^[0-9a-fA-F]{64}$")) throw new InvalidDataException($"metadata {name} must be SHA-256");
+}
+
+static void ValidateAppendValues(RenderOperation operation)
+{
+    if (operation.Values is not { Count: > 0 }) throw new InvalidDataException("append_row requires non-empty values");
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var value in operation.Values)
+    {
+        if (value is null || !IsValidCellReference(value.Cell)) throw new InvalidDataException("append_row values require valid cells");
+        var cellReference = value.Cell!;
+        var row = UInt32.Parse(new string(cellReference.Where(Char.IsDigit).ToArray()), CultureInfo.InvariantCulture);
+        if (row != operation.Row) throw new InvalidDataException("append_row value cells must belong to the declared row");
+        if (!seen.Add(cellReference)) throw new InvalidDataException("append_row value cells must be unique");
+        ValidateFieldType(value.FieldType);
+        ValidateNumberFormat(value.NumberFormat);
+        ValidateFormulaTemplate(value.FormulaTemplate, "append_row formula_template");
+    }
+}
+
+static void ValidateValidation(RenderValidation validation)
+{
+    if (validation.Type == "list")
+    {
+        if (validation.Values is not { Count: > 0 } || validation.Values.Any(String.IsNullOrEmpty) || validation.Min is not null || validation.Max is not null)
+            throw new InvalidDataException("list validation requires non-empty values and no numeric bounds");
+        var list = String.Join(",", validation.Values.Select(value => value.Replace("\"", "\"\"")));
+        if (list.Length > 250) throw new InvalidDataException("inline validation list exceeds safe Excel limit");
+        return;
+    }
+    if (validation.Type is not ("integer" or "decimal") || validation.Values is not null || (validation.Min is null && validation.Max is null))
+        throw new InvalidDataException("numeric validation requires integer/decimal type, bounds, and no list values");
+    Decimal? minimum = ParseValidationBound(validation.Min);
+    Decimal? maximum = ParseValidationBound(validation.Max);
+    if (minimum is not null && maximum is not null && minimum > maximum) throw new InvalidDataException("validation minimum must not exceed maximum");
+}
+
+static decimal? ParseValidationBound(string? value)
+{
+    if (value is null) return null;
+    if (!Decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed)) throw new InvalidDataException("validation bounds must be finite invariant decimals");
+    return parsed;
+}
+
+static void ValidateFormulaTemplate(string? formula, string source)
+{
+    if (formula is null) return;
+    var withoutRowPlaceholder = formula.Replace("{row}", "", StringComparison.Ordinal);
+    if (formula.Length is < 2 or > 512 || !formula.StartsWith('=') || withoutRowPlaceholder.Contains('{') || withoutRowPlaceholder.Contains('}') || Regex.IsMatch(formula, @"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", RegexOptions.IgnoreCase))
+        throw new InvalidDataException($"{source} is unsafe or invalid");
+}
+
+static void ValidateFieldType(string? fieldType)
+{
+    if (fieldType is null) return;
+    var known = new HashSet<string> { "string", "integer", "decimal", "date", "datetime", "boolean", "enum", "phone", "id_code", "postal_code", "set", "json", "fuzzy_string" };
+    if (!known.Contains(fieldType)) throw new InvalidDataException($"unknown field_type: {fieldType}");
+}
+
+static void ValidateNumberFormat(string? numberFormat)
+{
+    if (numberFormat is not null && (numberFormat.Length > 255 || numberFormat.Any(Char.IsControl))) throw new InvalidDataException("number_format exceeds Excel's safe contract");
+}
+
+static bool IsValidRow(uint? row) => row is >= 1u and <= 1048576u;
+static bool IsValidColumnReference(string? reference) => !String.IsNullOrWhiteSpace(reference) && Regex.IsMatch(reference, "^[A-Z]{1,3}$") && ColumnNumber(reference) is >= 1 and <= 16384;
+static bool IsValidCellReference(string? reference)
+{
+    if (String.IsNullOrWhiteSpace(reference)) return false;
+    var match = Regex.Match(reference, "^(?<column>[A-Z]{1,3})(?<row>[1-9][0-9]*)$");
+    return match.Success && IsValidColumnReference(match.Groups["column"].Value) && UInt32.TryParse(match.Groups["row"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var row) && row <= 1048576u;
+}
+
+static bool IsValidSheetName(string? name) => !String.IsNullOrWhiteSpace(name) && name.Length <= 31 && !name.Any(character => "[]:*?/\\".Contains(character)) && name[0] != '\'' && name[^1] != '\'';
 
 sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 {

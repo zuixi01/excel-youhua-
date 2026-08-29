@@ -174,6 +174,60 @@ def test_dotnet_renderer_writes_typed_cells_formats_validation_metadata_and_reje
     assert json.loads(rejected.stderr)["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
 
 
+@pytest.mark.parametrize(
+    ("case", "operations", "metadata", "message"),
+    [
+        ("missing-operations", "__omit__", None, "operations are required"),
+        ("null-operations", None, None, "operations are required"),
+        ("null-operation", [None], None, "must not contain null"),
+        ("invalid-cell", [{"type": "mark_cell", "sheet": "Data", "cell": "XFE1", "fill_color": "D9EAD3"}], None, "valid Excel cell"),
+        ("invalid-row", [{"type": "mark_row", "sheet": "Data", "row": 0, "fill_color": "D9EAD3"}], None, "valid Excel row"),
+        ("after-xfd", [{"type": "insert_column", "sheet": "Data", "after": "XFD", "canonical_field": "value", "header_row": 1, "header_value": "Value", "fill_color": "D9EAD3"}], None, "cannot insert after XFD"),
+        ("formula-rows-without-template", [{"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "value", "header_row": 1, "header_value": "Value", "fill_color": "D9EAD3", "formula_rows": [2]}], None, "require a formula_template"),
+        ("unsafe-template", [{"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "value", "header_row": 1, "header_value": "Value", "fill_color": "D9EAD3", "formula_template": "={other}"}], None, "unsafe or invalid"),
+        ("unknown-validation", [{"type": "insert_column", "sheet": "Data", "before": "B", "canonical_field": "value", "header_row": 1, "header_value": "Value", "fill_color": "D9EAD3", "validation": {"type": "unknown"}}], None, "numeric validation requires"),
+        ("empty-append", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [], "fill_color": "D9EAD3"}], None, "non-empty values"),
+        ("cross-row-append", [{"type": "append_row", "sheet": "Data", "row": 2, "values": [{"cell": "A3", "value": "E2", "field_type": "string"}], "fill_color": "D9EAD3"}], None, "declared row"),
+        ("unknown-field-type", [{"type": "set_cell", "sheet": "Data", "cell": "A1", "value": "1", "field_type": "deciml", "fill_color": "D9EAD3"}], None, "unknown field_type"),
+        ("reserved-report-name", [{"type": "add_or_replace_report_sheet", "name": "__ExcelAuditorMetadata", "source_json": "report.json"}], None, "non-reserved name"),
+        ("ignored-field", [{"type": "mark_cell", "sheet": "Data", "cell": "A1", "before": "B", "fill_color": "D9EAD3"}], None, "insert_column-only fields"),
+        ("invalid-metadata-hash", [], {"schema_sha256": "not-a-hash"}, "must be SHA-256"),
+    ],
+)
+def test_dotnet_renderer_rejects_invalid_or_ineffective_manifest_fields(tmp_path, case, operations, metadata, message):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "input.xlsx", tmp_path / "output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID"])
+    book.save(source)
+    manifest = {
+        "manifest_version": "1.0",
+        "job_id": f"job_{case}",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+    if operations != "__omit__":
+        manifest["operations"] = operations
+    if metadata is not None:
+        manifest["metadata"] = metadata
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    failure = json.loads(completed.stderr)
+    assert failure["error_code"] == "MANIFEST_OR_STRUCTURE_INVALID"
+    assert message in failure["message"]
+    assert not output.exists()
+
+
 def test_service_repairs_use_normalized_typed_values_without_losing_raw_audit_values(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:
