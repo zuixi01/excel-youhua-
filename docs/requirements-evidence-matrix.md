@@ -21,7 +21,7 @@
 | 9 | 字段及跨字段数据质量规则 | 本地已证明 | `pandera_adapter.py`、注册校验器；`test_validation.py` | 业务规则清单 |
 | 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试 | 业务方修复策略签署 |
 | 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言 | 客户端下载抽验 |
-| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `e66788d` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 及 JUnit 制品已通过 | Microsoft Excel 桌面验收记录 |
+| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `e66788d` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 及 JUnit 制品已通过；Excel COM 自动打开/另存、关键宏部件哈希和独立人工签核工具已就绪 | Microsoft Excel 桌面实际运行及人工验收记录 |
 | 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试 | 生产审计抽样 |
 | 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
 | 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地生产 Renderer 完整回归通过；提交 `e66788d` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；小型人工标注 precision/recall | 业务标注基准 |
@@ -46,6 +46,6 @@
 
 1. 创建正式版本标签，让 release 门禁在已有 CI 和性能参考基线上构建、扫描并推送版本化镜像。
 2. 保存发布镜像 digest、镜像 SBOM、漏洞报告和 release manifest，并验证 GHCR 拉取。
-3. 在安装 Microsoft Excel 的验收机打开固定 Golden 及真实 `.xlsm` 样例，核验格式、关系、宏、签名和控件。
+3. 在安装 Microsoft Excel 的验收机按 `docs/excel-desktop-acceptance.md` 运行固定 Golden 及真实 `.xlsm` 样例，归档自动 JSON、独立人工签核及最终校验输出。
 4. 提供开发文档第 23 节列出的业务模板、脱敏异常文件、标准接口、主键/字段/敏感规则与容量目标。
 5. 提供目标服务器后，按 `AGENTS.md` 完成只读资源检查、指定 digest 部署、健康检查和回滚演练；服务器不承担构建。

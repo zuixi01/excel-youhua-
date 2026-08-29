@@ -1,6 +1,8 @@
 # 本地验证记录（2026-08-29）
 
 工作区：`E:\Excel优化`
+
+> 历史说明：本文件保存 2026-08-29 较早阶段的本地验证快照，其中“尚无 Git remote/远程证据”等陈述已被后续工作取代。当前权威状态与最新 CI/性能链接见 `docs/implementation-status.md` 和 `docs/requirements-evidence-matrix.md`，不得用本快照否定后续证据。
 平台：Windows x64，CPython 3.12.13，.NET SDK 8.0.424，pnpm 9.15.9
 
 ## 已执行并通过

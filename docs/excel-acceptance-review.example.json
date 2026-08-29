@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "automated_evidence_sha256": "replace-with-sha256-of-excel-automated-evidence-json",
+  "reviewer": "replace-with-human-reviewer",
+  "reviewed_at": "replace-with-rfc3339-utc-time",
+  "decision": "pending",
+  "checks": {
+    "opens_without_repair_prompt": false,
+    "sheet_names_and_layout_correct": false,
+    "colors_comments_and_report_correct": false,
+    "formulas_tables_filters_and_validation_correct": false,
+    "macro_signature_activex_and_vml_correct": false
+  },
+  "notes": "Record deviations or the controlled evidence location; do not include workbook data."
+}
