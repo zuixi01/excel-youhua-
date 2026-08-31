@@ -132,10 +132,33 @@ static void ApplySetCell(WorkbookPart workbookPart, RenderOperation operation, D
     var worksheetPart = Worksheet(workbookPart, operation.Sheet!);
     var cell = FindOrCreateCell(worksheetPart, operation.Cell!);
     WriteSafeValue(cell, operation.Value, operation.FieldType, Uses1904DateSystem(workbookPart));
+    SynchronizeTableHeaderName(worksheetPart, operation.Cell!, operation.Value);
     cell.StyleIndex = FillStyle(workbookPart, cell.StyleIndex, operation.FillColor!, operation.NumberFormat, styleCache);
     if (!String.IsNullOrWhiteSpace(operation.Comment)) AddOrReplaceComment(worksheetPart, operation.Cell!, operation.Comment!);
     RecalculateDimension(worksheetPart.Worksheet!);
     (worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing")).Save();
+}
+
+static void SynchronizeTableHeaderName(WorksheetPart worksheetPart, string reference, JsonElement? value)
+{
+    if (value is not JsonElement element || element.ValueKind != JsonValueKind.String) return;
+    var name = element.GetString();
+    if (String.IsNullOrWhiteSpace(name)) return;
+    var referenceRowText = new string(reference.Where(Char.IsDigit).ToArray());
+    if (!UInt32.TryParse(referenceRowText, NumberStyles.None, CultureInfo.InvariantCulture, out var referenceRow)) return;
+    var referenceColumn = ColumnNumber(CellColumn(reference));
+    foreach (var tablePart in worksheetPart.TableDefinitionParts)
+    {
+        var table = tablePart.Table;
+        if (table?.Reference?.Value is not string tableReference || (table.HeaderRowCount?.Value ?? 1u) == 0u) continue;
+        var bounds = RangeBounds(tableReference);
+        if (referenceRow != bounds.StartRow || referenceColumn < bounds.StartColumn || referenceColumn > bounds.EndColumn) continue;
+        var columns = table.TableColumns?.Elements<TableColumn>().ToList();
+        var index = referenceColumn - bounds.StartColumn;
+        if (columns is null || index < 0 || index >= columns.Count) continue;
+        columns[index].Name = name;
+        table.Save();
+    }
 }
 
 static void ApplyNumberFormat(WorkbookPart workbookPart, RenderOperation operation, Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
@@ -789,6 +812,18 @@ static (int Start, int End) RangeColumns(string reference)
     return (start, end);
 }
 
+static (int StartColumn, int EndColumn, uint StartRow, uint EndRow) RangeBounds(string reference)
+{
+    var parts = reference.Replace("$", "").Split(':', 2);
+    var startRowText = new string(parts[0].Where(Char.IsDigit).ToArray());
+    var endCell = parts.Length == 2 ? parts[1] : parts[0];
+    var endRowText = new string(endCell.Where(Char.IsDigit).ToArray());
+    if (!UInt32.TryParse(startRowText, NumberStyles.None, CultureInfo.InvariantCulture, out var startRow)
+        || !UInt32.TryParse(endRowText, NumberStyles.None, CultureInfo.InvariantCulture, out var endRow))
+        throw new InvalidDataException($"invalid range reference: {reference}");
+    return (ColumnNumber(CellColumn(parts[0])), ColumnNumber(CellColumn(endCell)), startRow, endRow);
+}
+
 static (int Start, int End) ShiftInterval(int start, int end, int target)
 {
     if (start >= target) return (start + 1, end + 1);
@@ -883,7 +918,11 @@ static void RebuildCommentVml(WorksheetPart worksheetPart)
     {
         vmlPart = worksheetPart.AddNewPart<VmlDrawingPart>();
         var worksheet = worksheetPart.Worksheet ?? throw new InvalidDataException("worksheet is missing");
-        worksheet.Append(new LegacyDrawing { Id = worksheetPart.GetIdOfPart(vmlPart) });
+        var legacyDrawing = new LegacyDrawing { Id = worksheetPart.GetIdOfPart(vmlPart) };
+        var following = worksheet.ChildElements.FirstOrDefault(item => item.LocalName is
+            "legacyDrawingHF" or "picture" or "oleObjects" or "controls" or "webPublishItems" or "tableParts" or "extLst");
+        if (following is null) worksheet.Append(legacyDrawing);
+        else worksheet.InsertBefore(legacyDrawing, following);
         document = CreateCommentVmlDocument(v, o, x);
     }
 

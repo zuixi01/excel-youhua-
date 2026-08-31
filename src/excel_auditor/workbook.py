@@ -207,6 +207,12 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
                 package_sheet_features.update(_detect_sheet_xml_features(archive, info))
     try:
         probe = load_workbook(path, read_only=True, data_only=False, keep_links=False, keep_vba=path.suffix.lower() == ".xlsm")
+        for sheet in probe.worksheets:
+            if sheet.max_row is None or sheet.max_column is None:
+                # The worksheet dimension element is optional. Some valid OOXML
+                # producers omit it, so determine the actual sparse bounds before
+                # deciding that the workbook requires large-file report mode.
+                sheet.calculate_dimension(force=True)
         large_mode = any(
             sheet.max_row is None
             or sheet.max_column is None
@@ -234,7 +240,7 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
     if len(book.worksheets) > rules.workbook.max_worksheets:
         book.close()
         raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED: workbook has more than 50 worksheets")
-    if rules.workbook.reject_protected and book.security.lockStructure:
+    if rules.workbook.reject_protected and getattr(getattr(book, "security", None), "lockStructure", False):
         raise WorkbookSafetyError("WORKBOOK_PROTECTED")
     for sheet in book.worksheets:
         matching_rule = sheet_rule_for_name(rules, sheet.title)

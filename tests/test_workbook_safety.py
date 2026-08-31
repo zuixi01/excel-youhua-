@@ -176,6 +176,67 @@ def test_workbook_sheet_limit_and_structure_inventory(tmp_path):
     assert not snapshot.manual_review_reasons
 
 
+def test_workbook_without_workbook_properties_is_not_misclassified_as_protected(tmp_path):
+    source = tmp_path / "with-properties.xlsx"
+    path = tmp_path / "without-properties.xlsx"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID"])
+    book.active.append(["E1"])
+    book.save(source)
+    with zipfile.ZipFile(source, "r") as archive, zipfile.ZipFile(path, "w") as rewritten:
+        for entry in archive.infolist():
+            payload = archive.read(entry)
+            if entry.filename == "xl/workbook.xml":
+                payload = payload.replace(b"<workbookPr/>", b"")
+            rewritten.writestr(entry, payload)
+    rules = RuleSet.model_validate({
+        "schema_id": "no-workbook-properties", "schema_version": "1.0.0", "name": "No workbook properties",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert snapshot.sheets["Data"].rows[1][1] == ["E1"]
+    snapshot.close()
+
+
+def test_workbook_without_worksheet_dimension_uses_actual_bounds(tmp_path):
+    source = tmp_path / "with-dimension.xlsx"
+    path = tmp_path / "without-dimension.xlsx"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID", "Value"])
+    book.active.append(["E1", "A"])
+    book.save(source)
+    with zipfile.ZipFile(source, "r") as archive, zipfile.ZipFile(path, "w") as rewritten:
+        for entry in archive.infolist():
+            payload = archive.read(entry)
+            if entry.filename == "xl/worksheets/sheet1.xml":
+                payload = payload.replace(b'<dimension ref="A1:B2"/>', b"")
+            rewritten.writestr(entry, payload)
+    rules = RuleSet.model_validate({
+        "schema_id": "no-worksheet-dimension", "schema_version": "1.0.0", "name": "No worksheet dimension",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value"},
+            ],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules, max_in_memory_cells=10_000)
+
+    assert snapshot.large_mode is False
+    assert snapshot.sheets["Data"].max_row == 2
+    assert snapshot.sheets["Data"].max_column == 2
+    snapshot.close()
+
+
 def test_row_limit_is_counted_from_the_configured_data_start(tmp_path):
     path = tmp_path / "data-start-limit.xlsx"
     book = Workbook()

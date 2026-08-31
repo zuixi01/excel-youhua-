@@ -125,6 +125,74 @@ def test_dotnet_renderer_marks_sparse_row_across_used_columns(tmp_path):
     rendered.close()
 
 
+def test_dotnet_renderer_inserts_comment_vml_before_table_parts(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "table-comment.xlsx", tmp_path / "table-comment-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Value"])
+    sheet.append(["E1", "A"])
+    sheet.add_table(Table(displayName="CommentTable", ref="A1:B2"))
+    book.save(source)
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_table_comment",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{
+            "type": "mark_cell", "sheet": "Data", "cell": "B2",
+            "fill_color": "FFE599", "comment": "audit comment",
+        }],
+    }), encoding="utf-8")
+
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = load_workbook(output, data_only=False)
+    assert rendered["Data"]["B2"].comment.text == "audit comment"
+    assert rendered["Data"].tables["CommentTable"].ref == "A1:B2"
+    rendered.close()
+
+
+def test_dotnet_renderer_keeps_table_column_name_in_sync_with_renamed_header(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output, manifest_path = tmp_path / "table-header.xlsx", tmp_path / "table-header-output.xlsx", tmp_path / "manifest.json"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID", "Salary Alias"])
+    sheet.append(["E1", 100])
+    sheet.add_table(Table(displayName="EmployeeTable", ref="A1:B2"))
+    book.save(source)
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_table_header",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "operations": [{
+            "type": "set_cell", "sheet": "Data", "cell": "B1", "value": "Salary",
+            "field_type": "string", "fill_color": "D9EAD3", "comment": "renamed alias",
+        }],
+    }), encoding="utf-8")
+
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = load_workbook(output, data_only=False)
+    assert rendered["Data"]["B1"].value == "Salary"
+    assert [column.name for column in rendered["Data"].tables["EmployeeTable"].tableColumns] == ["ID", "Salary"]
+    rendered.close()
+
+
 def test_dotnet_renderer_validates_hash_marks_and_inserts(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:
