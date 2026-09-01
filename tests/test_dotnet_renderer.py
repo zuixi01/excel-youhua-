@@ -1313,6 +1313,63 @@ def test_dotnet_renderer_preserves_macro_and_signature_parts_during_real_edit(tm
     rendered.close()
 
 
+def test_dotnet_renderer_builds_dynamic_product_and_sku_sheets_from_versioned_result(tmp_path):
+    command = os.environ.get("EXCEL_RENDERER_COMMAND")
+    if not command:
+        pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
+    source, output = tmp_path / "product-input.xlsx", tmp_path / "product-output.xlsx"
+    manifest_path, result_path = tmp_path / "manifest.json", tmp_path / "product-result.json"
+    book = Workbook()
+    book.active.title = "商家原表"
+    book.active.append(["原字段"])
+    book.active.append(["原值"])
+    book.save(source)
+    planned_fields = [
+        {"field": {"field_id": "product_id", "title": "商品ID", "source": "fixed", "field_type": "string", "number_format": None}},
+        {"field": {"field_id": "price", "title": "价格", "source": "platform_attribute", "field_type": "decimal", "number_format": "0.00"}},
+        {"field": {"field_id": "color", "title": "颜色", "source": "platform_specification", "field_type": "string", "number_format": None}},
+        {"field": {"field_id": "merchant_note", "title": "商家备注", "source": "merchant_extra", "field_type": "string", "number_format": None}},
+    ]
+    result_path.write_text(json.dumps({
+        "category_sheets": [{
+            "category_id": "phone",
+            "worksheet_name": "手机",
+            "plan": {"fields": planned_fields},
+            "source_excel_rows": [2],
+            "rows": [{"product_id": "P-1", "price": "12.50", "color": "黑色", "merchant_note": "保留"}],
+            "sku_rows": [{"product_id": "P-1", "color": "黑色"}],
+        }],
+        "issues": [{
+            "category_id": "phone", "excel_row": 2, "field_id": "price", "color": "F9CB9C",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "1.0",
+        "job_id": "job_product_renderer",
+        "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "metadata": {"schema_id": "products", "schema_version": "1.0.0", "schema_sha256": "0" * 64},
+        "operations": [{"type": "add_or_replace_product_sheets", "source_json": result_path.name}],
+    }), encoding="utf-8")
+
+    completed = subprocess.run(
+        [command, "--input", str(source), "--output", str(output), "--manifest", str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    operation = json.loads(completed.stdout)["operation_results"][0]
+    assert operation["type"] == "add_or_replace_product_sheets" and operation["status"] == "applied"
+    rendered = load_workbook(output, data_only=False)
+    assert [cell.value for cell in rendered["手机"][1]] == ["商品ID", "价格", "颜色", "商家备注"]
+    assert [cell.value for cell in rendered["手机"][2]] == ["P-1", 12.5, "黑色", "保留"]
+    assert rendered["手机"]["B2"].number_format == "0.00"
+    assert rendered["手机"]["B2"].fill.fgColor.rgb.endswith("F9CB9C")
+    assert [cell.value for cell in rendered["手机-SKU"][1]] == ["商品ID", "颜色"]
+    assert [cell.value for cell in rendered["手机-SKU"][2]] == ["P-1", "黑色"]
+    assert rendered["__ExcelAuditorMetadata"].sheet_state == "veryHidden"
+    rendered.close()
+
+
 def test_rendered_output_opens_and_resaves_in_libreoffice(tmp_path):
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     libreoffice = os.environ.get("LIBREOFFICE_COMMAND")

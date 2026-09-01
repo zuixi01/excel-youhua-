@@ -52,6 +52,7 @@ try
                     case "set_number_format": ApplyNumberFormat(workbookPart, operation, styleCache); break;
                     case "insert_column": InsertColumn(workbookPart, operation, styleCache); break;
                     case "append_row": AppendRow(workbookPart, operation, styleCache); break;
+                    case "add_or_replace_product_sheets": AddProductSheets(workbookPart, operation, Path.GetDirectoryName(Path.GetFullPath(arguments.Manifest))!, styleCache); break;
                     case "add_or_replace_report_sheet": AddReportSheet(workbookPart, operation, Path.GetDirectoryName(Path.GetFullPath(arguments.Manifest))!); break;
                     default: throw new InvalidDataException($"unknown operation type: {operation.Type}");
                 }
@@ -455,6 +456,194 @@ static void AddReportSheet(WorkbookPart workbookPart, RenderOperation operation,
     part.Worksheet.Save();
     var nextId = sheets.Elements<Sheet>().Select(item => item.SheetId?.Value ?? 0u).DefaultIfEmpty(0u).Max() + 1u;
     sheets.Append(new Sheet { Id = workbookPart.GetIdOfPart(part), SheetId = nextId, Name = name });
+}
+
+static void AddProductSheets(
+    WorkbookPart workbookPart,
+    RenderOperation operation,
+    string manifestDirectory,
+    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+{
+    var productPath = SafeManifestSourcePath(manifestDirectory, operation.SourceJson ?? "product-result.json");
+    using var document = JsonDocument.Parse(File.ReadAllText(productPath));
+    var root = document.RootElement;
+    if (!root.TryGetProperty("category_sheets", out var categorySheets) || categorySheets.ValueKind != JsonValueKind.Array)
+        throw new InvalidDataException("product result requires category_sheets array");
+    var merchantHeaderColor = JsonValue(root, "merchant_extra_header_color");
+    if (String.IsNullOrWhiteSpace(merchantHeaderColor)) merchantHeaderColor = "D9D9D9";
+    if (!Regex.IsMatch(merchantHeaderColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("product merchant header color is invalid");
+    var issues = new Dictionary<(string Category, uint SourceRow, string Field), string>();
+    if (root.TryGetProperty("issues", out var issueArray) && issueArray.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var issue in issueArray.EnumerateArray())
+        {
+            var category = JsonValue(issue, "category_id");
+            var field = JsonValue(issue, "field_id");
+            if (String.IsNullOrWhiteSpace(category) || String.IsNullOrWhiteSpace(field)
+                || !issue.TryGetProperty("excel_row", out var sourceRowElement)
+                || !sourceRowElement.TryGetUInt32(out var sourceRow)) continue;
+            var color = JsonValue(issue, "color");
+            if (Regex.IsMatch(color, "^[0-9A-Fa-f]{6}$")) issues[(category, sourceRow, field)] = color;
+        }
+    }
+    var usedNames = (workbookPart.Workbook?.Sheets?.Elements<Sheet>() ?? [])
+        .Select(item => item.Name?.Value ?? "").ToHashSet(StringComparer.OrdinalIgnoreCase);
+    foreach (var category in categorySheets.EnumerateArray())
+    {
+        var categoryId = JsonValue(category, "category_id");
+        var sheetName = JsonValue(category, "worksheet_name");
+        if (!IsValidSheetName(sheetName) || sheetName == "__ExcelAuditorMetadata")
+            throw new InvalidDataException("product result contains an invalid worksheet name");
+        var plan = category.GetProperty("plan");
+        var fields = ParseProductFields(plan.GetProperty("fields"));
+        var rows = category.GetProperty("rows");
+        var sourceRows = category.GetProperty("source_excel_rows");
+        AddOrReplaceProductSheet(workbookPart, sheetName, categoryId, fields, rows, sourceRows, issues, merchantHeaderColor, styleCache);
+        usedNames.Add(sheetName);
+        if (category.TryGetProperty("sku_rows", out var skuRows) && skuRows.ValueKind == JsonValueKind.Array && skuRows.GetArrayLength() > 0)
+        {
+            var skuFields = fields.Where(item => item.Source is "fixed" or "platform_specification").ToList();
+            var skuName = UniqueSheetName(sheetName + "-SKU", categoryId, usedNames);
+            AddOrReplaceProductSheet(workbookPart, skuName, categoryId, skuFields, skuRows, sourceRows, issues, merchantHeaderColor, styleCache);
+            usedNames.Add(skuName);
+        }
+    }
+}
+
+static List<ProductField> ParseProductFields(JsonElement plannedFields)
+{
+    if (plannedFields.ValueKind != JsonValueKind.Array) throw new InvalidDataException("product plan fields must be an array");
+    var fields = new List<ProductField>();
+    foreach (var planned in plannedFields.EnumerateArray())
+    {
+        var field = planned.GetProperty("field");
+        var id = JsonValue(field, "field_id");
+        var title = JsonValue(field, "title");
+        var source = JsonValue(field, "source");
+        var fieldType = JsonValue(field, "field_type");
+        var numberFormat = JsonValue(field, "number_format");
+        if (String.IsNullOrWhiteSpace(id) || String.IsNullOrWhiteSpace(title)
+            || source is not ("fixed" or "platform_attribute" or "platform_specification" or "merchant_extra"))
+            throw new InvalidDataException("product field identity or source is invalid");
+        ValidateFieldType(fieldType);
+        ValidateNumberFormat(String.IsNullOrWhiteSpace(numberFormat) ? null : numberFormat);
+        fields.Add(new ProductField(id, title, source, fieldType, String.IsNullOrWhiteSpace(numberFormat) ? null : numberFormat));
+    }
+    if (fields.Count == 0 || fields.Count > 16384 || fields.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count() != fields.Count)
+        throw new InvalidDataException("product field count or identity is invalid");
+    return fields;
+}
+
+static void AddOrReplaceProductSheet(
+    WorkbookPart workbookPart,
+    string name,
+    string categoryId,
+    List<ProductField> fields,
+    JsonElement rows,
+    JsonElement sourceRows,
+    Dictionary<(string Category, uint SourceRow, string Field), string> issues,
+    string merchantHeaderColor,
+    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+{
+    if (rows.ValueKind != JsonValueKind.Array || sourceRows.ValueKind != JsonValueKind.Array || rows.GetArrayLength() != sourceRows.GetArrayLength())
+        throw new InvalidDataException("product rows and source_excel_rows must be aligned arrays");
+    if (rows.GetArrayLength() > 1048575) throw new InvalidDataException("product sheet exceeds Excel's row limit");
+    RemoveSheetIfPresent(workbookPart, name);
+    var part = workbookPart.AddNewPart<WorksheetPart>();
+    var data = new SheetData();
+    var view = new SheetView { WorkbookViewId = 0u };
+    view.Append(new Pane {
+        VerticalSplit = 1d,
+        TopLeftCell = "A2",
+        ActivePane = PaneValues.BottomLeft,
+        State = PaneStateValues.Frozen,
+    });
+    var worksheet = new Worksheet(new SheetViews(view), data);
+    part.Worksheet = worksheet;
+    var header = new Row { RowIndex = 1u };
+    for (var index = 0; index < fields.Count; index++)
+    {
+        var field = fields[index];
+        var cell = new Cell {
+            CellReference = ColumnName(index + 1) + "1",
+            DataType = CellValues.InlineString,
+            InlineString = new InlineString(new Text(field.Title) { Space = SpaceProcessingModeValues.Preserve }),
+        };
+        var headerColor = field.Source switch {
+            "fixed" => "DDEBF7",
+            "platform_attribute" => "E2F0D9",
+            "platform_specification" => "FFF2CC",
+            _ => merchantHeaderColor,
+        };
+        cell.StyleIndex = FillStyle(workbookPart, 0u, headerColor, null, styleCache);
+        header.Append(cell);
+    }
+    data.Append(header);
+    var rowElements = rows.EnumerateArray().ToArray();
+    var sourceElements = sourceRows.EnumerateArray().ToArray();
+    for (var rowIndex = 0; rowIndex < rowElements.Length; rowIndex++)
+    {
+        if (rowElements[rowIndex].ValueKind != JsonValueKind.Object || !sourceElements[rowIndex].TryGetUInt32(out var sourceRow))
+            throw new InvalidDataException("product output row or source row is invalid");
+        var row = new Row { RowIndex = (uint)rowIndex + 2u };
+        for (var columnIndex = 0; columnIndex < fields.Count; columnIndex++)
+        {
+            var field = fields[columnIndex];
+            var cell = new Cell { CellReference = ColumnName(columnIndex + 1) + row.RowIndex!.Value };
+            JsonElement? value = rowElements[rowIndex].TryGetProperty(field.Id, out var property) ? property : null;
+            WriteSafeValue(cell, value, field.FieldType, Uses1904DateSystem(workbookPart));
+            issues.TryGetValue((categoryId, sourceRow, field.Id), out var issueColor);
+            if (!String.IsNullOrWhiteSpace(issueColor) || !String.IsNullOrWhiteSpace(field.NumberFormat))
+                cell.StyleIndex = FillStyle(workbookPart, 0u, issueColor, field.NumberFormat, styleCache);
+            row.Append(cell);
+        }
+        data.Append(row);
+    }
+    var endColumn = ColumnName(fields.Count);
+    var endRow = Math.Max(1, rows.GetArrayLength() + 1);
+    worksheet.Append(new AutoFilter { Reference = $"A1:{endColumn}{endRow}" });
+    RecalculateDimension(worksheet);
+    worksheet.Save();
+    var workbook = workbookPart.Workbook ?? throw new InvalidDataException("workbook is missing");
+    var sheets = workbook.Sheets ?? workbook.AppendChild(new Sheets());
+    var nextId = sheets.Elements<Sheet>().Select(item => item.SheetId?.Value ?? 0u).DefaultIfEmpty(0u).Max() + 1u;
+    sheets.Append(new Sheet { Id = workbookPart.GetIdOfPart(part), SheetId = nextId, Name = name });
+}
+
+static void RemoveSheetIfPresent(WorkbookPart workbookPart, string name)
+{
+    var sheets = workbookPart.Workbook?.Sheets;
+    var existing = sheets?.Elements<Sheet>().FirstOrDefault(item => StringComparer.OrdinalIgnoreCase.Equals(item.Name?.Value, name));
+    if (existing is null) return;
+    var oldPart = workbookPart.GetPartById(existing.Id!);
+    existing.Remove();
+    workbookPart.DeletePart(oldPart);
+}
+
+static string UniqueSheetName(string requested, string categoryId, HashSet<string> used)
+{
+    var sanitized = Regex.Replace(requested, @"[\[\]:*?/\\]", "-");
+    if (sanitized.Length > 31) sanitized = sanitized[..31];
+    if (!used.Contains(sanitized) && IsValidSheetName(sanitized)) return sanitized;
+    var suffix = "-" + categoryId;
+    if (suffix.Length > 12) suffix = suffix[..12];
+    var candidate = sanitized[..Math.Min(sanitized.Length, 31 - suffix.Length)] + suffix;
+    var counter = 2;
+    while (used.Contains(candidate))
+    {
+        var marker = "-" + counter++;
+        candidate = sanitized[..Math.Min(sanitized.Length, 31 - suffix.Length - marker.Length)] + suffix + marker;
+    }
+    return candidate;
+}
+
+static string SafeManifestSourcePath(string manifestDirectory, string source)
+{
+    var path = Path.GetFullPath(Path.Combine(manifestDirectory, source));
+    var relative = Path.GetRelativePath(manifestDirectory, path);
+    if (Path.IsPathRooted(relative) || relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar))
+        throw new InvalidDataException("source path escapes manifest directory");
+    return path;
 }
 
 static void AddMetadataSheet(WorkbookPart workbookPart, RenderManifest manifest)
@@ -1209,7 +1398,7 @@ static string CellColumn(string reference) => new(reference.TakeWhile(Char.IsLet
 static int ColumnNumber(string name) { var value = 0; foreach (var c in name.ToUpperInvariant()) value = value * 26 + c - 'A' + 1; return value; }
 static string ColumnName(int number) { var value = ""; while (number > 0) { number--; value = (char)('A' + number % 26) + value; number /= 26; } return value; }
 
-static int OperationPhase(string type) => type switch { "mark_cell" or "mark_row" => 0, "set_number_format" or "set_cell" => 1, "insert_column" => 2, "set_cell_after_insert" => 3, "append_row" => 4, "add_or_replace_report_sheet" => 5, _ => 99 };
+static int OperationPhase(string type) => type switch { "mark_cell" or "mark_row" => 0, "set_number_format" or "set_cell" => 1, "insert_column" => 2, "set_cell_after_insert" => 3, "append_row" => 4, "add_or_replace_product_sheets" => 5, "add_or_replace_report_sheet" => 6, _ => 99 };
 
 static void ValidateManifest(RenderManifest manifest)
 {
@@ -1218,13 +1407,14 @@ static void ValidateManifest(RenderManifest manifest)
         throw new InvalidDataException("manifest identity or input hash is invalid");
     if (manifest.Operations is null) throw new InvalidDataException("manifest operations are required");
     ValidateMetadata(manifest.Metadata);
-    var known = new HashSet<string> { "mark_cell", "mark_row", "set_cell", "set_number_format", "insert_column", "set_cell_after_insert", "append_row", "add_or_replace_report_sheet" };
+    var known = new HashSet<string> { "mark_cell", "mark_row", "set_cell", "set_number_format", "insert_column", "set_cell_after_insert", "append_row", "add_or_replace_product_sheets", "add_or_replace_report_sheet" };
     foreach (var operation in manifest.Operations)
     {
         if (operation is null) throw new InvalidDataException("manifest operations must not contain null items");
         if (!known.Contains(operation.Type)) throw new InvalidDataException($"unknown operation type: {operation.Type}");
-        if (operation.Type is not "add_or_replace_report_sheet" && String.IsNullOrWhiteSpace(operation.Sheet)) throw new InvalidDataException($"{operation.Type} requires sheet");
-        if (operation.Type == "add_or_replace_report_sheet" && operation.Sheet is not null) throw new InvalidDataException("report operation must not declare sheet");
+        var globalOperation = operation.Type is "add_or_replace_report_sheet" or "add_or_replace_product_sheets";
+        if (!globalOperation && String.IsNullOrWhiteSpace(operation.Sheet)) throw new InvalidDataException($"{operation.Type} requires sheet");
+        if (globalOperation && operation.Sheet is not null) throw new InvalidDataException($"{operation.Type} must not declare sheet");
         if (operation.Type is "mark_cell" or "set_cell" or "set_number_format" or "set_cell_after_insert")
         {
             if (!IsValidCellReference(operation.Cell)) throw new InvalidDataException($"{operation.Type} requires a valid Excel cell");
@@ -1257,6 +1447,11 @@ static void ValidateManifest(RenderManifest manifest)
         {
             if (!IsValidSheetName(operation.Name) || operation.Name == "__ExcelAuditorMetadata" || String.IsNullOrWhiteSpace(operation.SourceJson)) throw new InvalidDataException("report operation requires a valid non-reserved name and source_json");
             if (operation.FillColor is not null || operation.Comment is not null) throw new InvalidDataException("report operation contains unsupported presentation fields");
+        }
+        else if (operation.Type == "add_or_replace_product_sheets")
+        {
+            if (operation.Name is not null || String.IsNullOrWhiteSpace(operation.SourceJson)) throw new InvalidDataException("product sheet operation requires source_json and no name");
+            if (operation.FillColor is not null || operation.Comment is not null) throw new InvalidDataException("product sheet operation contains unsupported presentation fields");
         }
         else if (operation.Name is not null || operation.SourceJson is not null) throw new InvalidDataException($"{operation.Type} contains report-only fields");
         if (operation.Type is not ("set_cell" or "set_cell_after_insert" or "set_number_format" or "insert_column") && (operation.Value is not null || operation.FieldType is not null || operation.NumberFormat is not null))
@@ -1531,6 +1726,7 @@ sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 sealed record RenderManifest(string ManifestVersion, string JobId, string InputSha256, List<RenderOperation> Operations, RenderMetadata? Metadata);
 sealed record RenderMetadata(string? SchemaId, string? SchemaVersion, string? SchemaSha256, string? StandardSnapshotId, string? StandardSha256, string? ResultSha256);
 sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate, uint? DataStartRow, List<uint>? FormulaRows, string? Timezone);
+sealed record ProductField(string Id, string Title, string Source, string FieldType, string? NumberFormat);
 sealed record RenderValue(string? Cell, JsonElement? Value, string? FieldType, string? NumberFormat, string? FormulaTemplate, string? Timezone);
 sealed record RenderValidation(string? Type, List<string>? Values, string? Min, string? Max, bool AllowBlank = true);
 sealed record OperationResult(int OperationIndex, string Type, string? DifferenceId, string Status, string? ErrorCode, string? Message);

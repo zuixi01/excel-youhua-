@@ -5,12 +5,13 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, delete, insert, select
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, delete, func, insert, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from .models import AuditReport, RuleSet
 from .snapshots import StandardSnapshot
 from .ids import new_ulid
+from .product_workflow.models import CatalogSchemaSnapshot, ProductNormalizationResult
 
 
 class Base(DeclarativeBase):
@@ -130,6 +131,52 @@ class AuditEventRow(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ProductCatalogSnapshotRow(Base):
+    __tablename__ = "product_catalog_snapshots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(200), index=True)
+    connection_id: Mapped[str] = mapped_column(String(200), index=True)
+    category_id: Mapped[str] = mapped_column(String(300), index=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    fields_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    source_metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ProductWorkflowRevisionRow(Base):
+    __tablename__ = "product_workflow_revisions"
+    __table_args__ = (
+        UniqueConstraint("job_id", "revision_number", name="uq_product_job_revision"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("comparison_jobs.id", ondelete="CASCADE"), index=True)
+    revision_number: Mapped[int] = mapped_column(Integer)
+    parent_revision_id: Mapped[str | None] = mapped_column(ForeignKey("product_workflow_revisions.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    catalog_snapshot_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+
+class ProductReviewItemRow(Base):
+    __tablename__ = "product_review_items"
+    __table_args__ = (
+        UniqueConstraint("revision_id", "review_key", name="uq_product_revision_review_key"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("comparison_jobs.id", ondelete="CASCADE"), index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("product_workflow_revisions.id", ondelete="CASCADE"), index=True)
+    review_key: Mapped[str] = mapped_column(String(500))
+    review_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    decision_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+
 class DatabaseRepository:
     def __init__(self, url: str, create_schema: bool = True) -> None:
         self.engine = create_engine(url, pool_pre_ping=True)
@@ -225,6 +272,175 @@ class DatabaseRepository:
                     batch.clear()
             if batch:
                 session.execute(insert(DifferenceIndexRow), batch)
+
+    def save_product_catalog_snapshot(
+        self,
+        snapshot: CatalogSchemaSnapshot,
+        tenant_id: str = "local",
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            existing = session.get(ProductCatalogSnapshotRow, snapshot.snapshot_id)
+            if existing is not None:
+                if existing.content_sha256 != snapshot.content_sha256 or existing.tenant_id != tenant_id:
+                    raise FileExistsError("catalog snapshot ids are immutable")
+                return
+            session.add(ProductCatalogSnapshotRow(
+                id=snapshot.snapshot_id,
+                tenant_id=tenant_id,
+                connection_id=snapshot.connection_id,
+                category_id=snapshot.category_id,
+                content_sha256=snapshot.content_sha256,
+                fields_json=[field.model_dump(mode="json") for field in snapshot.fields],
+                source_metadata_json=snapshot.source_metadata,
+                captured_at=snapshot.captured_at,
+            ))
+
+    def create_product_revision(
+        self,
+        job_id: str,
+        result: ProductNormalizationResult,
+        *,
+        actor_id: str | None = None,
+        parent_revision_id: str | None = None,
+        tenant_id: str = "local",
+    ) -> dict[str, Any]:
+        with Session(self.engine) as session, session.begin():
+            job = session.scalar(select(ComparisonJobRow).where(
+                ComparisonJobRow.id == job_id,
+                ComparisonJobRow.tenant_id == tenant_id,
+            ))
+            if job is None:
+                raise FileNotFoundError("product workflow job not found")
+            if parent_revision_id is not None:
+                parent = session.scalar(select(ProductWorkflowRevisionRow).where(
+                    ProductWorkflowRevisionRow.id == parent_revision_id,
+                    ProductWorkflowRevisionRow.job_id == job_id,
+                ))
+                if parent is None:
+                    raise ValueError("parent revision does not belong to the product workflow job")
+            number = (session.scalar(select(func.max(ProductWorkflowRevisionRow.revision_number)).where(
+                ProductWorkflowRevisionRow.job_id == job_id,
+            )) or 0) + 1
+            revision_id = new_ulid("prev_")
+            status = "manual_review" if result.requires_manual_review else "ready"
+            session.add(ProductWorkflowRevisionRow(
+                id=revision_id,
+                job_id=job_id,
+                revision_number=number,
+                parent_revision_id=parent_revision_id,
+                status=status,
+                catalog_snapshot_ids_json=[snapshot.snapshot_id for snapshot in result.catalog_snapshots],
+                result_json=result.model_dump(mode="json"),
+                created_at=_now(),
+                created_by=actor_id,
+            ))
+            for review in result.review_items:
+                session.add(ProductReviewItemRow(
+                    id=new_ulid("review_"),
+                    job_id=job_id,
+                    revision_id=revision_id,
+                    review_key=review.key,
+                    review_type=review.review_type,
+                    status="pending",
+                    payload_json=review.model_dump(mode="json"),
+                    decision_json=None,
+                    created_at=_now(),
+                    decided_at=None,
+                    decided_by=None,
+                ))
+            session.add(_event(
+                "product.revision_created",
+                "product_workflow_revision",
+                revision_id,
+                actor_id,
+                {"job_id": job_id, "revision_number": number, "status": status},
+                tenant_id,
+            ))
+            return {"revision_id": revision_id, "revision_number": number, "status": status}
+
+    def list_product_reviews(
+        self,
+        job_id: str,
+        *,
+        revision_id: str | None = None,
+        status: str | None = None,
+        tenant_id: str = "local",
+    ) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            job = session.scalar(select(ComparisonJobRow.id).where(
+                ComparisonJobRow.id == job_id,
+                ComparisonJobRow.tenant_id == tenant_id,
+            ))
+            if job is None:
+                raise FileNotFoundError("product workflow job not found")
+            selected_revision = revision_id
+            if selected_revision is None:
+                selected_revision = session.scalar(
+                    select(ProductWorkflowRevisionRow.id)
+                    .where(ProductWorkflowRevisionRow.job_id == job_id)
+                    .order_by(ProductWorkflowRevisionRow.revision_number.desc())
+                    .limit(1)
+                )
+            query = select(ProductReviewItemRow).where(
+                ProductReviewItemRow.job_id == job_id,
+                ProductReviewItemRow.revision_id == selected_revision,
+            ).order_by(ProductReviewItemRow.created_at, ProductReviewItemRow.id)
+            if status is not None:
+                query = query.where(ProductReviewItemRow.status == status)
+            rows = session.scalars(query).all()
+            return [self._review_payload(row) for row in rows]
+
+    def decide_product_review(
+        self,
+        job_id: str,
+        review_id: str,
+        decision: dict[str, Any],
+        *,
+        actor_id: str,
+        tenant_id: str = "local",
+    ) -> dict[str, Any]:
+        with Session(self.engine) as session, session.begin():
+            row = session.scalar(select(ProductReviewItemRow).join(
+                ComparisonJobRow,
+                ProductReviewItemRow.job_id == ComparisonJobRow.id,
+            ).where(
+                ProductReviewItemRow.id == review_id,
+                ProductReviewItemRow.job_id == job_id,
+                ComparisonJobRow.tenant_id == tenant_id,
+            ))
+            if row is None:
+                raise FileNotFoundError("product review item not found")
+            if row.status != "pending":
+                raise ValueError("product review item has already been decided")
+            row.status = "resolved"
+            row.decision_json = decision
+            row.decided_at = _now()
+            row.decided_by = actor_id
+            session.add(_event(
+                "product.review_decided",
+                "product_review_item",
+                review_id,
+                actor_id,
+                {"job_id": job_id, "action": decision.get("action")},
+                tenant_id,
+            ))
+            return self._review_payload(row)
+
+    @staticmethod
+    def _review_payload(row: ProductReviewItemRow) -> dict[str, Any]:
+        return {
+            "review_id": row.id,
+            "job_id": row.job_id,
+            "revision_id": row.revision_id,
+            "review_key": row.review_key,
+            "review_type": row.review_type,
+            "status": row.status,
+            "payload": row.payload_json,
+            "decision": row.decision_json,
+            "created_at": row.created_at.isoformat(),
+            "decided_at": row.decided_at.isoformat() if row.decided_at else None,
+            "decided_by": row.decided_by,
+        }
 
     def mark_repair_results(self, job_id: str, results: dict[str, str]) -> None:
         with Session(self.engine) as session, session.begin():

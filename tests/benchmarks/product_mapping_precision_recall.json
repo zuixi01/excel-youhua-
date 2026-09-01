@@ -1,0 +1,18 @@
+{
+  "minimum_precision": 1.0,
+  "minimum_recall": 1.0,
+  "fields": [
+    {"field_id": "brand", "title": "品牌", "aliases": ["商品品牌"]},
+    {"field_id": "model", "title": "型号", "aliases": ["机型"]},
+    {"field_id": "material", "title": "材质", "aliases": []},
+    {"field_id": "color", "title": "颜色", "aliases": []}
+  ],
+  "cases": [
+    {"headers": ["品牌", "型号", "颜色"], "accepted": {"1": "brand", "2": "model", "3": "color"}, "review": {}},
+    {"headers": ["商品品牌", "机型", "材质"], "accepted": {"1": "brand", "2": "model", "3": "material"}, "review": {}},
+    {"headers": ["brand", "model", "内部备注"], "accepted": {"1": "brand", "2": "model"}, "review": {}},
+    {"headers": ["品脾"], "accepted": {}, "review": {"1": "brand"}},
+    {"headers": ["品牌", "品牌"], "accepted": {"1": "brand"}, "review": {"2": "brand"}},
+    {"headers": ["采购说明", "供应商留言"], "accepted": {}, "review": {}}
+  ]
+}

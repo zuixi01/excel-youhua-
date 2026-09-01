@@ -6,6 +6,13 @@ from hypothesis import given, settings, strategies as st
 
 from excel_auditor.engine import compare_workbook
 from excel_auditor.models import ColumnRule, RuleSet, normalize_header
+from excel_auditor.product_workflow import (
+    CatalogFieldDefinition,
+    CatalogFieldSource,
+    CatalogSchemaSnapshot,
+    build_dynamic_schema,
+    map_product_headers,
+)
 from excel_auditor.normalization import apply_normalizers, parse_value, values_equal
 from excel_auditor.workbook import SheetSnapshot, WorkbookSnapshot
 
@@ -114,3 +121,64 @@ def test_standard_record_order_does_not_change_semantic_differences_or_repairs(i
     finally:
         first.close()
         second.close()
+
+
+@given(st.lists(st.from_regex(r"[A-Za-z0-9]{1,8}", fullmatch=True).map(lambda value: f"商家_{value}"), max_size=20, unique=True))
+def test_dynamic_product_schema_never_loses_or_reorders_merchant_extra_headers(extra_headers):
+    fixed = [ColumnRule(name="product_id", title="商品ID", required=True)]
+    platform = [CatalogFieldDefinition(
+        field_id="brand",
+        title="品牌",
+        source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+        category_id="phone",
+        attribute_id="brand",
+    )]
+    targets = [CatalogFieldDefinition(
+        field_id="product_id",
+        title="商品ID",
+        source=CatalogFieldSource.FIXED,
+        required=True,
+    ), *platform]
+    headers = ["商品ID", "品牌", *extra_headers]
+    mappings = map_product_headers(headers, targets, fuzzy_threshold=100)
+    plan = build_dynamic_schema(
+        category_id="phone",
+        category_name="手机",
+        fixed_columns=fixed,
+        platform_fields=platform,
+        headers=headers,
+        mappings=mappings,
+    )
+    merchant_fields = [item for item in plan.fields if item.field.source == CatalogFieldSource.MERCHANT_EXTRA]
+    assert [item.source_header for item in merchant_fields] == extra_headers
+    assert [item.field.title for item in merchant_fields] == extra_headers
+    assert len({item.field.field_id for item in plan.fields}) == len(plan.fields)
+
+
+@given(st.permutations(("brand", "material", "color")))
+def test_catalog_snapshot_hash_and_field_order_are_independent_of_api_record_order(order):
+    fields_by_id = {
+        field_id: CatalogFieldDefinition(
+            field_id=field_id,
+            title=field_id.title(),
+            source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+            category_id="phone",
+            attribute_id=field_id,
+            display_order={"brand": 1, "material": 2, "color": 3}[field_id],
+        )
+        for field_id in ("brand", "material", "color")
+    }
+    snapshot = CatalogSchemaSnapshot.create(
+        snapshot_id="catalog_property",
+        connection_id="platform",
+        category_id="phone",
+        fields=[fields_by_id[field_id] for field_id in order],
+    )
+    canonical = CatalogSchemaSnapshot.create(
+        snapshot_id="catalog_property",
+        connection_id="platform",
+        category_id="phone",
+        fields=[fields_by_id[field_id] for field_id in ("brand", "material", "color")],
+    )
+    assert snapshot.content_sha256 == canonical.content_sha256
+    assert [field.field_id for field in snapshot.fields] == ["brand", "material", "color"]

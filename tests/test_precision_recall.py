@@ -6,10 +6,12 @@ from excel_auditor.models import RuleSet
 from excel_auditor.engine import compare_workbook
 from excel_auditor.workbook import SheetSnapshot, inspect_workbook
 from openpyxl import Workbook
+from excel_auditor.product_workflow import CatalogFieldDefinition, CatalogFieldSource, map_product_headers
 
 
 BENCHMARK = json.loads(Path("tests/benchmarks/precision_recall.json").read_text(encoding="utf-8"))
 CORE = json.loads(Path("tests/golden_files/core_scenarios.json").read_text(encoding="utf-8"))
+PRODUCT_BENCHMARK = json.loads(Path("tests/benchmarks/product_mapping_precision_recall.json").read_text(encoding="utf-8"))
 
 
 def test_confirmed_header_mapping_precision_and_recall_meet_release_thresholds():
@@ -39,6 +41,49 @@ def test_distinct_headers_mapping_to_one_canonical_field_are_duplicates():
     assert [(item.physical_column, item.status) for item in id_mappings] == [(1, "duplicate"), (2, "duplicate")]
     assert "id" not in columns
     assert columns == {"name": 3, "phone": 4}
+
+
+def test_product_mapping_precision_recall_and_manual_review_gate_meet_release_thresholds():
+    fields = [
+        CatalogFieldDefinition(
+            field_id=item["field_id"],
+            title=item["title"],
+            aliases=item["aliases"],
+            source=CatalogFieldSource.FIXED,
+        )
+        for item in PRODUCT_BENCHMARK["fields"]
+    ]
+    predicted_accepted = set()
+    expected_accepted = set()
+    predicted_review = set()
+    expected_review = set()
+    for case_index, case in enumerate(PRODUCT_BENCHMARK["cases"]):
+        mappings = map_product_headers(case["headers"], fields, fuzzy_threshold=50)
+        predicted_accepted.update(
+            (case_index, mapping.physical_column, mapping.field_id)
+            for mapping in mappings
+            if mapping.status == "accepted"
+        )
+        expected_accepted.update(
+            (case_index, int(column), field_id)
+            for column, field_id in case["accepted"].items()
+        )
+        predicted_review.update(
+            (case_index, mapping.physical_column, mapping.field_id or mapping.candidates[0].field_id)
+            for mapping in mappings
+            if mapping.status == "manual_review" and (mapping.field_id or mapping.candidates)
+        )
+        expected_review.update(
+            (case_index, int(column), field_id)
+            for column, field_id in case["review"].items()
+        )
+        assert all(
+            mapping.status != "accepted"
+            for mapping in mappings
+            if mapping.match_type == "fuzzy_suggestion"
+        )
+    _assert_precision_recall(predicted_accepted, expected_accepted, "product automatic field mapping")
+    _assert_precision_recall(predicted_review, expected_review, "product manual-review detection")
 
 
 def _assert_precision_recall(predicted, expected, label):

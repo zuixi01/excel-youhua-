@@ -127,17 +127,34 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             if missing and risky:
                 warnings.append(f"{physical_name}: development renderer refused column insertion because of {', '.join(risky)}")
                 continue
-            operation_count += _insert_missing_columns(sheet, sheet_rule, missing, rules.colors.inserted)
+            operation_count += _insert_missing_columns(
+                sheet,
+                sheet_rule,
+                missing,
+                rules.colors.inserted,
+                header_row=(comparison.resolved_header_rows_by_sheet or {}).get(sheet_rule.id),
+                formula_rows=(comparison.formula_rows_by_sheet or {}).get(sheet_rule.id, []),
+            )
         for repair in comparison.repairs:
             if repair.sheet_name not in book.sheetnames:
                 continue
             sheet = book[repair.sheet_name]
             if repair.type == "set_field" and repair.excel_row and repair.canonical_field:
-                positions = _canonical_positions(sheet, next(item for item in rules.sheets if item.id == repair.sheet_id))
+                sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
+                positions = _canonical_positions(
+                    sheet,
+                    sheet_rule,
+                    header_row=(comparison.resolved_header_rows_by_sheet or {}).get(repair.sheet_id),
+                )
                 if repair.canonical_field not in positions:
                     raise RuntimeError(f"RENDER_FAILED: repaired field has no final column: {repair.canonical_field}")
                 cell = sheet.cell(repair.excel_row, positions[repair.canonical_field])
-                _set_safe_value(cell, repair.value)
+                column_rule = next(item for item in sheet_rule.columns if item.name == repair.canonical_field)
+                allow_formula = bool(
+                    column_rule.formula_template
+                    and repair.value == column_rule.formula_template.replace("{row}", str(repair.excel_row))
+                )
+                _set_safe_value(cell, repair.value, allow_formula=allow_formula)
                 cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
                 _set_audit_comment(
                     cell,
@@ -146,12 +163,21 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
                 operation_count += 1
             elif repair.type == "append_record" and repair.excel_row and repair.values is not None:
                 sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
-                positions = _canonical_positions(sheet, sheet_rule)
+                positions = _canonical_positions(
+                    sheet,
+                    sheet_rule,
+                    header_row=(comparison.resolved_header_rows_by_sheet or {}).get(repair.sheet_id),
+                )
                 for field, value in repair.values.items():
                     if field not in positions:
                         continue
                     cell = sheet.cell(repair.excel_row, positions[field])
-                    _set_safe_value(cell, value)
+                    column_rule = next(item for item in sheet_rule.columns if item.name == field)
+                    allow_formula = bool(
+                        column_rule.formula_template
+                        and value == column_rule.formula_template.replace("{row}", str(repair.excel_row))
+                    )
+                    _set_safe_value(cell, value, allow_formula=allow_formula)
                     cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
                 _set_audit_comment(
                     sheet.cell(repair.excel_row, 1),
@@ -166,9 +192,18 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
         for key, value in summary.items():
             report_sheet.append([key, value])
         report_sheet.append([])
-        report_sheet.append(["类型", "工作表", "单元格", "业务主键", "说明"])
+        report_sheet.append([
+            "类型", "级别", "工作表", "单元格", "字段", "业务主键", "Excel 原值",
+            "Excel 规范值", "标准原值", "标准规范值", "规则 ID", "动作", "修复状态", "说明",
+        ])
         for item in report_payload.get("differences", []):
-            report_sheet.append([item["type"], item["sheet_name"], item.get("cell"), json.dumps(item.get("business_key"), ensure_ascii=False), item["message"]])
+            report_sheet.append([
+                item["type"], item.get("severity"), item["sheet_name"], item.get("cell"),
+                item.get("canonical_field"), json.dumps(item.get("business_key"), ensure_ascii=False),
+                _report_cell_value(item.get("excel_raw_value")), _report_cell_value(item.get("excel_normalized_value")),
+                _report_cell_value(item.get("standard_raw_value")), _report_cell_value(item.get("standard_normalized_value")),
+                item.get("rule_id"), item.get("render_action"), item.get("repair_status"), item["message"],
+            ])
         report_sheet.sheet_state = "visible"
         operation_count += 1
         if "__ExcelAuditorMetadata" in book.sheetnames:
@@ -225,11 +260,20 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
 
     def render(self, source: Path, destination: Path, workbook: WorkbookSnapshot, rules: RuleSet, comparison: ComparisonResult, report_payload: dict[str, Any]) -> RenderResult:
         manifest = destination.parent / "render-manifest.private.json"
+        return self.render_manifest(source, destination, manifest, rules.workbook.processing_timeout_seconds)
+
+    def render_manifest(
+        self,
+        source: Path,
+        destination: Path,
+        manifest: Path,
+        timeout_seconds: int,
+    ) -> RenderResult:
         completed = subprocess.run(
             [str(self.command), "--input", str(source), "--output", str(destination), "--manifest", str(manifest)],
             capture_output=True,
             text=True,
-            timeout=rules.workbook.processing_timeout_seconds,
+            timeout=timeout_seconds,
             check=False,
         )
         if completed.returncode != 0:
@@ -261,12 +305,20 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
         return RenderResult(destination, digest, operation_results=operation_results)
 
 
-def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Difference], color: str) -> int:
+def _insert_missing_columns(
+    sheet: Any,
+    sheet_rule: Any,
+    missing: list[Difference],
+    color: str,
+    *,
+    header_row: int | None = None,
+    formula_rows: list[int] | None = None,
+) -> int:
     missing_by_name = {item.canonical_field: item for item in missing}
     missing_names = set(missing_by_name)
     if not missing_names:
         return 0
-    header_row = sheet_rule.header.row
+    header_row = header_row or sheet_rule.header.row
     known_positions: dict[str, int] = {}
     normalized_headers = {str(sheet.cell(header_row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
     for rule in sheet_rule.columns:
@@ -293,6 +345,13 @@ def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Differenc
             cell,
             _repair_provenance_comment("自动插入缺失表头", difference.rule_id or f"{rule.name}.missing_column", difference),
         )
+        if rule.formula_template:
+            for row_number in formula_rows or []:
+                formula_cell = sheet.cell(row_number, before)
+                formula_cell.value = rule.formula_template.replace("{row}", str(row_number))
+                formula_cell.data_type = "f"
+                if rule.format:
+                    formula_cell.number_format = rule.format
     return len(plans)
 
 
@@ -367,9 +426,10 @@ def _set_result_content_hash(path: Path, metadata_entry: str) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
-def _canonical_positions(sheet: Any, sheet_rule: Any) -> dict[str, int]:
+def _canonical_positions(sheet: Any, sheet_rule: Any, *, header_row: int | None = None) -> dict[str, int]:
     positions: dict[str, int] = {}
-    normalized_headers = {str(sheet.cell(sheet_rule.header.row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
+    header_row = header_row or sheet_rule.header.row
+    normalized_headers = {str(sheet.cell(header_row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
     for rule in sheet_rule.columns:
         for candidate in [rule.title, rule.name, *rule.aliases]:
             if candidate in normalized_headers:
@@ -378,10 +438,18 @@ def _canonical_positions(sheet: Any, sheet_rule: Any) -> dict[str, int]:
     return positions
 
 
-def _set_safe_value(cell: Any, value: Any) -> None:
+def _set_safe_value(cell: Any, value: Any, *, allow_formula: bool = False) -> None:
     cell.value = value
-    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")) and not allow_formula:
         cell.data_type = "s"
+
+
+def _report_cell_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=isinstance(value, dict), default=str)
+    return str(value)
 
 
 def _comment(item: Difference) -> str:

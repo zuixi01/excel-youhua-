@@ -765,6 +765,171 @@ class StandardSourceConfig(StrictModel):
         return self
 
 
+class ProductCategoryRecordMapping(StrictModel):
+    id_key: str = "id"
+    name_key: str = "name"
+    parent_id_key: str | None = "parent_id"
+    path_key: str | None = "path"
+    aliases_key: str | None = "aliases"
+    active_key: str | None = "active"
+
+    @field_validator("id_key", "name_key", "parent_id_key", "path_key", "aliases_key", "active_key")
+    @classmethod
+    def valid_record_key(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or len(value) > 128 or any(ord(character) < 32 for character in value)):
+            raise ValueError("catalog record keys must be printable, non-blank, and no longer than 128 characters")
+        return value
+
+    @model_validator(mode="after")
+    def distinct_keys(self) -> "ProductCategoryRecordMapping":
+        keys = [value for value in self.model_dump().values() if value is not None]
+        if len(keys) != len(set(keys)):
+            raise ValueError("category record mapping keys must be distinct")
+        return self
+
+
+class ProductFieldRecordMapping(StrictModel):
+    id_key: str = "id"
+    title_key: str = "title"
+    aliases_key: str | None = "aliases"
+    type_key: str | None = "type"
+    required_key: str | None = "required"
+    multiple_key: str | None = "multiple"
+    display_order_key: str | None = "display_order"
+    enum_values_key: str | None = "enum_values"
+    number_format_key: str | None = "number_format"
+
+    @field_validator(
+        "id_key", "title_key", "aliases_key", "type_key", "required_key", "multiple_key",
+        "display_order_key", "enum_values_key", "number_format_key",
+    )
+    @classmethod
+    def valid_record_key(cls, value: str | None) -> str | None:
+        return ProductCategoryRecordMapping.valid_record_key(value)
+
+    @model_validator(mode="after")
+    def distinct_keys(self) -> "ProductFieldRecordMapping":
+        keys = [value for value in self.model_dump().values() if value is not None]
+        if len(keys) != len(set(keys)):
+            raise ValueError("field record mapping keys must be distinct")
+        return self
+
+
+class ProductCatalogEndpoint(StrictModel):
+    """A managed catalog endpoint whose category placeholder is substituted safely."""
+
+    path_template: str
+    data_json_path: str = "$.data"
+    method: Literal["GET", "POST"] = "GET"
+    category_parameter: str | None = None
+    static_parameters: dict[str, Any] = Field(default_factory=dict)
+    pagination: PaginationConfig | None = None
+    record_mapping: ProductFieldRecordMapping = Field(default_factory=ProductFieldRecordMapping)
+
+    @field_validator("path_template")
+    @classmethod
+    def valid_path_template(cls, value: str) -> str:
+        if value.count("{category_id}") != 1:
+            raise ValueError("catalog path_template must contain exactly one {category_id} placeholder")
+        if "{" in value.replace("{category_id}", "") or "}" in value.replace("{category_id}", ""):
+            raise ValueError("catalog path_template contains an unsupported placeholder")
+        validate_managed_http_path(
+            value.replace("{category_id}", "category-id"),
+            field_name="product_workflow catalog path_template",
+        )
+        return value
+
+    @field_validator("data_json_path")
+    @classmethod
+    def valid_catalog_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="product_workflow catalog data_json_path") or "$"
+
+    @field_validator("category_parameter")
+    @classmethod
+    def valid_category_parameter(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_parameter_name(value, field_name="product_workflow catalog category_parameter")
+        return value
+
+    @model_validator(mode="after")
+    def validate_parameters(self) -> "ProductCatalogEndpoint":
+        for name in self.static_parameters:
+            validate_parameter_name(str(name), field_name="product_workflow catalog static parameter")
+        occupied = set(self.static_parameters)
+        if self.category_parameter is not None and self.category_parameter in occupied:
+            raise ValueError("catalog category_parameter overlaps a static parameter")
+        if self.pagination is not None:
+            collisions = occupied & {self.pagination.page_param, self.pagination.size_param}
+            if collisions:
+                raise ValueError(f"catalog pagination parameters overlap static parameters: {sorted(collisions)}")
+        return self
+
+
+class ProductCategoryConfig(StrictModel):
+    source_field: str = Field(default="merchant_category", min_length=1, max_length=128)
+    id_field: str | None = Field(default="platform_category_id", min_length=1, max_length=128)
+    category_list_path: str = "/categories"
+    category_list_json_path: str = "$.data"
+    category_list_method: Literal["GET", "POST"] = "GET"
+    category_list_static_parameters: dict[str, Any] = Field(default_factory=dict)
+    category_list_pagination: PaginationConfig | None = None
+    record_mapping: ProductCategoryRecordMapping = Field(default_factory=ProductCategoryRecordMapping)
+    attributes: ProductCatalogEndpoint
+    specifications: ProductCatalogEndpoint
+
+    @field_validator("category_list_path")
+    @classmethod
+    def valid_category_list_path(cls, value: str) -> str:
+        return validate_managed_http_path(value, field_name="product_workflow category_list_path")
+
+    @field_validator("category_list_json_path")
+    @classmethod
+    def valid_category_list_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="product_workflow category_list_json_path") or "$"
+
+    @model_validator(mode="after")
+    def valid_category_list_parameters(self) -> "ProductCategoryConfig":
+        for name in self.category_list_static_parameters:
+            validate_parameter_name(str(name), field_name="product_workflow category list static parameter")
+        if self.category_list_pagination is not None:
+            collisions = set(self.category_list_static_parameters) & {
+                self.category_list_pagination.page_param,
+                self.category_list_pagination.size_param,
+            }
+            if collisions:
+                raise ValueError(f"category list pagination parameters overlap static parameters: {sorted(collisions)}")
+        return self
+
+
+class ProductOutputConfig(StrictModel):
+    multi_category_mode: Literal["split_sheets"] = "split_sheets"
+    merchant_extra_mode: Literal["append_right"] = "append_right"
+    sku_sheet_mode: Literal["when_present", "always", "disabled"] = "when_present"
+    required_missing_color: str = "F4CCCC"
+    invalid_value_color: str = "F9CB9C"
+    ambiguous_color: str = "D9D2E9"
+    merchant_extra_header_color: str = "D9D9D9"
+
+    @field_validator(
+        "required_missing_color",
+        "invalid_value_color",
+        "ambiguous_color",
+        "merchant_extra_header_color",
+    )
+    @classmethod
+    def valid_product_color(cls, value: str) -> str:
+        return Colors.rgb(value)
+
+
+class ProductWorkflowConfig(StrictModel):
+    sheet_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    catalog_connection_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    category: ProductCategoryConfig
+    output: ProductOutputConfig = Field(default_factory=ProductOutputConfig)
+    mapping_fuzzy_threshold: int = Field(default=92, ge=0, le=100)
+    minimum_category_confidence: int = Field(default=95, ge=0, le=100)
+
+
 class RuleSet(StrictModel):
 
     schema_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -774,6 +939,7 @@ class RuleSet(StrictModel):
     sheets: list[SheetRule] = Field(min_length=1)
     colors: Colors = Field(default_factory=Colors)
     standard_source: StandardSourceConfig = Field(default_factory=StandardSourceConfig)
+    product_workflow: ProductWorkflowConfig | None = None
 
     @field_validator("schema_version")
     @classmethod
@@ -800,6 +966,25 @@ class RuleSet(StrictModel):
             if physical_owner is not None and physical_owner != sheet.id:
                 raise ValueError(
                     f"sheet id {sheet.id!r} conflicts with a worksheet name or alias owned by sheet {physical_owner!r}"
+                )
+        if self.product_workflow is not None:
+            product_sheet = next(
+                (sheet for sheet in self.sheets if sheet.id == self.product_workflow.sheet_id),
+                None,
+            )
+            if product_sheet is None:
+                raise ValueError(
+                    f"product_workflow sheet_id does not exist: {self.product_workflow.sheet_id}"
+                )
+            names = {column.name for column in product_sheet.columns}
+            category = self.product_workflow.category
+            required_fields = {category.source_field}
+            if category.id_field is not None:
+                required_fields.add(category.id_field)
+            missing = required_fields - names
+            if missing:
+                raise ValueError(
+                    f"product_workflow category fields do not exist on sheet {product_sheet.id!r}: {sorted(missing)}"
                 )
         return self
 
