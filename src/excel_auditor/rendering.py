@@ -234,6 +234,14 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
 
 
 class DotNetOpenXmlRenderer(ExcelRenderer):
+    REQUIRED_CONTRACT_VERSION = 2
+    REQUIRED_CAPABILITIES = frozenset({
+        "standard-repair-v1",
+        "product-sheets-v1",
+        "report-sheet-v1",
+        "result-content-hash-v1",
+    })
+
     def __init__(self, command: Path) -> None:
         if not command.is_file():
             raise FileNotFoundError(f"renderer command not found: {command}")
@@ -256,6 +264,15 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
         version = payload.get("version")
         if payload.get("name") != "ExcelRenderer" or not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
             raise RuntimeError("renderer self-check returned an invalid identity or version")
+        capabilities = payload.get("capabilities")
+        if payload.get("contract_version") != self.REQUIRED_CONTRACT_VERSION or not isinstance(capabilities, list):
+            raise RuntimeError("renderer self-check returned an incompatible contract")
+        if any(not isinstance(capability, str) for capability in capabilities):
+            raise RuntimeError("renderer self-check returned invalid capabilities")
+        missing = self.REQUIRED_CAPABILITIES - set(capabilities)
+        build_id = payload.get("build_id")
+        if missing or not isinstance(build_id, str) or not re.fullmatch(r"[0-9a-f]{32}", build_id):
+            raise RuntimeError("renderer self-check is missing required capabilities or build identity")
         return version
 
     def render(self, source: Path, destination: Path, workbook: WorkbookSnapshot, rules: RuleSet, comparison: ComparisonResult, report_payload: dict[str, Any]) -> RenderResult:

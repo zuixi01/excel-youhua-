@@ -28,7 +28,22 @@ def test_dotnet_renderer_self_check_contract():
     command = os.environ.get("EXCEL_RENDERER_COMMAND")
     if not command:
         pytest.skip("set EXCEL_RENDERER_COMMAND to run the .NET renderer contract test")
-    assert DotNetOpenXmlRenderer(Path(command)).self_check() == "0.1.0"
+    assert DotNetOpenXmlRenderer(Path(command)).self_check() == "0.2.0"
+
+
+def test_dotnet_renderer_self_check_rejects_stale_binary(tmp_path, monkeypatch):
+    command = tmp_path / "renderer.exe"
+    command.write_bytes(b"placeholder")
+    renderer = DotNetOpenXmlRenderer(command)
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=json.dumps({"name": "ExcelRenderer", "version": "0.1.0"}),
+        stderr="",
+    ))
+
+    with pytest.raises(RuntimeError, match="incompatible contract"):
+        renderer.self_check()
 
 
 @pytest.mark.parametrize(

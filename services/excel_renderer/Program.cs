@@ -11,10 +11,24 @@ using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using DocumentFormat.OpenXml.Validation;
 
-const string RendererVersion = "0.1.0";
+const string RendererVersion = "0.2.0";
+const int RendererContractVersion = 2;
+string[] rendererCapabilities = [
+    "standard-repair-v1",
+    "product-sheets-v1",
+    "report-sheet-v1",
+    "result-content-hash-v1",
+];
 if (args.Length == 1 && args[0] == "--version")
 {
-    Console.WriteLine(JsonSerializer.Serialize(new { name = "ExcelRenderer", version = RendererVersion }, JsonOptions.Default));
+    var buildId = System.Reflection.Assembly.GetExecutingAssembly().ManifestModule.ModuleVersionId.ToString("N");
+    Console.WriteLine(JsonSerializer.Serialize(new {
+        name = "ExcelRenderer",
+        version = RendererVersion,
+        contract_version = RendererContractVersion,
+        capabilities = rendererCapabilities,
+        build_id = buildId,
+    }, JsonOptions.Default));
     return 0;
 }
 
