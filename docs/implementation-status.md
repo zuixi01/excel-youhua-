@@ -1,6 +1,6 @@
 # 开发文档落实与验收状态
 
-更新日期：2026-08-30
+更新日期：2026-09-03
 
 本页只陈述当前工作区可以复核的事实。完整的逐项状态见 `docs/requirements-evidence-matrix.md`；“代码存在”不等于已经取得生产验收证据。
 
@@ -26,13 +26,18 @@ IANA 时区本地化会往返验证 DST：不存在或重复的无偏移本地�
 
 固定 Golden 语料目前为 19 个工作簿：15 个核心表头/记录场景，外加联合主键与完整类型、结构化多工作表、合并表头人工审核，以及 10,000×20 大文件报告模式。大文件输入和 10,000 条标准 JSONL 快照均锁定 SHA，并强制工作簿与标准记录走磁盘后备序列及 Polars 分区连接。Golden 测试校验输入 SHA、完整差异计数/语义投影以及关键渲染结构；Renderer 合约另覆盖公式引用、Table、筛选、验证、命名区域、内部超链接、宏部件字节保持和不安全插列拒绝。字段统计按 `sheet_id.field` 隔离同名字段，值差异率与校验错误率分别使用该表匹配记录和实际验证记录作分母，内存/磁盘报告路径使用相同口径并包含零差异字段。工作簿内存门槛按所有工作表的实际稀疏边界合计，不再按单表分别判断；缺失 `<dimension>` 的工作表由流式包扫描取得边界，避免完整双重解析。磁盘差异序列的汇总与人工复核原因在单次遍历中完成，50 万标准记录/400,001 差异场景已通过历史 CPU 与 RSS 回退门禁。
 
+商品人工审核的 `keep_extra` 决策现在按类目隔离：某类目把物理列保留为商家附加字段时，不会再把其他类目同列的合法平台字段一起降级；单元测试与真实 Renderer 修订流程均覆盖这一回归。
+
+Renderer 自检现在同时校验契约版本、必需能力清单和每次构建唯一的模块标识，不能再仅凭相同语义版本误接收缺少商品末表操作的陈旧二进制；Windows CI 发布目录使用非隐藏路径，缺失文件立即失败，并以实际检出 SHA 命名保存可回下载的自包含制品，包内同时记录分支 HEAD、运行号、构建 ID 和文件哈希。
+
 ## 当前验证结果
 
-- 当前完整本地生产 Renderer 回归：`341 passed, 8 skipped`（共收集 349 项）；条件跳过的性能、真实基础设施和 LibreOffice 已由专用远程作业承接。
-- 当前远端提交 `b3c04e9c5eaa7cdcdf6ba4761b21cc618e2b26b0` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33255008418) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施及依赖治理制品均已保存。当前工作区新增的核心精度补强尚未形成远端 CI 证据，因此以上远端结果不替代本轮本地回归。
-- 同一提交的 [性能基线 v4 最终复核运行](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色：五个工作簿负载场景、50,000 条分页标准源、500,000 条直接比较、500,000 条受管 HTTP 服务全链路，以及 500,000 条上传 JSON 的流式解析、校验与快照均通过相对回归门禁并保存指标及 JUnit 制品。
+- 当前完整本地生产 Renderer 回归：共收集 387 项，`378 passed, 9 skipped, 0 failed/error`；9 个条件跳过项为 6 个性能场景、LibreOffice 兼容性和 2 个真实基础设施场景，均由专用远程作业承接。JUnit 用时 57.628 秒。
+- 当前核心代码提交 `0a2986bf63be85a34db7373c2d24070d2302c507` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33744714686) 全部绿色：Python 3.12/3.14、Web、Windows Renderer、LibreOffice、真实 PostgreSQL/Redis/RQ/MinIO 和依赖安全共七项均通过；JUnit、Coverage、LibreOffice、Renderer、基础设施、依赖治理及 Windows 自包含 Renderer 制品均已保存。PR 检查为 7/7 SUCCESS，合并状态 CLEAN。
+- 代码提交 `9f48477` 的 [性能基线运行](https://github.com/zuixi01/excel-youhua-/actions/runs/33741447727) 十项全部绿色：五个 v5 工作簿负载场景、50,000 条分页标准源、500,000 条直接比较、500,000 条受管 HTTP 服务全链路、500,000 条上传 JSON，以及 100,000 商品×20 属性规范化均通过门禁并保存原始指标及 JUnit 制品。
 - 条件跳过项分别由上述性能、真实基础设施和 LibreOffice 专用远程作业承接；远程通过不改变“本机未执行”的事实。
-- 本地 Windows Renderer locked restore/build/publish 通过；新增 Renderer 合约测试通过。
+- 已回下载核心提交 `0a2986b` 对应的 Windows Renderer 自包含制品；来源清单记录实际检出 SHA `f124ced1e40f31a0f223967c5efab2bef7a1a232`、Git HEAD 和 CI 运行号，其自检为 `ExcelRenderer/0.2.0`、契约版本 2、四项必需能力齐全，构建 ID 为 `b3fe245846514d378e015f62b0325697`，可执行文件 SHA-256 为 `47B0996857B5ED773E8EC8082DEDD8FF4BC1CE796A04E96CF5D07B627AAE09B2`；本地 API 就绪探针已切换到该制品并再次完成模拟商品流程。
+- 当前制品已完成商品工作流模拟验收：1 个确定类目生成类目表和 SKU 表，1 条 ID/名称冲突记录进入人工审核，7 条数据质量问题进入问题清单；类目末表按 4 个固定字段、6 个平台属性/规格字段、1 个商家附加字段排序，SKU 维度笛卡尔展开，隐藏列表与审计元数据同时生成。
 - 仓库记录的 v4 参考性能包括：10k×50 为 14.416 秒/50.48 MiB；100k×100 为 41.054 秒/254.23 MiB；100k×200、50% 差异为 53.641 秒/287.38 MiB；5 工作表 50k×50 为 11.045 秒/18.2 MiB；50,000 条分页标准源为 0.161 秒。500,000 条上传 JSON 的流式解析、校验和快照为 15.058 秒/132.49 MiB；500,000 条直接比较为 78.03 秒/268.13 MiB；受管 HTTP 服务全链路为 155.871 秒/303.38 MiB，并生成约 549 MiB 的 JSON、JSONL、HTML 工件。详见 `docs/performance-baselines.json`。
 - 性能工作流会下载上一成功主分支同版本、同场景指标；工作簿和最大规模场景以固定纯 Python 校准归一化进程 CPU，再与峰值 RSS 一起执行相对回归门禁，墙钟时间仍受硬限制。分页短场景保留进程 CPU 与绝对余量。正式发布缺少兼容参考或发生实质回归都会失败。
 - Python、Node、NuGet 锁文件以及安全/许可证/SBOM 工作流已配置；本地已对锁定的 Python、Node、NuGet 依赖执行漏洞检查，新增 ijson 依赖为 BSD-3-Clause/ISC 且已写入 NOTICE。远程 CI 已保存 `dependency-governance` 制品；GitHub Actions 已升级到官方最新发布版并固定不可变提交 SHA，运行不再产生 Node 20 运行时弃用告警。
