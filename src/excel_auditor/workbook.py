@@ -159,6 +159,7 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         raise WorkbookSafetyError("FILE_CORRUPTED")
     package_warnings: list[str] = []
     package_sheet_features: set[str] = set()
+    package_sheet_bounds: dict[str, tuple[int, int]] = {}
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         if len(infos) > 10_000:
@@ -204,21 +205,33 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             if info.filename.lower().endswith((".xml", ".rels")):
                 _validate_xml_part(archive, info)
             if info.filename.lower().startswith("xl/worksheets/") and info.filename.lower().endswith(".xml"):
-                package_sheet_features.update(_detect_sheet_xml_features(archive, info))
+                features, bounds = _inspect_sheet_xml_structure(archive, info)
+                package_sheet_features.update(features)
+                package_sheet_bounds[info.filename.replace("\\", "/").casefold()] = bounds
     try:
         probe = load_workbook(path, read_only=True, data_only=False, keep_links=False, keep_vba=path.suffix.lower() == ".xlsm")
+        effective_bounds: list[tuple[int | None, int | None]] = []
         for sheet in probe.worksheets:
-            if sheet.max_row is None or sheet.max_column is None:
-                # The worksheet dimension element is optional. Some valid OOXML
-                # producers omit it, so determine the actual sparse bounds before
-                # deciding that the workbook requires large-file report mode.
-                sheet.calculate_dimension(force=True)
-        large_mode = any(
-            sheet.max_row is None
-            or sheet.max_column is None
-            or sheet.max_row * sheet.max_column > max_in_memory_cells
-            for sheet in probe.worksheets
+            worksheet_path = str(getattr(sheet, "_worksheet_path", "")).replace("\\", "/").casefold()
+            observed = package_sheet_bounds.get(worksheet_path)
+            effective_bounds.append((
+                sheet.max_row if sheet.max_row is not None else (observed[0] if observed is not None else None),
+                sheet.max_column if sheet.max_column is not None else (observed[1] if observed is not None else None),
+            ))
+        # Never call ReadOnlyWorksheet.calculate_dimension here: it performs a
+        # complete first parse and small workbooks are then parsed a second time
+        # by the normal loader.  The package scan above already obtains actual
+        # sparse bounds while inventorying structural features.
+        has_unknown_bounds = any(
+            row_count is None or column_count is None
+            for row_count, column_count in effective_bounds
         )
+        total_cells = sum(
+            row_count * column_count
+            for row_count, column_count in effective_bounds
+            if row_count is not None and column_count is not None
+        )
+        large_mode = has_unknown_bounds or total_cells > max_in_memory_cells
         if large_mode and rules.workbook.large_file_action == "reject":
             probe.close()
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED: workbook requires large-file report mode")
@@ -449,31 +462,86 @@ def _format_normalization_targets(sheet: SheetRule, header_values: list[Any]) ->
     }
 
 
-def _detect_sheet_xml_features(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> set[str]:
-    markers = {
-        b"<mergecells": "merged_cells",
-        b"<datavalidations": "data_validations",
-        b"<autofilter": "auto_filter",
-        b"<sheetprotection": "protected_sheet",
-        b"<conditionalformatting": "conditional_formatting",
-        b"<f t=\"shared\"": "shared_formulas",
-        b"<f t=\"array\"": "array_formulas",
-        b"<hyperlink": "internal_or_external_hyperlinks",
-        b"<sortstate": "sort_state",
-        b"<filtercolumn": "filter_columns",
+def _inspect_sheet_xml_structure(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+) -> tuple[set[str], tuple[int, int]]:
+    """Inventory structural tags and actual sparse bounds in one streaming pass."""
+    element_features = {
+        "mergecells": "merged_cells",
+        "datavalidations": "data_validations",
+        "autofilter": "auto_filter",
+        "sheetprotection": "protected_sheet",
+        "conditionalformatting": "conditional_formatting",
+        "hyperlink": "internal_or_external_hyperlinks",
+        "sortstate": "sort_state",
+        "filtercolumn": "filter_columns",
     }
     found: set[str] = set()
-    tail = b""
-    with archive.open(info) as handle:
-        while chunk := handle.read(256 * 1024):
-            data = (tail + chunk).lower()
-            for marker, feature in markers.items():
-                if marker in data:
-                    found.add(feature)
-            tail = data[-64:]
-            if len(found) == len(markers):
-                break
-    return found
+    max_row = 0
+    max_column = 0
+    current_row = 0
+    current_column = 0
+
+    def local_name(name: str) -> str:
+        return name.rsplit("}", 1)[-1].rsplit(":", 1)[-1].casefold()
+
+    def local_attributes(attributes: dict[str, str]) -> dict[str, str]:
+        return {local_name(key): value for key, value in attributes.items()}
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal current_row, current_column, max_row, max_column
+        element = local_name(name)
+        feature = element_features.get(element)
+        if feature is not None:
+            found.add(feature)
+        attrs = local_attributes(attributes)
+        if element == "f":
+            formula_type = attrs.get("t", "").casefold()
+            if formula_type == "shared":
+                found.add("shared_formulas")
+            elif formula_type == "array":
+                found.add("array_formulas")
+        elif element == "row":
+            try:
+                current_row = int(attrs.get("r", ""))
+            except ValueError:
+                current_row += 1
+            current_column = 0
+            max_row = max(max_row, current_row)
+        elif element == "c":
+            reference = attrs.get("r", "")
+            match = re.fullmatch(r"([A-Za-z]{1,3})([1-9][0-9]*)", reference)
+            if match is not None:
+                column_number = _column_number(match.group(1))
+                row_number = int(match.group(2))
+                current_column = column_number
+                current_row = row_number
+            else:
+                current_column += 1
+                row_number = current_row
+                column_number = current_column
+            max_row = max(max_row, row_number)
+            max_column = max(max_column, column_number)
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.StartElementHandler = start_element
+    parser.ExternalEntityRefHandler = lambda *_arguments: 0
+    try:
+        with archive.open(info) as handle:
+            while chunk := handle.read(256 * 1024):
+                parser.Parse(chunk, False)
+            parser.Parse(b"", True)
+    except expat.ExpatError as exc:
+        raise WorkbookSafetyError(f"FILE_CORRUPTED: invalid XML part {info.filename}") from exc
+    return found, (max_row, max_column)
+
+
+def _column_number(letters: str) -> int:
+    result = 0
+    for character in letters.upper():
+        result = result * 26 + ord(character) - 64
+    return result
 
 
 def _vml_has_controls(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:

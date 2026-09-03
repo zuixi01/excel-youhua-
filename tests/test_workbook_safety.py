@@ -204,7 +204,7 @@ def test_workbook_without_workbook_properties_is_not_misclassified_as_protected(
     snapshot.close()
 
 
-def test_workbook_without_worksheet_dimension_uses_actual_bounds(tmp_path):
+def test_workbook_without_worksheet_dimension_uses_actual_bounds(tmp_path, monkeypatch):
     source = tmp_path / "with-dimension.xlsx"
     path = tmp_path / "without-dimension.xlsx"
     book = Workbook()
@@ -229,11 +229,48 @@ def test_workbook_without_worksheet_dimension_uses_actual_bounds(tmp_path):
         }],
     })
 
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    def fail_if_dimension_is_reparsed(*_args, **_kwargs):
+        raise AssertionError("dimensionless worksheets must use package-scan bounds")
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "calculate_dimension", fail_if_dimension_is_reparsed)
+
     snapshot = inspect_workbook(path, rules, max_in_memory_cells=10_000)
 
     assert snapshot.large_mode is False
     assert snapshot.sheets["Data"].max_row == 2
     assert snapshot.sheets["Data"].max_column == 2
+    snapshot.close()
+
+
+def test_large_mode_uses_total_workbook_cells_across_sheets(tmp_path):
+    path = tmp_path / "aggregate-cell-limit.xlsx"
+    book = Workbook()
+    for sheet_index in range(2):
+        sheet = book.active if sheet_index == 0 else book.create_sheet()
+        sheet.title = f"Data{sheet_index + 1}"
+        for row_index in range(600):
+            sheet.append([f"{sheet_index}-{row_index}-{column}" for column in range(10)])
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "aggregate-cell-limit", "schema_version": "1.0.0", "name": "Aggregate cell limit",
+        "workbook": {"max_in_memory_cells": 10_000},
+        "sheets": [
+            {
+                "id": f"data_{sheet_index + 1}", "name": f"Data{sheet_index + 1}",
+                "primary_key_mode": "row_number",
+                "columns": [{"name": "value", "title": "Value"}],
+            }
+            for sheet_index in range(2)
+        ],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert snapshot.large_mode is True
+    assert snapshot.report_only is True
+    assert all(isinstance(sheet.rows, SpilledRows) for sheet in snapshot.sheets.values())
     snapshot.close()
 
 
