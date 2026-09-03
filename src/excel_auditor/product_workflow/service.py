@@ -45,6 +45,7 @@ class ProductWorkflowService:
         confirmed_aliases_by_category: dict[str, dict[str, str]] | None = None,
         category_overrides: dict[int, str] | None = None,
         forced_extra_columns: set[int] | None = None,
+        forced_extra_columns_by_category: dict[str, set[int]] | None = None,
         parent_revision_id: str | None = None,
     ) -> None:
         directory = self.audit_service.job_directory(job_id)
@@ -85,6 +86,7 @@ class ProductWorkflowService:
                 confirmed_aliases_by_category=confirmed_aliases_by_category,
                 category_overrides=category_overrides,
                 forced_extra_columns=forced_extra_columns,
+                forced_extra_columns_by_category=forced_extra_columns_by_category,
                 checkpoint=checkpoint,
             )
             checkpoint()
@@ -321,7 +323,7 @@ class ProductWorkflowService:
             raise ValueError("rejected review items must be corrected before creating a revision")
         category_overrides: dict[int, str] = {}
         confirmed_aliases_by_category: dict[str, dict[str, str]] = {}
-        forced_extra_columns: set[int] = set()
+        forced_extra_columns_by_category: dict[str, set[int]] = {}
         for review, decision in zip(reviews, decisions, strict=True):
             action = decision.get("action")
             payload = review.get("payload", {})
@@ -333,7 +335,12 @@ class ProductWorkflowService:
                     str(decision["raw_header"])
                 ] = str(decision["field_id"])
             elif action == "keep_extra" and payload.get("physical_column") is not None:
-                forced_extra_columns.add(int(payload["physical_column"]))
+                category_id = payload.get("category_id")
+                if not category_id:
+                    raise ValueError("field review is missing its category scope")
+                forced_extra_columns_by_category.setdefault(str(category_id), set()).add(
+                    int(payload["physical_column"])
+                )
         directory = self.audit_service.job_directory(job_id)
         inputs = [path for path in directory.glob("product-input.*") if path.is_file()]
         if len(inputs) != 1:
@@ -374,7 +381,7 @@ class ProductWorkflowService:
                 actor_id=actor_id,
                 confirmed_aliases_by_category=confirmed_aliases_by_category,
                 category_overrides=category_overrides,
-                forced_extra_columns=forced_extra_columns,
+                forced_extra_columns_by_category=forced_extra_columns_by_category,
                 parent_revision_id=parent,
             )
         finally:

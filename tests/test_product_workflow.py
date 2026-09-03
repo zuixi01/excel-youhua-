@@ -581,6 +581,137 @@ def test_product_normalizer_splits_categories_preserves_extras_and_validates_val
         )
 
 
+def test_keep_extra_mapping_is_scoped_to_its_category(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "category-scoped-extra",
+        "schema_version": "1.0.0",
+        "name": "类目隔离附加字段",
+        "sheets": [{
+            "id": "products",
+            "name": "商品信息",
+            "primary_key": ["product_id"],
+            "columns": [
+                {"name": "product_id", "title": "商品ID", "required": True},
+                {"name": "platform_category_id", "title": "平台类目ID"},
+                {"name": "merchant_category", "title": "商家类目", "required": True},
+            ],
+        }],
+        "product_workflow": {
+            "sheet_id": "products",
+            "catalog_connection_id": "platform-main",
+            "category": {
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+
+    def platform_field(
+        category_id: str,
+        field_id: str,
+        title: str,
+        *,
+        aliases: list[str] | None = None,
+    ) -> CatalogFieldDefinition:
+        return CatalogFieldDefinition(
+            field_id=field_id,
+            title=title,
+            source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+            category_id=category_id,
+            attribute_id=field_id,
+            aliases=aliases or [],
+        )
+
+    catalog = InMemoryCatalogAdapter(
+        [
+            CategoryDefinition(category_id="cat-a", name="类目A"),
+            CategoryDefinition(category_id="cat-b", name="类目B"),
+        ],
+        {
+            "cat-a": [platform_field("cat-a", "a_size", "尺寸")],
+            "cat-b": [
+                platform_field("cat-b", "b_length", "长度", aliases=["尺寸"]),
+                platform_field("cat-b", "b_width", "宽度", aliases=["尺寸"]),
+            ],
+        },
+    )
+    headers = ["商品ID", "平台类目ID", "商家类目", "尺寸"]
+    snapshot = WorkbookSnapshot(
+        path=tmp_path / "products.xlsx",
+        sha256="0" * 64,
+        sheets={"商品信息": SheetSnapshot(
+            name="商品信息",
+            max_row=3,
+            max_column=len(headers),
+            rows=[
+                (1, headers),
+                (2, ["P-A", "cat-a", "类目A", "10"]),
+                (3, ["P-B", "cat-b", "类目B", "20"]),
+            ],
+        )},
+        excel_epoch=datetime(1899, 12, 30),
+    )
+
+    result = normalize_product_workbook(
+        snapshot,
+        rules,
+        catalog,
+        forced_extra_columns_by_category={"cat-b": {4}},
+    )
+    try:
+        by_category = {sheet.category_id: sheet for sheet in result.category_sheets}
+        category_a = by_category["cat-a"]
+        category_b = by_category["cat-b"]
+        a_size = next(item for item in category_a.plan.fields if item.field.field_id == "a_size")
+        assert a_size.present is True and a_size.source_column == 4
+        assert all(item.field.source != CatalogFieldSource.MERCHANT_EXTRA for item in category_a.plan.fields)
+        b_extra = [item for item in category_b.plan.fields if item.field.source == CatalogFieldSource.MERCHANT_EXTRA]
+        assert len(b_extra) == 1 and b_extra[0].source_column == 4
+        assert category_b.rows[0][b_extra[0].field.field_id] == "20"
+    finally:
+        result.close()
+
+    source = tmp_path / "scoped-extra-source.xlsx"
+    book = Workbook()
+    source_sheet = book.active
+    source_sheet.title = "商品信息"
+    source_sheet.append(headers)
+    source_sheet.append(["P-A", "cat-a", "类目A", "10"])
+    source_sheet.append(["P-B", "cat-b", "类目B", "20"])
+    book.save(source)
+    audit = AuditService(tmp_path / "scoped-extra-runtime")
+    workflow = ProductWorkflowService(audit)
+    job_id = audit.create_job()
+    job_source = audit.job_directory(job_id) / "product-input.xlsx"
+    job_source.write_bytes(source.read_bytes())
+
+    workflow.run(job_id, job_source, rules, catalog)
+    reviews = workflow.list_reviews(job_id)
+    category_b_review = next(
+        item
+        for item in reviews
+        if item["review_type"] == "field_mapping" and item["payload"]["category_id"] == "cat-b"
+    )
+    workflow.decide_review(
+        job_id,
+        category_b_review["review_id"],
+        ProductReviewDecision(action="keep_extra"),
+    )
+    workflow.rerun_after_reviews(job_id, rules)
+
+    rerun = json.loads(
+        (audit.job_directory(job_id) / "product-result-r2.json").read_text(encoding="utf-8")
+    )
+    rerun_by_category = {sheet["category_id"]: sheet for sheet in rerun["category_sheets"]}
+    rerun_a_fields = rerun_by_category["cat-a"]["plan"]["fields"]
+    rerun_b_fields = rerun_by_category["cat-b"]["plan"]["fields"]
+    assert next(item for item in rerun_a_fields if item["field"]["field_id"] == "a_size")["source_column"] == 4
+    assert any(
+        item["field"]["source"] == "merchant_extra" and item["source_column"] == 4
+        for item in rerun_b_fields
+    )
+
+
 def test_product_normalizer_checks_keys_unique_fields_and_cross_field_rules_globally(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "product-quality",

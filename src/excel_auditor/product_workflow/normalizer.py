@@ -46,6 +46,7 @@ def normalize_product_workbook(
     confirmed_aliases_by_category: dict[str, dict[str, str]] | None = None,
     category_overrides: dict[int, str] | None = None,
     forced_extra_columns: set[int] | None = None,
+    forced_extra_columns_by_category: dict[str, set[int]] | None = None,
     checkpoint: Callable[[], None] | None = None,
 ) -> ProductNormalizationResult:
     check = checkpoint or (lambda: None)
@@ -206,7 +207,10 @@ def normalize_product_workbook(
             headers,
             targets,
             confirmed_aliases=category_confirmed_aliases,
-            forced_extra_columns=forced_extra_columns,
+            forced_extra_columns={
+                *(forced_extra_columns or set()),
+                *(forced_extra_columns_by_category or {}).get(category_id, set()),
+            },
             fuzzy_threshold=config.mapping_fuzzy_threshold,
         )
         plan = build_dynamic_schema(
