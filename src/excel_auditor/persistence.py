@@ -368,6 +368,10 @@ class DatabaseRepository:
                 created_at=_now(),
                 created_by=actor_id,
             ))
+            # ProductReviewItemRow has a database FK but no ORM relationship.
+            # Flush the parent explicitly so PostgreSQL never observes a child
+            # review row before its revision within this transaction.
+            session.flush()
             for review in result.review_items:
                 session.add(ProductReviewItemRow(
                     id=new_ulid("review_"),

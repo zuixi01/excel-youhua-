@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from openpyxl import Workbook, load_workbook
+from sqlalchemy import event
 
 from excel_auditor.models import ColumnRule, FieldType, ProductWorkflowConfig, RuleSet, ValidationConfig
 from excel_auditor.product_workflow import (
@@ -543,11 +544,24 @@ def test_product_normalizer_splits_categories_preserves_extras_and_validates_val
     database.save_product_category_snapshot(result.category_catalog_snapshot)
     for catalog_snapshot in result.catalog_snapshots:
         database.save_product_catalog_snapshot(catalog_snapshot)
-    revision = database.create_product_revision(
-        "job_01PRODUCTWORKFLOW000000000",
-        result,
-        actor_id="operator",
-    )
+    inserts: list[str] = []
+
+    def capture_insert(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("INSERT"):
+            inserts.append(statement)
+
+    event.listen(database.engine, "before_cursor_execute", capture_insert)
+    try:
+        revision = database.create_product_revision(
+            "job_01PRODUCTWORKFLOW000000000",
+            result,
+            actor_id="operator",
+        )
+    finally:
+        event.remove(database.engine, "before_cursor_execute", capture_insert)
+    revision_insert = next(index for index, statement in enumerate(inserts) if "product_workflow_revisions" in statement)
+    review_insert = next(index for index, statement in enumerate(inserts) if "product_review_items" in statement)
+    assert revision_insert < review_insert
     reviews = database.list_product_reviews("job_01PRODUCTWORKFLOW000000000")
     assert revision["revision_number"] == 1
     assert reviews and reviews[0]["status"] == "pending"
