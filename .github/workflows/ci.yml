@@ -53,17 +53,18 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with: { python-version: "3.12" }
       - run: dotnet restore services/excel_renderer/ExcelRenderer.csproj --locked-mode --nologo
-      - run: dotnet publish services/excel_renderer/ExcelRenderer.csproj -c Release -r win-x64 --self-contained true --no-restore -o .renderer-win --nologo
+      - run: dotnet publish services/excel_renderer/ExcelRenderer.csproj -c Release -r win-x64 --self-contained true --no-restore -o renderer-win --nologo
       - run: python -m pip install uv==0.12.5 && uv sync --frozen --extra test
       - name: Renderer contract test
         shell: pwsh
         run: |
-          $env:EXCEL_RENDERER_COMMAND = (Resolve-Path ".renderer-win/ExcelRenderer.exe").Path
+          $env:EXCEL_RENDERER_COMMAND = (Resolve-Path "renderer-win/ExcelRenderer.exe").Path
           uv run --frozen --extra test python -m pytest tests/test_dotnet_renderer.py --junitxml=renderer-junit.xml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: excel-renderer-win-x64-${{ github.sha }}
-          path: .renderer-win
+          name: excel-renderer-win-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: renderer-win
+          if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
