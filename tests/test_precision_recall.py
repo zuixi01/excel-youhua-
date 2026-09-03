@@ -6,7 +6,13 @@ from excel_auditor.models import RuleSet
 from excel_auditor.engine import compare_workbook
 from excel_auditor.workbook import SheetSnapshot, inspect_workbook
 from openpyxl import Workbook
-from excel_auditor.product_workflow import CatalogFieldDefinition, CatalogFieldSource, map_product_headers
+from excel_auditor.product_workflow import (
+    CatalogFieldDefinition,
+    CatalogFieldSource,
+    CategoryDefinition,
+    map_product_headers,
+    resolve_categories,
+)
 
 
 BENCHMARK = json.loads(Path("tests/benchmarks/precision_recall.json").read_text(encoding="utf-8"))
@@ -84,6 +90,24 @@ def test_product_mapping_precision_recall_and_manual_review_gate_meet_release_th
         )
     _assert_precision_recall(predicted_accepted, expected_accepted, "product automatic field mapping")
     _assert_precision_recall(predicted_review, expected_review, "product manual-review detection")
+
+
+def test_product_category_resolution_matches_adversarial_release_annotations():
+    categories = [CategoryDefinition.model_validate(item) for item in PRODUCT_BENCHMARK["categories"]]
+    cases = PRODUCT_BENCHMARK["category_cases"]
+    results = resolve_categories(
+        [case["row"] for case in cases],
+        categories,
+        fuzzy_threshold=60,
+        candidate_score_margin=5,
+    )
+
+    assert len(results) == len(cases)
+    for result, expected in zip(results, cases, strict=True):
+        assert result.status == expected["status"]
+        assert result.match_type == expected["match_type"]
+        assert result.category_id == expected.get("category_id")
+        assert [candidate.field_id for candidate in result.candidates] == expected["candidates"]
 
 
 def _assert_precision_recall(predicted, expected, label):

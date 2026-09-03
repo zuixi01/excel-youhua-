@@ -1326,21 +1326,38 @@ def test_dotnet_renderer_builds_dynamic_product_and_sku_sheets_from_versioned_re
     book.save(source)
     planned_fields = [
         {"field": {"field_id": "product_id", "title": "商品ID", "source": "fixed", "field_type": "string", "number_format": None}},
-        {"field": {"field_id": "price", "title": "价格", "source": "platform_attribute", "field_type": "decimal", "number_format": "0.00"}},
-        {"field": {"field_id": "color", "title": "颜色", "source": "platform_specification", "field_type": "string", "number_format": None}},
+        {"field": {"field_id": "price", "title": "价格", "source": "platform_attribute", "field_type": "decimal", "number_format": "0.00", "required": True, "validation": {"nullable": False, "min": "0", "max": "1000"}}},
+        {"field": {"field_id": "unsafe_number", "title": "高精度编号", "source": "platform_attribute", "field_type": "decimal", "number_format": None}},
+        {"field": {"field_id": "launched_at", "title": "上架时间", "source": "platform_attribute", "field_type": "datetime", "number_format": "yyyy-mm-dd hh:mm:ss", "timezone": "Asia/Shanghai"}},
+        {"field": {"field_id": "color", "title": "颜色", "source": "platform_specification", "field_type": "enum", "number_format": None, "required": True, "enum_values": ["黑色", "白色"]}},
         {"field": {"field_id": "merchant_note", "title": "商家备注", "source": "merchant_extra", "field_type": "string", "number_format": None}},
     ]
     result_path.write_text(json.dumps({
+        "source_headers": ["商品ID", "商家类目"],
         "category_sheets": [{
             "category_id": "phone",
             "worksheet_name": "手机",
             "plan": {"fields": planned_fields},
             "source_excel_rows": [2],
-            "rows": [{"product_id": "P-1", "price": "12.50", "color": "黑色", "merchant_note": "保留"}],
+            "rows": [{"product_id": "P-1", "price": "12.50", "unsafe_number": "1234567890123456", "launched_at": "2026-09-03T12:30:00+08:00", "color": "黑色", "merchant_note": "保留"}],
             "sku_rows": [{"product_id": "P-1", "color": "黑色"}],
+            "sku_source_excel_rows": [2],
         }],
         "issues": [{
-            "category_id": "phone", "excel_row": 2, "field_id": "price", "color": "F9CB9C",
+            "issue_type": "invalid_value", "category_id": "phone", "excel_row": 2, "field_id": "price", "color": "F9CB9C",
+        }, {
+            "issue_type": "excel_write_unsafe", "category_id": "phone", "excel_row": 2, "field_id": "unsafe_number", "color": "F9CB9C",
+        }],
+        "unresolved_rows": [{
+            "excel_row": 3,
+            "values": ["P-2", "未知类目"],
+            "category_resolution": {
+                "status": "unresolved",
+                "match_type": "missing",
+                "raw_category_id": None,
+                "raw_category": "未知类目",
+                "candidates": [],
+            },
         }],
     }, ensure_ascii=False), encoding="utf-8")
     manifest_path.write_text(json.dumps({
@@ -1360,10 +1377,22 @@ def test_dotnet_renderer_builds_dynamic_product_and_sku_sheets_from_versioned_re
     operation = json.loads(completed.stdout)["operation_results"][0]
     assert operation["type"] == "add_or_replace_product_sheets" and operation["status"] == "applied"
     rendered = load_workbook(output, data_only=False)
-    assert [cell.value for cell in rendered["手机"][1]] == ["商品ID", "价格", "颜色", "商家备注"]
-    assert [cell.value for cell in rendered["手机"][2]] == ["P-1", 12.5, "黑色", "保留"]
+    assert [cell.value for cell in rendered["手机"][1]] == ["商品ID", "价格", "高精度编号", "上架时间", "颜色", "商家备注"]
+    assert [cell.value for cell in rendered["手机"][2]] == [
+        "P-1", 12.5, "1234567890123456", datetime(2026, 9, 3, 12, 30), "黑色", "保留",
+    ]
     assert rendered["手机"]["B2"].number_format == "0.00"
     assert rendered["手机"]["B2"].fill.fgColor.rgb.endswith("F9CB9C")
+    assert rendered["手机"]["C2"].data_type == "s"
+    assert rendered["手机"]["D2"].number_format == "yyyy-mm-dd hh:mm:ss"
+    validations = list(rendered["手机"].data_validations.dataValidation)
+    assert any(item.type == "decimal" and item.formula1 == "0" and item.formula2 == "1000" for item in validations)
+    assert any(item.type == "list" and item.formula1.startswith("_ExcelAuditorList") for item in validations)
+    validation_sheets = [sheet for sheet in rendered.worksheets if sheet.title.startswith("__ExcelAuditorLists")]
+    assert len(validation_sheets) == 1 and validation_sheets[0].sheet_state == "veryHidden"
+    assert [cell.value for cell in rendered["待审核商品"][1]][:6] == ["源行", "状态", "匹配类型", "原类目ID", "原类目", "候选类目"]
+    assert rendered["待审核商品"]["G2"].value == "P-2"
+    assert rendered["问题清单"]["D2"].value == "invalid_value"
     assert [cell.value for cell in rendered["手机-SKU"][1]] == ["商品ID", "颜色"]
     assert [cell.value for cell in rendered["手机-SKU"][2]] == ["P-1", "黑色"]
     assert rendered["__ExcelAuditorMetadata"].sheet_state == "veryHidden"

@@ -64,7 +64,10 @@ def test_product_normalization_baseline():
         "schema_id": "product-performance",
         "schema_version": "1.0.0",
         "name": "Product performance",
-        "workbook": {"max_rows_per_sheet": max(100_000, record_count)},
+        "workbook": {
+            "max_rows_per_sheet": max(100_000, record_count),
+            "max_in_memory_cells": int(os.environ.get("PRODUCT_PERF_MAX_IN_MEMORY_CELLS", "500000")),
+        },
         "sheets": [{
             "id": "products",
             "name": "Products",
@@ -103,26 +106,48 @@ def test_product_normalization_baseline():
     )
     process = psutil.Process()
     baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stopped = threading.Event()
+
+    def sample_memory():
+        while not stopped.wait(0.02):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
     started = time.perf_counter()
+    cpu_started = time.process_time()
     result = normalize_product_workbook(snapshot, rules, catalog)
+    serialized_row_count = len(result.model_dump(mode="json")["category_sheets"][0]["rows"])
     elapsed = time.perf_counter() - started
-    rss_delta_mib = (process.memory_info().rss - baseline_rss) / 1024 / 1024
+    cpu_seconds = time.process_time() - cpu_started
+    stopped.set()
+    sampler.join()
+    rss_delta_mib = (peak_rss[0] - baseline_rss) / 1024 / 1024
     metrics = {
-        "benchmark_version": 1,
+        "benchmark_version": 2,
         "rows": record_count,
         "platform_attributes": attribute_count,
+        "cpu_calibration_seconds": round(cpu_calibration_seconds, 6),
+        "cpu_seconds": round(cpu_seconds, 3),
+        "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3),
         "elapsed_seconds": round(elapsed, 3),
-        "rss_delta_mib": round(rss_delta_mib, 2),
+        "peak_rss_delta_mib": round(rss_delta_mib, 2),
         "issues": len(result.issues),
         "reviews": len(result.review_items),
     }
     print(metrics)
+    if output := os.environ.get("PRODUCT_PERF_RESULT_PATH"):
+        Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     assert len(result.category_sheets) == 1
     assert len(result.category_sheets[0].rows) == record_count
+    assert serialized_row_count == record_count
     assert result.category_sheets[0].rows[-1][f"attribute_{attribute_count - 1}"]
     assert not result.requires_manual_review and not result.issues
     assert elapsed <= float(os.environ.get("PRODUCT_PERF_MAX_SECONDS", "60"))
     assert rss_delta_mib <= float(os.environ.get("PRODUCT_PERF_MAX_RSS_MIB", "512"))
+    result.close()
 
 
 @pytest.mark.performance

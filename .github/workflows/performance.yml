@@ -417,3 +417,77 @@ jobs:
           path: |
             performance-maximum-uploaded-json.json
             performance-maximum-uploaded-json-junit.xml
+
+  product-normalization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install uv==0.12.5
+      - run: uv sync --frozen --extra test
+      - name: Resolve prior product performance reference
+        id: reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
+        run: |
+          RUN_ID=""
+          for CANDIDATE in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=main&status=success&per_page=20" --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .id"); do
+            if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE}/artifacts" --jq '.artifacts[].name' | grep -Fxq performance-product-normalization; then
+              RUN_ID="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ] && [ "$REQUIRE_REFERENCE" = "1" ]; then
+            echo "A release requires a successful product-normalization performance baseline." >&2
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+      - name: Download prior product performance reference
+        if: steps.reference.outputs.run_id != ''
+        id: compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.reference.outputs.run_id }}
+          REQUIRE_REFERENCE: ${{ inputs.require_reference && '1' || '0' }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name performance-product-normalization --dir performance-reference
+          if jq -e '.benchmark_version == 2 and has("normalized_cpu_units")' performance-reference/performance-product-normalization.json >/dev/null; then
+            echo "compatible=1" >> "$GITHUB_OUTPUT"
+          elif [ "$REQUIRE_REFERENCE" = "1" ]; then
+            echo "A release requires a benchmark-version 2 product performance reference." >&2
+            exit 1
+          else
+            echo "compatible=0" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run 100,000-row product normalization baseline
+        env:
+          RUN_PRODUCT_PERFORMANCE: "1"
+          PRODUCT_PERF_ROWS: "100000"
+          PRODUCT_PERF_ATTRIBUTES: "20"
+          PRODUCT_PERF_MAX_IN_MEMORY_CELLS: "500000"
+          PRODUCT_PERF_MAX_SECONDS: "300"
+          PRODUCT_PERF_MAX_RSS_MIB: "2048"
+          PRODUCT_PERF_RESULT_PATH: performance-product-normalization.json
+        run: uv run --frozen --extra test python -m pytest tests/performance/test_baseline.py -k product_normalization -s --junitxml=performance-product-normalization-junit.xml
+      - name: Reject product-normalization regression
+        if: steps.compatibility.outputs.compatible == '1'
+        run: >-
+          uv run --frozen python -m excel_auditor.performance_gate
+          --current performance-product-normalization.json
+          --reference performance-reference/performance-product-normalization.json
+          --time-metric normalized_cpu_units
+          --max-time-ratio 0.25
+          --time-slack-seconds 5
+          --max-memory-ratio 0.25
+          --memory-slack-mib 96
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-product-normalization
+          path: |
+            performance-product-normalization.json
+            performance-product-normalization-junit.xml

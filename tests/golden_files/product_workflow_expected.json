@@ -10,10 +10,10 @@
   "sku_sheet": {
     "name": "手机-SKU",
     "headers": ["商品ID", "平台类目ID", "商家类目", "颜色"],
-    "rows": [["P-1", "cat-phone", "手机", "黑色、白色"]],
+    "rows": [["P-1", "cat-phone", "手机", "黑色"], ["P-1", "cat-phone", "手机", "白色"]],
     "header_colors": ["DDEBF7", "DDEBF7", "DDEBF7", "FFF2CC"],
     "freeze_panes": "A2",
-    "auto_filter": "A1:D2"
+    "auto_filter": "A1:D3"
   },
   "metadata_sheet": {
     "name": "__ExcelAuditorMetadata",

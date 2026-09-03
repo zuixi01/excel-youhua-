@@ -798,10 +798,20 @@ class ProductFieldRecordMapping(StrictModel):
     display_order_key: str | None = "display_order"
     enum_values_key: str | None = "enum_values"
     number_format_key: str | None = "number_format"
+    timezone_key: str | None = "timezone"
+    nullable_key: str | None = "nullable"
+    unique_key: str | None = "unique"
+    min_key: str | None = "min"
+    max_key: str | None = "max"
+    min_length_key: str | None = "min_length"
+    max_length_key: str | None = "max_length"
+    regex_key: str | None = "regex"
+    type_value_aliases: dict[str, FieldType] = Field(default_factory=dict, max_length=64)
 
     @field_validator(
         "id_key", "title_key", "aliases_key", "type_key", "required_key", "multiple_key",
-        "display_order_key", "enum_values_key", "number_format_key",
+        "display_order_key", "enum_values_key", "number_format_key", "timezone_key", "nullable_key", "unique_key",
+        "min_key", "max_key", "min_length_key", "max_length_key", "regex_key",
     )
     @classmethod
     def valid_record_key(cls, value: str | None) -> str | None:
@@ -809,9 +819,24 @@ class ProductFieldRecordMapping(StrictModel):
 
     @model_validator(mode="after")
     def distinct_keys(self) -> "ProductFieldRecordMapping":
-        keys = [value for value in self.model_dump().values() if value is not None]
+        keys = [
+            value
+            for name, value in self.model_dump().items()
+            if name.endswith("_key") and value is not None
+        ]
         if len(keys) != len(set(keys)):
             raise ValueError("field record mapping keys must be distinct")
+        aliases: dict[str, FieldType] = {}
+        canonical = {field_type.value: field_type for field_type in FieldType}
+        for raw, target in self.type_value_aliases.items():
+            normalized = raw.strip().casefold()
+            if not normalized or len(raw) > 128:
+                raise ValueError("field type aliases must be non-blank and no longer than 128 characters")
+            if normalized in aliases:
+                raise ValueError("field type aliases must be unique after trimming and case folding")
+            if normalized in canonical and canonical[normalized] != target:
+                raise ValueError("field type aliases cannot remap a canonical field type")
+            aliases[normalized] = target
         return self
 
 
@@ -905,6 +930,7 @@ class ProductOutputConfig(StrictModel):
     multi_category_mode: Literal["split_sheets"] = "split_sheets"
     merchant_extra_mode: Literal["append_right"] = "append_right"
     sku_sheet_mode: Literal["when_present", "always", "disabled"] = "when_present"
+    max_sku_combinations_per_product: int = Field(default=1_000, ge=1, le=100_000)
     required_missing_color: str = "F4CCCC"
     invalid_value_color: str = "F9CB9C"
     ambiguous_color: str = "D9D2E9"
@@ -928,6 +954,7 @@ class ProductWorkflowConfig(StrictModel):
     output: ProductOutputConfig = Field(default_factory=ProductOutputConfig)
     mapping_fuzzy_threshold: int = Field(default=92, ge=0, le=100)
     minimum_category_confidence: int = Field(default=95, ge=0, le=100)
+    category_candidate_score_margin: int = Field(default=5, ge=0, le=100)
 
 
 class RuleSet(StrictModel):

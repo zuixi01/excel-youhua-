@@ -22,6 +22,7 @@ def resolve_categories(
     first_excel_row: int = 2,
     excel_rows: list[int] | None = None,
     fuzzy_threshold: int = 95,
+    candidate_score_margin: int = 5,
 ) -> list[CategoryResolution]:
     if excel_rows is not None and len(excel_rows) != len(rows):
         raise ValueError("excel_rows must align one-to-one with category rows")
@@ -38,11 +39,34 @@ def resolve_categories(
     for offset, row in enumerate(rows):
         excel_row = excel_rows[offset] if excel_rows is not None else first_excel_row + offset
         raw_id = normalize_header(row.get(id_field)) if id_field else ""
+        raw_name = normalize_header(row.get(source_field))
         if raw_id and raw_id in by_id:
             category = by_id[raw_id]
+            name_owners = names.get(_key(raw_name), set()) if raw_name else set()
+            if name_owners and name_owners != {raw_id}:
+                candidate_ids = sorted({raw_id, *name_owners})
+                results.append(CategoryResolution(
+                    excel_row=excel_row,
+                    raw_category_id=raw_id,
+                    raw_category=raw_name or None,
+                    status="manual_review",
+                    match_type="id_name_conflict",
+                    confidence=100,
+                    candidates=[
+                        MappingCandidate(
+                            field_id=candidate_id,
+                            title=by_id[candidate_id].name,
+                            confidence=100,
+                            match_value=raw_id if candidate_id == raw_id else raw_name,
+                        )
+                        for candidate_id in candidate_ids
+                    ],
+                ))
+                continue
             results.append(CategoryResolution(
                 excel_row=excel_row,
-                raw_category=normalize_header(row.get(source_field)) or None,
+                raw_category_id=raw_id,
+                raw_category=raw_name or None,
                 category_id=category.category_id,
                 category_name=category.name,
                 status="resolved",
@@ -51,19 +75,40 @@ def resolve_categories(
             ))
             continue
 
-        raw_name = normalize_header(row.get(source_field))
         if not raw_name:
             results.append(CategoryResolution(
                 excel_row=excel_row,
+                raw_category_id=raw_id or None,
                 status="unresolved",
-                match_type="missing",
+                match_type="invalid_id" if raw_id else "missing",
             ))
             continue
         owners = names.get(_key(raw_name), set())
+        if raw_id:
+            candidates = [
+                MappingCandidate(
+                    field_id=owner,
+                    title=by_id[owner].name,
+                    confidence=100,
+                    match_value=raw_name,
+                )
+                for owner in sorted(owners)
+            ]
+            results.append(CategoryResolution(
+                excel_row=excel_row,
+                raw_category_id=raw_id,
+                raw_category=raw_name,
+                status="manual_review" if candidates else "unresolved",
+                match_type="invalid_id",
+                confidence=100 if candidates else None,
+                candidates=candidates,
+            ))
+            continue
         if len(owners) == 1:
             category = by_id[next(iter(owners))]
             results.append(CategoryResolution(
                 excel_row=excel_row,
+                raw_category_id=None,
                 raw_category=raw_name,
                 category_id=category.category_id,
                 category_name=category.name,
@@ -100,9 +145,18 @@ def resolve_categories(
                     if current is None or candidate.confidence > current.confidence:
                         candidates_by_id[owner] = candidate
             match_type = "fuzzy_suggestion"
-        candidates = sorted(candidates_by_id.values(), key=lambda item: (-item.confidence, item.field_id))[:3]
+        ranked_candidates = sorted(candidates_by_id.values(), key=lambda item: (-item.confidence, item.field_id))
+        if match_type == "fuzzy_suggestion" and ranked_candidates:
+            top_score = ranked_candidates[0].confidence
+            ranked_candidates = [
+                candidate
+                for candidate in ranked_candidates
+                if top_score - candidate.confidence <= candidate_score_margin
+            ]
+        candidates = ranked_candidates[:3]
         results.append(CategoryResolution(
             excel_row=excel_row,
+            raw_category_id=None,
             raw_category=raw_name,
             status="manual_review" if candidates else "unresolved",
             match_type=match_type if candidates else "missing",

@@ -33,6 +33,7 @@ def _fixed_field(column: ColumnRule, display_order: int) -> CatalogFieldDefiniti
         display_order=display_order,
         enum_values=column.enum_values,
         number_format=column.format,
+        timezone=column.compare.timezone,
         validation=column.validation,
     )
 

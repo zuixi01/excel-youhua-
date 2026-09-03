@@ -14,5 +14,17 @@
     {"headers": ["品脾"], "accepted": {}, "review": {"1": "brand"}},
     {"headers": ["品牌", "品牌"], "accepted": {"1": "brand"}, "review": {"2": "brand"}},
     {"headers": ["采购说明", "供应商留言"], "accepted": {}, "review": {}}
+  ],
+  "categories": [
+    {"category_id": "cat-a", "name": "Category A", "aliases": ["A alias"]},
+    {"category_id": "cat-b", "name": "Category B", "aliases": []}
+  ],
+  "category_cases": [
+    {"row": {"platform_category_id": "cat-a", "merchant_category": "Category B"}, "status": "manual_review", "match_type": "id_name_conflict", "candidates": ["cat-a", "cat-b"]},
+    {"row": {"platform_category_id": "deleted", "merchant_category": "Category A"}, "status": "manual_review", "match_type": "invalid_id", "candidates": ["cat-a"]},
+    {"row": {"platform_category_id": "cat-a", "merchant_category": "unknown label"}, "status": "resolved", "match_type": "id", "category_id": "cat-a", "candidates": []},
+    {"row": {"merchant_category": "A alias"}, "status": "resolved", "match_type": "exact", "category_id": "cat-a", "candidates": []},
+    {"row": {"merchant_category": "Categroy A"}, "status": "manual_review", "match_type": "fuzzy_suggestion", "candidates": ["cat-a"]},
+    {"row": {}, "status": "unresolved", "match_type": "missing", "candidates": []}
   ]
 }

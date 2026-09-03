@@ -11,7 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from .models import AuditReport, RuleSet
 from .snapshots import StandardSnapshot
 from .ids import new_ulid
-from .product_workflow.models import CatalogSchemaSnapshot, ProductNormalizationResult
+from .product_workflow.models import CategoryCatalogSnapshot, CatalogSchemaSnapshot, ProductNormalizationResult
 
 
 class Base(DeclarativeBase):
@@ -143,6 +143,17 @@ class ProductCatalogSnapshotRow(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ProductCategorySnapshotRow(Base):
+    __tablename__ = "product_category_snapshots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(200), index=True)
+    connection_id: Mapped[str] = mapped_column(String(200), index=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    categories_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    source_metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ProductWorkflowRevisionRow(Base):
     __tablename__ = "product_workflow_revisions"
     __table_args__ = (
@@ -153,6 +164,7 @@ class ProductWorkflowRevisionRow(Base):
     revision_number: Mapped[int] = mapped_column(Integer)
     parent_revision_id: Mapped[str | None] = mapped_column(ForeignKey("product_workflow_revisions.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    category_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("product_category_snapshots.id"), nullable=True)
     catalog_snapshot_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -295,6 +307,27 @@ class DatabaseRepository:
                 captured_at=snapshot.captured_at,
             ))
 
+    def save_product_category_snapshot(
+        self,
+        snapshot: CategoryCatalogSnapshot,
+        tenant_id: str = "local",
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            existing = session.get(ProductCategorySnapshotRow, snapshot.snapshot_id)
+            if existing is not None:
+                if existing.content_sha256 != snapshot.content_sha256 or existing.tenant_id != tenant_id:
+                    raise FileExistsError("category snapshot ids are immutable")
+                return
+            session.add(ProductCategorySnapshotRow(
+                id=snapshot.snapshot_id,
+                tenant_id=tenant_id,
+                connection_id=snapshot.connection_id,
+                content_sha256=snapshot.content_sha256,
+                categories_json=[category.model_dump(mode="json") for category in snapshot.categories],
+                source_metadata_json=snapshot.source_metadata,
+                captured_at=snapshot.captured_at,
+            ))
+
     def create_product_revision(
         self,
         job_id: str,
@@ -329,6 +362,7 @@ class DatabaseRepository:
                 revision_number=number,
                 parent_revision_id=parent_revision_id,
                 status=status,
+                category_snapshot_id=result.category_catalog_snapshot.snapshot_id,
                 catalog_snapshot_ids_json=[snapshot.snapshot_id for snapshot in result.catalog_snapshots],
                 result_json=result.model_dump(mode="json"),
                 created_at=_now(),

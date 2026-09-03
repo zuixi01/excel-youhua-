@@ -15,6 +15,7 @@ from excel_auditor.product_workflow import (
     CatalogFieldDefinition,
     CatalogFieldSource,
     CatalogSchemaSnapshot,
+    CategoryCatalogSnapshot,
     CategoryDefinition,
     InMemoryCatalogAdapter,
     ManagedHttpCatalogAdapter,
@@ -28,6 +29,7 @@ from excel_auditor.rules import load_rules
 from excel_auditor.persistence import DatabaseRepository
 from excel_auditor.service import AuditService
 from excel_auditor.product_workflow.service import ProductWorkflowService
+from excel_auditor.spill import SpillableSequence
 from excel_auditor.workbook import SheetSnapshot, WorkbookSnapshot
 
 
@@ -192,6 +194,49 @@ def test_category_resolution_is_deterministic_and_fuzzy_is_review_only():
     assert resolved[3].status == "unresolved"
 
 
+def test_category_id_name_conflict_and_invalid_id_are_never_auto_resolved():
+    categories = [
+        CategoryDefinition(category_id="cat-a", name="Category A"),
+        CategoryDefinition(category_id="cat-b", name="Category B"),
+    ]
+
+    resolved = resolve_categories([
+        {"platform_category_id": "cat-a", "merchant_category": "Category B"},
+        {"platform_category_id": "deleted-id", "merchant_category": "Category A"},
+    ], categories)
+
+    assert resolved[0].status == "manual_review"
+    assert resolved[0].match_type == "id_name_conflict"
+    assert {candidate.field_id for candidate in resolved[0].candidates} == {"cat-a", "cat-b"}
+    assert resolved[1].status == "manual_review"
+    assert resolved[1].match_type == "invalid_id"
+    assert [candidate.field_id for candidate in resolved[1].candidates] == ["cat-a"]
+
+
+def test_category_catalog_snapshot_is_order_independent_and_tamper_evident():
+    categories = [
+        CategoryDefinition(category_id="cat-b", name="Category B"),
+        CategoryDefinition(category_id="cat-a", name="Category A"),
+    ]
+    snapshot = CategoryCatalogSnapshot.create(
+        snapshot_id="pcat_snapshot",
+        connection_id="platform-main",
+        categories=categories,
+    )
+    reordered = CategoryCatalogSnapshot.create(
+        snapshot_id="pcat_reordered",
+        connection_id="platform-main",
+        categories=list(reversed(categories)),
+    )
+
+    assert [category.category_id for category in snapshot.categories] == ["cat-a", "cat-b"]
+    assert snapshot.content_sha256 == reordered.content_sha256
+    tampered = snapshot.model_dump(mode="json")
+    tampered["categories"][0]["name"] = "Changed"
+    with pytest.raises(ValidationError, match="content hash"):
+        CategoryCatalogSnapshot.model_validate(tampered)
+
+
 def test_catalog_snapshot_hash_detects_field_changes():
     fields = [_platform_field("brand", "品牌")]
     snapshot = CatalogSchemaSnapshot.create(
@@ -342,6 +387,54 @@ def test_managed_catalog_adapter_supports_explicit_platform_payload_mappings_and
     ]
 
 
+def test_managed_catalog_adapter_maps_type_aliases_and_validation_contracts():
+    config = ProductWorkflowConfig.model_validate({
+        "sheet_id": "products",
+        "catalog_connection_id": "platform-main",
+        "category": {
+            "attributes": {
+                "path_template": "/catalog/{category_id}/attributes",
+                "record_mapping": {"type_value_aliases": {"money": "decimal"}},
+            },
+            "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+        },
+    })
+
+    class ValidatedSource(_FakeManagedSource):
+        def fetch_with_metadata(self, source, _parameters=None):
+            if source.path.endswith("/attributes"):
+                return [{
+                    "id": "price",
+                    "title": "Price",
+                    "type": " MONEY ",
+                    "required": True,
+                    "nullable": False,
+                    "unique": True,
+                    "min": "0.01",
+                    "max": 999.99,
+                }], {}
+            return [], {}
+
+    field = ManagedHttpCatalogAdapter(ValidatedSource(), config).fetch_schema("cat-phone").fields[0]
+    assert field.field_type == FieldType.DECIMAL
+    assert field.validation == ValidationConfig(
+        nullable=False,
+        unique=True,
+        min=Decimal("0.01"),
+        max=Decimal("999.99"),
+    )
+
+    class InvalidConstraintSource(ValidatedSource):
+        def fetch_with_metadata(self, source, _parameters=None):
+            records, metadata = super().fetch_with_metadata(source, _parameters)
+            if records:
+                records[0]["unique"] = "yes"
+            return records, metadata
+
+    with pytest.raises(ValueError, match="field.unique must be a boolean"):
+        ManagedHttpCatalogAdapter(InvalidConstraintSource(), config).fetch_schema("cat-phone")
+
+
 def test_product_normalizer_splits_categories_preserves_extras_and_validates_values(tmp_path):
     rules = RuleSet.model_validate({
         "schema_id": "products",
@@ -388,25 +481,36 @@ def test_product_normalizer_splits_categories_preserves_extras_and_validates_val
         multiple=True,
         enum_values=["黑色", "白色"],
     )
+    size = CatalogFieldDefinition(
+        field_id="size",
+        title="尺寸",
+        source=CatalogFieldSource.PLATFORM_SPECIFICATION,
+        field_type=FieldType.ENUM,
+        category_id="cat-phone",
+        attribute_id="size",
+        multiple=True,
+        enum_values=["小", "大"],
+    )
     catalog = InMemoryCatalogAdapter(
         [
             CategoryDefinition(category_id="cat-phone", name="手机", aliases=["智能手机"]),
             CategoryDefinition(category_id="cat-accessory", name="手机配件"),
         ],
-        {"cat-phone": [brand, price, color], "cat-accessory": []},
+        {"cat-phone": [brand, price, color, size], "cat-accessory": []},
     )
-    headers = ["内部备注", "商品ID", "平台类目ID", "商家类目", "品牌", "价格", "颜色"]
+    headers = ["内部备注", "商品ID", "平台类目ID", "商家类目", "品牌", "价格", "颜色", "尺寸"]
     snapshot = WorkbookSnapshot(
         path=tmp_path / "products.xlsx",
         sha256="0" * 64,
         sheets={"商品信息": SheetSnapshot(
             name="商品信息",
-            max_row=5,
+            max_row=6,
             max_column=len(headers),
             rows=[
                 (1, headers),
-                (3, ["保留我", "P-1", "cat-phone", "智能手机", "", "12.50", "黑色、白色"]),
-                (5, ["也保留", "P-2", "", "未知手机类目", "某品牌", "-1", "黑色"]),
+                (3, ["保留我", "P-1", "cat-phone", "智能手机", "", "12.50", "黑色、白色", "小、大"]),
+                (5, ["也保留", "P-2", "", "未知手机类目", "某品牌", "-1", "黑色", "小"]),
+                (6, ["高精度", "P-3", "cat-phone", "手机", "某品牌", "1234567890123456", "黑色", "小"]),
             ],
         )},
         excel_epoch=datetime(1899, 12, 30),
@@ -416,18 +520,27 @@ def test_product_normalizer_splits_categories_preserves_extras_and_validates_val
 
     assert len(result.category_sheets) == 1
     product_sheet = result.category_sheets[0]
-    assert product_sheet.source_excel_rows == [3]
+    assert product_sheet.source_excel_rows == [3, 6]
     assert [item.field.source for item in product_sheet.plan.fields][-1] == CatalogFieldSource.MERCHANT_EXTRA
     assert product_sheet.rows[0][product_sheet.plan.fields[-1].field.field_id] == "保留我"
     assert product_sheet.rows[0]["price"] == Decimal("12.50")
     assert product_sheet.rows[0]["color"] == "黑色、白色"
-    assert product_sheet.sku_rows[0]["color"] == "黑色、白色"
+    assert [(row["color"], row["size"]) for row in product_sheet.sku_rows[:4]] == [
+        ("黑色", "小"), ("黑色", "大"), ("白色", "小"), ("白色", "大"),
+    ]
+    assert product_sheet.sku_source_excel_rows[:4] == [3, 3, 3, 3]
     assert any(issue.field_id == "brand" and issue.issue_type == "required_missing" for issue in result.issues)
+    assert any(
+        issue.excel_row == 6 and issue.field_id == "price" and issue.issue_type == "excel_write_unsafe"
+        for issue in result.issues
+    )
+    assert product_sheet.rows[1]["price"] == "1234567890123456"
     assert result.unresolved_rows[0].excel_row == 5
     assert result.requires_manual_review is True
 
     database = DatabaseRepository(f"sqlite:///{(tmp_path / 'workflow.db').as_posix()}")
     database.create_job("job_01PRODUCTWORKFLOW000000000", user_id="operator")
+    database.save_product_category_snapshot(result.category_catalog_snapshot)
     for catalog_snapshot in result.catalog_snapshots:
         database.save_product_catalog_snapshot(catalog_snapshot)
     revision = database.create_product_revision(
@@ -452,6 +565,91 @@ def test_product_normalizer_splits_categories_preserves_extras_and_validates_val
             {"action": "confirm_category", "category_id": "cat-phone"},
             actor_id="operator",
         )
+
+
+def test_product_normalizer_checks_keys_unique_fields_and_cross_field_rules_globally(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "product-quality",
+        "schema_version": "1.0.0",
+        "name": "Product quality",
+        "sheets": [{
+            "id": "products",
+            "name": "Products",
+            "primary_key": ["product_id"],
+            "columns": [
+                {"name": "product_id", "title": "Product ID", "required": True},
+                {"name": "category_id", "title": "Category ID"},
+                {"name": "category_name", "title": "Category"},
+                {"name": "serial", "title": "Serial", "validation": {"unique": True}},
+                {"name": "status", "title": "Status"},
+                {"name": "end_date", "title": "End date"},
+            ],
+            "cross_field_rules": [{
+                "rule_id": "end-required",
+                "validator": "conditional_required",
+                "params": {"when_field": "status", "equals": "inactive", "required_field": "end_date"},
+            }],
+        }],
+        "product_workflow": {
+            "sheet_id": "products",
+            "catalog_connection_id": "platform-main",
+            "category": {
+                "source_field": "category_name",
+                "id_field": "category_id",
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+    platform_code_a = CatalogFieldDefinition(
+        field_id="platform.platform_attribute.code",
+        attribute_id="code",
+        category_id="cat-a",
+        title="Platform code",
+        source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+        validation=ValidationConfig(unique=True),
+    )
+    platform_code_b = platform_code_a.model_copy(update={"category_id": "cat-b"})
+    catalog = InMemoryCatalogAdapter(
+        [
+            CategoryDefinition(category_id="cat-a", name="Category A"),
+            CategoryDefinition(category_id="cat-b", name="Category B"),
+        ],
+        {"cat-a": [platform_code_a], "cat-b": [platform_code_b]},
+    )
+    headers = ["Product ID", "Category ID", "Category", "Serial", "Status", "End date", "Platform code"]
+    snapshot = WorkbookSnapshot(
+        path=tmp_path / "quality.xlsx",
+        sha256="1" * 64,
+        sheets={"Products": SheetSnapshot(
+            name="Products",
+            max_row=4,
+            max_column=len(headers),
+            rows=[
+                (1, headers),
+                (2, ["P-1", "cat-a", "Category A", "S-1", "inactive", None, "X-1"]),
+                (3, ["P-1", "cat-b", "Category B", "S-1", "active", None, "X-1"]),
+                (4, ["P-2", "cat-a", "Category A", "S-2", "active", None, "X-1"]),
+            ],
+        )},
+        excel_epoch=datetime(1899, 12, 30),
+    )
+
+    result = normalize_product_workbook(snapshot, rules, catalog)
+    by_type = {}
+    for issue in result.issues:
+        by_type.setdefault(issue.issue_type, []).append(issue)
+
+    assert {issue.excel_row for issue in by_type["duplicate_primary_key"]} == {2, 3}
+    fixed_unique = [issue for issue in by_type["unique_value"] if issue.field_id == "serial"]
+    platform_unique = [
+        issue
+        for issue in by_type["unique_value"]
+        if issue.field_id == "platform.platform_attribute.code"
+    ]
+    assert {issue.excel_row for issue in fixed_unique} == {2, 3}
+    assert {issue.excel_row for issue in platform_unique} == {2, 4}
+    assert [(issue.excel_row, issue.field_id) for issue in by_type["cross_field_error"]] == [(2, "end_date")]
 
 
 def test_product_workflow_service_renders_category_and_sku_workbooks(tmp_path):
@@ -527,6 +725,9 @@ def test_product_workflow_service_renders_category_and_sku_workbooks(tmp_path):
     metadata = output[golden["metadata_sheet"]["name"]]
     actual["metadata_sheet"] = {"name": metadata.title, "state": metadata.sheet_state}
     assert actual == golden
+    assert any(item.type == "list" for item in output[golden["category_sheet"]["name"]].data_validations.dataValidation)
+    validation_sheets = [sheet for sheet in output.worksheets if sheet.title.startswith("__ExcelAuditorLists")]
+    assert len(validation_sheets) == 1 and validation_sheets[0].sheet_state == "veryHidden"
     output.close()
 
 
@@ -575,6 +776,11 @@ def test_review_decision_creates_a_new_revision_without_auto_accepting_fuzzy_map
     workflow.run(job_id, job_source, rules, catalog)
 
     assert audit.status(job_id)["status"] == "manual_review"
+    issue_lines = audit.artifact(job_id, "product_issues").read_text(encoding="utf-8").splitlines()
+    assert issue_lines and json.loads(issue_lines[0])["issue_type"] == "required_missing"
+    review_output = load_workbook(audit.artifact(job_id, "product_excel"), data_only=False)
+    assert "问题清单" in review_output.sheetnames
+    review_output.close()
     reviews = workflow.list_reviews(job_id)
     mapping_review = next(item for item in reviews if item["review_type"] == "field_mapping")
     assert mapping_review["status"] == "pending"
@@ -588,12 +794,154 @@ def test_review_decision_creates_a_new_revision_without_auto_accepting_fuzzy_map
         ),
         actor_id="operator",
     )
-    workflow.rerun_after_reviews(job_id, rules, catalog, actor_id="operator")
+    frozen_category_hash = json.loads(
+        (audit.job_directory(job_id) / "product-result-r1.json").read_text(encoding="utf-8")
+    )["category_catalog_snapshot"]["content_sha256"]
+    catalog._categories = [CategoryDefinition(category_id="cat-replacement", name="Replacement")]
+    catalog._fields = {"cat-replacement": []}
+    revision_lock = audit.job_directory(job_id) / ".revision.lock"
+    revision_lock.mkdir()
+    with pytest.raises(ValueError, match="already running"):
+        workflow.rerun_after_reviews(job_id, rules, actor_id="operator")
+    revision_lock.rmdir()
+    workflow.rerun_after_reviews(job_id, rules, actor_id="operator")
 
     status = audit.status(job_id)
     assert status["status"] == "completed", status
     state = json.loads((audit.job_directory(job_id) / "product-workflow.json").read_text(encoding="utf-8"))
     assert [item["revision_number"] for item in state["revision_history"]] == [1, 2]
+    rerun_result = json.loads(
+        (audit.job_directory(job_id) / "product-result-r2.json").read_text(encoding="utf-8")
+    )
+    assert rerun_result["category_catalog_snapshot"]["content_sha256"] == frozen_category_hash
+    assert rerun_result["category_sheets"][0]["category_id"] == "cat-phone"
     output = load_workbook(audit.artifact(job_id, "product_excel"), data_only=False)
     assert output["手机"]["D2"].value == "某品牌"
     output.close()
+
+
+def test_product_workflow_honors_cancel_and_processing_timeout_before_work_starts(tmp_path, monkeypatch):
+    rules = load_rules(Path("configs/examples/product-normalization.yaml"))
+    catalog = InMemoryCatalogAdapter([], {})
+
+    cancelled_audit = AuditService(tmp_path / "cancel-runtime")
+    cancelled_workflow = ProductWorkflowService(cancelled_audit)
+    cancelled_job = cancelled_audit.create_job()
+    cancelled_audit.request_cancel(cancelled_job)
+    cancelled_workflow.run(cancelled_job, tmp_path / "missing.xlsx", rules, catalog)
+    assert cancelled_audit.status(cancelled_job)["status"] == "cancelled"
+
+    timed_audit = AuditService(tmp_path / "timeout-runtime")
+    timed_workflow = ProductWorkflowService(timed_audit)
+    timed_job = timed_audit.create_job()
+    clock = iter([0.0, float(rules.workbook.processing_timeout_seconds) + 1.0])
+    monkeypatch.setattr("excel_auditor.product_workflow.service.time.monotonic", lambda: next(clock))
+    timed_workflow.run(timed_job, tmp_path / "missing.xlsx", rules, catalog)
+    status = timed_audit.status(timed_job)
+    assert status["status"] == "failed"
+    assert status["error_code"] == "PRODUCT_PROCESSING_TIMEOUT"
+
+
+def test_product_normalizer_spills_large_output_rows_and_serializes_losslessly(tmp_path):
+    rules = RuleSet.model_validate({
+        "schema_id": "product-spill",
+        "schema_version": "1.0.0",
+        "name": "Product spill",
+        "workbook": {"max_in_memory_cells": 10000},
+        "sheets": [{
+            "id": "products",
+            "name": "Products",
+            "primary_key": ["product_id"],
+            "columns": [
+                {"name": "product_id", "title": "Product ID", "required": True},
+                {"name": "category_id", "title": "Category ID"},
+                {"name": "category_name", "title": "Category"},
+            ],
+        }],
+        "product_workflow": {
+            "sheet_id": "products",
+            "catalog_connection_id": "memory",
+            "category": {
+                "source_field": "category_name",
+                "id_field": "category_id",
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+    headers = ["Product ID", "Category ID", "Category", *[f"Extra {index}" for index in range(7)]]
+    rows = [(1, headers)] + [
+        (index + 2, [f"P-{index}", "cat-a", "Category A", *[f"V-{index}-{extra}" for extra in range(7)]])
+        for index in range(1001)
+    ]
+    snapshot = WorkbookSnapshot(
+        path=tmp_path / "spill.xlsx",
+        sha256="2" * 64,
+        sheets={"Products": SheetSnapshot("Products", len(rows), len(headers), rows)},
+    )
+    result = normalize_product_workbook(
+        snapshot,
+        rules,
+        InMemoryCatalogAdapter([CategoryDefinition(category_id="cat-a", name="Category A")], {"cat-a": []}),
+        forced_extra_columns=set(range(4, 11)),
+    )
+    try:
+        assert isinstance(result.category_sheets[0].rows, SpillableSequence)
+        assert result.category_sheets[0].rows.spilled is True
+        assert len(result.model_dump(mode="json")["category_sheets"][0]["rows"]) == 1001
+    finally:
+        result.close()
+
+
+def test_product_workflow_respects_inspector_report_only_mode(tmp_path, monkeypatch):
+    rules = RuleSet.model_validate({
+        "schema_id": "product-report-only",
+        "schema_version": "1.0.0",
+        "name": "Product report only",
+        "sheets": [{
+            "id": "products",
+            "name": "Products",
+            "primary_key": ["product_id"],
+            "columns": [
+                {"name": "product_id", "title": "Product ID", "required": True},
+                {"name": "category_id", "title": "Category ID"},
+                {"name": "category_name", "title": "Category"},
+            ],
+        }],
+        "product_workflow": {
+            "sheet_id": "products",
+            "catalog_connection_id": "memory",
+            "category": {
+                "source_field": "category_name",
+                "id_field": "category_id",
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+    snapshot = WorkbookSnapshot(
+        path=tmp_path / "report-only.xlsx",
+        sha256="3" * 64,
+        sheets={"Products": SheetSnapshot(
+            "Products",
+            2,
+            3,
+            [(1, ["Product ID", "Category ID", "Category"]), (2, ["P-1", "cat-a", "Category A"])],
+        )},
+        report_only=True,
+    )
+    monkeypatch.setattr("excel_auditor.product_workflow.service.inspect_workbook", lambda *_args, **_kwargs: snapshot)
+    source = tmp_path / "input.xlsx"
+    source.write_bytes(b"not-read-because-inspector-is-stubbed")
+    audit = AuditService(tmp_path / "report-only-runtime")
+    job_id = audit.create_job()
+    ProductWorkflowService(audit).run(
+        job_id,
+        source,
+        rules,
+        InMemoryCatalogAdapter([CategoryDefinition(category_id="cat-a", name="Category A")], {"cat-a": []}),
+    )
+    status = audit.status(job_id)
+    assert status["status"] == "completed"
+    assert status["report_only"] is True
+    assert "product_excel" not in status["artifacts"]

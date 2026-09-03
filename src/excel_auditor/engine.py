@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import os
 from collections import Counter, defaultdict
@@ -21,17 +20,13 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, excel_datetime_write_safe, is_formula_text, normalized_uniqueness_key, parse_excel_value, parse_row_number, parse_value, values_equal
+from .normalization import ParsedValue, excel_datetime_write_safe, excel_numeric_write_safe, is_formula_text, normalized_uniqueness_key, parse_excel_value, parse_row_number, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
 from .workbook import SheetSnapshot, WorkbookSnapshot, locate_header_row
 from .validators import run_validator
 from .ids import new_ulid
-
-
-_EXCEL_MIN_POSITIVE_NUMBER = Decimal("2.2251E-308")
-_EXCEL_MAX_ABSOLUTE_NUMBER = Decimal("9.99999999999999E307")
 
 
 @dataclass
@@ -982,27 +977,7 @@ def _excel_write_safe(parsed: ParsedValue, rule: Any) -> bool:
     # governed by the separate trusted formula-template checks.
     if rule.compare.formula_mode == "formula" and is_formula_text(parsed.normalized):
         return True
-    value = Decimal(str(parsed.normalized))
-    if not value.is_finite():
-        return False
-    absolute = abs(value)
-    if absolute != 0 and (
-        absolute < _EXCEL_MIN_POSITIVE_NUMBER
-        or absolute > _EXCEL_MAX_ABSOLUTE_NUMBER
-    ):
-        return False
-    digits = list(value.as_tuple().digits)
-    while len(digits) > 1 and digits[-1] == 0:
-        digits.pop()
-    if len(digits) > 15:
-        return False
-    try:
-        as_float = float(value)
-    except (OverflowError, ValueError):
-        return False
-    if not math.isfinite(as_float) or (value != 0 and as_float == 0):
-        return False
-    return Decimal(str(as_float)) == value
+    return excel_numeric_write_safe(parsed.normalized)
 
 
 def _append_excel_write_safety_difference(

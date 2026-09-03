@@ -1,6 +1,6 @@
 """Dynamic product-catalog normalization primitives."""
 
-from .catalog import CatalogAdapter, InMemoryCatalogAdapter, ManagedHttpCatalogAdapter
+from .catalog import CatalogAdapter, FrozenCatalogAdapter, InMemoryCatalogAdapter, ManagedHttpCatalogAdapter
 from .category import resolve_categories
 from .mapping import map_product_headers
 from .normalizer import normalize_product_workbook
@@ -8,6 +8,7 @@ from .models import (
     CatalogFieldDefinition,
     CatalogFieldSource,
     CatalogSchemaSnapshot,
+    CategoryCatalogSnapshot,
     CategoryDefinition,
     CategoryResolution,
     DynamicSchemaPlan,
@@ -27,11 +28,13 @@ __all__ = [
     "CatalogFieldDefinition",
     "CatalogFieldSource",
     "CatalogSchemaSnapshot",
+    "CategoryCatalogSnapshot",
     "CategoryDefinition",
     "CategoryResolution",
     "CatalogAdapter",
     "DynamicSchemaPlan",
     "FieldMapping",
+    "FrozenCatalogAdapter",
     "InMemoryCatalogAdapter",
     "ManagedHttpCatalogAdapter",
     "MappingCandidate",

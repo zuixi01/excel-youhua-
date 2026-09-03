@@ -484,15 +484,28 @@ async def create_product_normalization(
         path = directory / f"product-input{suffix}"
         path.write_bytes(content)
         adapter = ManagedHttpCatalogAdapter(managed_http, rules.product_workflow)
-        background_tasks.add_task(
-            product_service.run,
-            job_id,
-            path,
-            rules,
-            adapter,
-            tenant_id=request.state.tenant_id,
-            actor_id=request.state.user_id,
-        )
+        if task_queue:
+            try:
+                task_queue.enqueue_product(
+                    DATA_ROOT,
+                    job_id,
+                    path,
+                    rules,
+                    request.state.tenant_id,
+                    request.state.user_id,
+                )
+            except Exception as exc:
+                raise HTTPException(503, "task queue is unavailable") from exc
+        else:
+            background_tasks.add_task(
+                product_service.run,
+                job_id,
+                path,
+                rules,
+                adapter,
+                tenant_id=request.state.tenant_id,
+                actor_id=request.state.user_id,
+            )
         return {
             "job_id": job_id,
             "status": "queued",
@@ -522,6 +535,42 @@ def list_product_reviews(
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"items": items, "total": len(items)}
+
+
+@app.get("/api/v1/product-normalizations/{job_id}/issues")
+def list_product_issues(
+    job_id: str,
+    request: Request,
+    issue_type: str | None = None,
+    category_id: str | None = None,
+    field_id: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    _authorize_job(request, job_id)
+    try:
+        path = service.artifact(job_id, "product_issues")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    start = (page - 1) * page_size
+    stop = start + page_size
+    total = 0
+    items: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if issue_type and item.get("issue_type") != issue_type:
+                continue
+            if category_id and item.get("category_id") != category_id:
+                continue
+            if field_id and item.get("field_id") != field_id:
+                continue
+            if start <= total < stop:
+                items.append(item)
+            total += 1
+    return {"items": items, "page": page, "page_size": page_size, "total": total}
 
 
 @app.post("/api/v1/product-normalizations/{job_id}/reviews/{review_id}/decision")
@@ -555,6 +604,8 @@ def create_product_revision(
     current = _authorize_job(request, job_id)
     if current.get("workflow") != "product_normalization":
         raise HTTPException(409, "job is not a product-normalization workflow")
+    if current.get("status") != "review_resolved":
+        raise HTTPException(409, "product revision is not ready to be queued")
     try:
         reviews = product_service.list_reviews(job_id, tenant_id=request.state.tenant_id)
     except FileNotFoundError as exc:
@@ -567,19 +618,28 @@ def create_product_revision(
         rules = _get_rule(request, str(current["schema_id"]), str(current["schema_version"]))
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(404, "the workflow rule version is unavailable") from exc
-    _validate_connection_reference(rules)
-    if managed_http is None or rules.product_workflow is None:
-        raise HTTPException(422, "RULE_CONFIG_INVALID: product catalog connection is unavailable")
-    adapter = ManagedHttpCatalogAdapter(managed_http, rules.product_workflow)
     service._write_status(job_id, {**current, "status": "revision_queued", "progress": 0})
-    background_tasks.add_task(
-        product_service.rerun_after_reviews_safe,
-        job_id,
-        rules,
-        adapter,
-        tenant_id=request.state.tenant_id,
-        actor_id=request.state.user_id,
-    )
+    if task_queue:
+        try:
+            task_queue.enqueue_product_revision(
+                DATA_ROOT,
+                job_id,
+                rules,
+                request.state.tenant_id,
+                request.state.user_id,
+                int(current.get("revision_number", 0)),
+            )
+        except Exception as exc:
+            service._write_status(job_id, current)
+            raise HTTPException(503, "task queue is unavailable") from exc
+    else:
+        background_tasks.add_task(
+            product_service.rerun_after_reviews_safe,
+            job_id,
+            rules,
+            tenant_id=request.state.tenant_id,
+            actor_id=request.state.user_id,
+        )
     return {
         "job_id": job_id,
         "status": "revision_queued",

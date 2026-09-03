@@ -326,3 +326,39 @@ def test_cancel_request_moves_job_to_cancelled_at_safe_checkpoint(tmp_path, monk
     assert api_module.service.status(job_id)["status"] == "cancelled"
     terminal = client.post(f"/api/v1/comparisons/{job_id}/cancel")
     assert terminal.status_code == 409
+
+
+def test_product_issue_api_filters_paginated_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXCEL_AUDITOR_DATA", str(tmp_path / "product-issues-api"))
+    monkeypatch.delenv("EXCEL_AUDITOR_API_TOKEN", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    import importlib
+    import excel_auditor.api as api_module
+
+    api_module = importlib.reload(api_module)
+    client = TestClient(api_module.app)
+    job_id = api_module.service.create_job()
+    directory = api_module.service.job_directory(job_id)
+    issues = [
+        {"issue_type": "invalid_value", "excel_row": 2, "category_id": "phone", "field_id": "price", "message": "bad", "color": "F9CB9C"},
+        {"issue_type": "required_missing", "excel_row": 3, "category_id": "phone", "field_id": "brand", "message": "missing", "color": "F4CCCC"},
+    ]
+    (directory / "product-issues.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in issues),
+        encoding="utf-8",
+    )
+    current = api_module.service.status(job_id)
+    api_module.service._write_status(job_id, {
+        **current,
+        "workflow": "product_normalization",
+        "status": "manual_review",
+        "artifacts": {"product_issues": "product-issues.jsonl"},
+    })
+
+    response = client.get(
+        f"/api/v1/product-normalizations/{job_id}/issues",
+        params={"issue_type": "required_missing", "page_size": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["field_id"] == "brand"

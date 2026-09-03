@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -12,6 +13,10 @@ from openpyxl.utils.datetime import from_excel
 
 from .models import ColumnRule, FieldType, to_python_datetime_format
 from .strict_serialization import dump_json_exact, load_json_strict
+
+
+_EXCEL_MIN_POSITIVE_NUMBER = Decimal("2.2251E-308")
+_EXCEL_MAX_ABSOLUTE_NUMBER = Decimal("9.99999999999999E307")
 
 
 @dataclass(frozen=True)
@@ -231,6 +236,34 @@ def excel_datetime_write_safe(value: datetime, timezone_name: str | None) -> boo
     except ValueError:
         return False
     return restored.astimezone(timezone.utc) == value.astimezone(timezone.utc)
+
+
+def excel_numeric_write_safe(value: Any) -> bool:
+    """Return whether Excel can round-trip a number without precision loss."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    if not parsed.is_finite():
+        return False
+    absolute = abs(parsed)
+    if absolute != 0 and (
+        absolute < _EXCEL_MIN_POSITIVE_NUMBER
+        or absolute > _EXCEL_MAX_ABSOLUTE_NUMBER
+    ):
+        return False
+    digits = list(parsed.as_tuple().digits)
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+    if len(digits) > 15:
+        return False
+    try:
+        as_float = float(parsed)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(as_float) or (parsed != 0 and as_float == 0):
+        return False
+    return Decimal(str(as_float)) == parsed
 
 
 def normalized_uniqueness_key(parsed: ParsedValue, rule: ColumnRule) -> tuple[str, Any] | None:

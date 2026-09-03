@@ -5,6 +5,7 @@ type JobStatus = { job_id: string; status: string; progress: number; workflow?: 
 type Difference = { difference_id: string; type: string; severity: string; sheet_id: string; sheet_name: string; cell?: string; excel_row?: number; canonical_field?: string; business_key?: Record<string, unknown>; excel_raw_value?: unknown; excel_normalized_value?: unknown; standard_raw_value?: unknown; standard_normalized_value?: unknown; rule_id?: string; message: string; repair_status: string };
 type ReviewCandidate = { field_id: string; title: string; confidence: number; match_value: string };
 type ProductReview = { review_id: string; review_type: string; review_key: string; status: string; payload: { message: string; raw_header?: string; physical_column?: number; excel_row?: number; candidates: ReviewCandidate[] }; decision?: Record<string, unknown> };
+type ProductIssue = { issue_type: string; excel_row: number; category_id?: string; field_id?: string; raw_value?: unknown; message: string; color: string };
 
 const tab = ref<"tasks" | "products" | "rules">("products");
 const schemaId = ref("employee-roster");
@@ -24,6 +25,9 @@ const apiToken = ref(sessionStorage.getItem("excel-auditor-api-token") || "");
 const authMessage = ref("");
 const precheckResult = ref<Record<string, unknown>>();
 const productReviews = ref<ProductReview[]>([]);
+const productIssues = ref<ProductIssue[]>([]);
+const productIssueTotal = ref(0);
+const productIssueFilters = ref({ issue_type: "", category_id: "", field_id: "" });
 const reviewBusy = ref("");
 let timer: number | undefined;
 
@@ -116,7 +120,7 @@ async function refresh() {
   job.value = current;
   if (finished.value) {
     window.clearInterval(timer); busy.value = false;
-    if (current.workflow === "product_normalization") await loadProductReviews();
+    if (current.workflow === "product_normalization") { await loadProductReviews(); await loadProductIssues(); }
     else if (["completed", "manual_review"].includes(current.status)) await loadDifferences();
   }
 }
@@ -126,6 +130,15 @@ async function loadProductReviews() {
   const response = await apiFetch(`/api/v1/product-normalizations/${job.value.job_id}/reviews`);
   if (!response.ok) { error.value = await problem(response); return; }
   productReviews.value = (await response.json()).items;
+}
+
+async function loadProductIssues() {
+  if (!job.value) return;
+  const query = new URLSearchParams({ page: "1", page_size: "200" });
+  Object.entries(productIssueFilters.value).forEach(([key, value]) => { if (value) query.set(key, value); });
+  const response = await apiFetch(`/api/v1/product-normalizations/${job.value.job_id}/issues?${query}`);
+  if (!response.ok) { error.value = await problem(response); return; }
+  const payload = await response.json(); productIssues.value = payload.items; productIssueTotal.value = payload.total;
 }
 
 async function decideProductReview(review: ProductReview, action: "confirm" | "keep_extra" | "reject", candidate?: ReviewCandidate) {
@@ -173,7 +186,7 @@ async function downloadArtifact(kind: string) {
   error.value = "";
   const response = await apiFetch(`/api/v1/comparisons/${job.value.job_id}/artifacts/${kind}`);
   if (!response.ok) { error.value = await problem(response); return; }
-  const extensions: Record<string, string> = { excel: "xlsx", json: "json", differences_jsonl: "jsonl", html: "html", manifest: "json", product_excel: "xlsx", product_result: "json", product_manifest: "json" };
+  const extensions: Record<string, string> = { excel: "xlsx", json: "json", differences_jsonl: "jsonl", html: "html", manifest: "json", product_excel: "xlsx", product_result: "json", product_manifest: "json", product_issues: "jsonl" };
   const fallback = `${job.value.job_id}-${kind}.${extensions[kind] || "bin"}`;
   const disposition = response.headers.get("content-disposition") || "";
   const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
@@ -288,7 +301,12 @@ onUnmounted(() => window.clearInterval(timer));
         <div class="bar"><i :style="{ width: `${job.progress || 0}%` }" /></div>
         <div class="metrics product-metrics"><article><strong>{{ job.category_count || 0 }}</strong><span>已解析类目</span></article><article><strong>{{ job.unresolved_row_count || 0 }}</strong><span>未解析商品</span></article><article><strong>{{ productReviews.filter(item => item.status === 'pending').length }}</strong><span>待人工确认</span></article><article><strong>{{ job.issue_count || 0 }}</strong><span>字段质量问题</span></article></div>
         <p v-if="job.error_message_safe" class="error">{{ job.error_message_safe }}</p>
-        <nav v-if="job.artifacts"><button v-if="job.artifacts.product_excel" @click="downloadArtifact('product_excel')">下载最终商品 Excel</button><button v-if="job.artifacts.product_result" @click="downloadArtifact('product_result')">下载完整结果 JSON</button><button v-if="job.artifacts.product_manifest" @click="downloadArtifact('product_manifest')">渲染清单</button></nav>
+        <nav v-if="job.artifacts"><button v-if="job.artifacts.product_excel" @click="downloadArtifact('product_excel')">{{ job.status === 'manual_review' ? '下载待审核商品 Excel' : '下载最终商品 Excel' }}</button><button v-if="job.artifacts.product_result" @click="downloadArtifact('product_result')">下载完整结果 JSON</button><button v-if="job.artifacts.product_issues" @click="downloadArtifact('product_issues')">下载问题 JSONL</button><button v-if="job.artifacts.product_manifest" @click="downloadArtifact('product_manifest')">渲染清单</button></nav>
+        <div v-if="productIssues.length || job.issue_count" class="differences">
+          <div class="review-title"><div><h3>字段质量问题</h3><p class="muted">与 Excel 内“问题清单”一致；共 {{ productIssueTotal }} 条，当前最多展示 200 条。</p></div></div>
+          <div class="filter-grid product-issue-filter"><input v-model="productIssueFilters.issue_type" placeholder="问题类型" /><input v-model="productIssueFilters.category_id" placeholder="类目 ID" /><input v-model="productIssueFilters.field_id" placeholder="字段 ID" /><button class="secondary" @click="loadProductIssues">筛选</button></div>
+          <div class="table-wrap"><table><thead><tr><th>源行</th><th>类目</th><th>字段</th><th>类型</th><th>原值</th><th>说明</th></tr></thead><tbody><tr v-for="item in productIssues" :key="`${item.excel_row}-${item.category_id}-${item.field_id}-${item.issue_type}`"><td>{{ item.excel_row }}</td><td>{{ item.category_id || '—' }}</td><td>{{ item.field_id || '—' }}</td><td>{{ item.issue_type }}</td><td>{{ JSON.stringify(item.raw_value) }}</td><td>{{ item.message }}</td></tr></tbody></table></div>
+        </div>
         <div v-if="productReviews.length" class="review-workbench">
           <div class="review-title"><div><h3>人工审核工作台</h3><p class="muted">候选项只提供依据，不会自动写入。每个决定都会进入修订历史。</p></div><button v-if="allProductReviewsResolved" class="primary" :disabled="busy" @click="createProductRevision">应用决定并生成新修订</button></div>
           <article v-for="review in productReviews" :key="review.review_id" class="review-card" :class="{ resolved: review.status === 'resolved' }">

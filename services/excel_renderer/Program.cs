@@ -472,7 +472,7 @@ static void AddProductSheets(
     var merchantHeaderColor = JsonValue(root, "merchant_extra_header_color");
     if (String.IsNullOrWhiteSpace(merchantHeaderColor)) merchantHeaderColor = "D9D9D9";
     if (!Regex.IsMatch(merchantHeaderColor, "^[0-9A-Fa-f]{6}$")) throw new InvalidDataException("product merchant header color is invalid");
-    var issues = new Dictionary<(string Category, uint SourceRow, string Field), string>();
+    var issues = new Dictionary<(string Category, uint SourceRow, string Field), ProductIssue>();
     if (root.TryGetProperty("issues", out var issueArray) && issueArray.ValueKind == JsonValueKind.Array)
     {
         foreach (var issue in issueArray.EnumerateArray())
@@ -483,11 +483,15 @@ static void AddProductSheets(
                 || !issue.TryGetProperty("excel_row", out var sourceRowElement)
                 || !sourceRowElement.TryGetUInt32(out var sourceRow)) continue;
             var color = JsonValue(issue, "color");
-            if (Regex.IsMatch(color, "^[0-9A-Fa-f]{6}$")) issues[(category, sourceRow, field)] = color;
+            var issueType = JsonValue(issue, "issue_type");
+            if (Regex.IsMatch(color, "^[0-9A-Fa-f]{6}$"))
+                issues[(category, sourceRow, field)] = new ProductIssue(color, issueType);
         }
     }
     var usedNames = (workbookPart.Workbook?.Sheets?.Elements<Sheet>() ?? [])
         .Select(item => item.Name?.Value ?? "").ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var validationListCache = new Dictionary<string, string>(StringComparer.Ordinal);
+    var validationSheetName = UniqueSheetName("__ExcelAuditorLists", "lists", usedNames);
     foreach (var category in categorySheets.EnumerateArray())
     {
         var categoryId = JsonValue(category, "category_id");
@@ -498,16 +502,150 @@ static void AddProductSheets(
         var fields = ParseProductFields(plan.GetProperty("fields"));
         var rows = category.GetProperty("rows");
         var sourceRows = category.GetProperty("source_excel_rows");
-        AddOrReplaceProductSheet(workbookPart, sheetName, categoryId, fields, rows, sourceRows, issues, merchantHeaderColor, styleCache);
+        AddOrReplaceProductSheet(workbookPart, sheetName, categoryId, fields, rows, sourceRows, issues, merchantHeaderColor, styleCache, validationListCache, validationSheetName);
         usedNames.Add(sheetName);
         if (category.TryGetProperty("sku_rows", out var skuRows) && skuRows.ValueKind == JsonValueKind.Array && skuRows.GetArrayLength() > 0)
         {
             var skuFields = fields.Where(item => item.Source is "fixed" or "platform_specification").ToList();
             var skuName = UniqueSheetName(sheetName + "-SKU", categoryId, usedNames);
-            AddOrReplaceProductSheet(workbookPart, skuName, categoryId, skuFields, skuRows, sourceRows, issues, merchantHeaderColor, styleCache);
+            var skuSourceRows = category.TryGetProperty("sku_source_excel_rows", out var skuSourceElement)
+                ? skuSourceElement
+                : sourceRows;
+            AddOrReplaceProductSheet(workbookPart, skuName, categoryId, skuFields, skuRows, skuSourceRows, issues, merchantHeaderColor, styleCache, validationListCache, validationSheetName);
             usedNames.Add(skuName);
         }
     }
+    AddProductReviewSheets(workbookPart, root, usedNames, styleCache);
+}
+
+static void AddProductReviewSheets(
+    WorkbookPart workbookPart,
+    JsonElement root,
+    HashSet<string> usedNames,
+    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+{
+    var sourceHeaders = new List<string>();
+    if (root.TryGetProperty("source_headers", out var headersElement))
+    {
+        if (headersElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("product source_headers must be an array");
+        var ordinal = 1;
+        foreach (var header in headersElement.EnumerateArray())
+        {
+            if (header.ValueKind != JsonValueKind.String)
+                throw new InvalidDataException("product source_headers must contain strings");
+            var value = header.GetString() ?? "";
+            sourceHeaders.Add(String.IsNullOrWhiteSpace(value) ? $"原列{ordinal}" : value);
+            ordinal++;
+        }
+    }
+    if (root.TryGetProperty("unresolved_rows", out var unresolved) && unresolved.ValueKind == JsonValueKind.Array && unresolved.GetArrayLength() > 0)
+    {
+        var rows = new List<List<string>>();
+        foreach (var item in unresolved.EnumerateArray())
+        {
+            var resolution = item.GetProperty("category_resolution");
+            var candidates = resolution.TryGetProperty("candidates", out var candidateArray) && candidateArray.ValueKind == JsonValueKind.Array
+                ? String.Join(" | ", candidateArray.EnumerateArray().Select(candidate => $"{JsonValue(candidate, "field_id")}:{JsonValue(candidate, "title")}"))
+                : "";
+            var row = new List<string> {
+                JsonValue(item, "excel_row"),
+                JsonValue(resolution, "status"),
+                JsonValue(resolution, "match_type"),
+                JsonValue(resolution, "raw_category_id"),
+                JsonValue(resolution, "raw_category"),
+                candidates,
+            };
+            if (item.TryGetProperty("values", out var values) && values.ValueKind == JsonValueKind.Array)
+                row.AddRange(values.EnumerateArray().Select(ProductReviewText));
+            rows.Add(row);
+        }
+        var name = UniqueSheetName("待审核商品", "review", usedNames);
+        AddGeneratedProductSheet(
+            workbookPart,
+            name,
+            ["源行", "状态", "匹配类型", "原类目ID", "原类目", "候选类目", .. sourceHeaders],
+            rows,
+            "D9D2E9",
+            styleCache
+        );
+        usedNames.Add(name);
+    }
+    if (root.TryGetProperty("issues", out var issues) && issues.ValueKind == JsonValueKind.Array && issues.GetArrayLength() > 0)
+    {
+        var rows = issues.EnumerateArray().Select(item => new List<string> {
+            JsonValue(item, "excel_row"),
+            JsonValue(item, "category_id"),
+            JsonValue(item, "field_id"),
+            JsonValue(item, "issue_type"),
+            item.TryGetProperty("raw_value", out var raw) ? ProductReviewText(raw) : "",
+            JsonValue(item, "message"),
+        }).ToList();
+        var name = UniqueSheetName("问题清单", "issues", usedNames);
+        AddGeneratedProductSheet(
+            workbookPart,
+            name,
+            ["源行", "类目ID", "字段ID", "问题类型", "原值", "说明"],
+            rows,
+            "F9CB9C",
+            styleCache
+        );
+        usedNames.Add(name);
+    }
+}
+
+static string ProductReviewText(JsonElement value) => value.ValueKind switch {
+    JsonValueKind.Null or JsonValueKind.Undefined => "",
+    JsonValueKind.String => value.GetString() ?? "",
+    JsonValueKind.Object or JsonValueKind.Array => value.GetRawText(),
+    _ => value.ToString(),
+};
+
+static void AddGeneratedProductSheet(
+    WorkbookPart workbookPart,
+    string name,
+    List<string> headers,
+    List<List<string>> rows,
+    string headerColor,
+    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+{
+    if (headers.Count == 0 || headers.Count > 16384 || rows.Count > 1048575)
+        throw new InvalidDataException("product review sheet exceeds Excel limits");
+    var part = workbookPart.AddNewPart<WorksheetPart>();
+    var data = new SheetData();
+    part.Worksheet = new Worksheet(data);
+    var header = new Row { RowIndex = 1u };
+    for (var column = 0; column < headers.Count; column++)
+    {
+        var cell = new Cell {
+            CellReference = ColumnName(column + 1) + "1",
+            DataType = CellValues.InlineString,
+            InlineString = new InlineString(new Text(headers[column]) { Space = SpaceProcessingModeValues.Preserve }),
+            StyleIndex = FillStyle(workbookPart, 0u, headerColor, null, styleCache),
+        };
+        header.Append(cell);
+    }
+    data.Append(header);
+    for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+    {
+        var row = new Row { RowIndex = (uint)rowIndex + 2u };
+        for (var column = 0; column < Math.Min(headers.Count, rows[rowIndex].Count); column++)
+        {
+            var cell = new Cell { CellReference = ColumnName(column + 1) + row.RowIndex!.Value };
+            cell.DataType = CellValues.InlineString;
+            cell.InlineString = new InlineString(new Text(rows[rowIndex][column]) { Space = SpaceProcessingModeValues.Preserve });
+            row.Append(cell);
+        }
+        data.Append(row);
+    }
+    var endColumn = ColumnName(headers.Count);
+    part.Worksheet.Append(new AutoFilter { Reference = $"A1:{endColumn}{Math.Max(1, rows.Count + 1)}" });
+    RecalculateDimension(part.Worksheet);
+    part.Worksheet.Save();
+    var workbook = workbookPart.Workbook ?? throw new InvalidDataException("workbook is missing");
+    var sheets = workbook.Sheets ?? workbook.AppendChild(new Sheets());
+    var nextId = sheets.Elements<Sheet>().Select(item => item.SheetId?.Value ?? 0u).DefaultIfEmpty(0u).Max() + 1u;
+    sheets.Append(new Sheet { Id = workbookPart.GetIdOfPart(part), SheetId = nextId, Name = name });
 }
 
 static List<ProductField> ParseProductFields(JsonElement plannedFields)
@@ -522,12 +660,65 @@ static List<ProductField> ParseProductFields(JsonElement plannedFields)
         var source = JsonValue(field, "source");
         var fieldType = JsonValue(field, "field_type");
         var numberFormat = JsonValue(field, "number_format");
+        var timezone = JsonValue(field, "timezone");
+        var required = field.TryGetProperty("required", out var requiredElement) && requiredElement.ValueKind == JsonValueKind.True;
+        if (field.TryGetProperty("required", out requiredElement) && requiredElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new InvalidDataException("product field required must be a boolean");
+        var allowBlank = !required;
+        string? minimum = null;
+        string? maximum = null;
+        if (field.TryGetProperty("validation", out var validationElement) && validationElement.ValueKind != JsonValueKind.Null)
+        {
+            if (validationElement.ValueKind != JsonValueKind.Object)
+                throw new InvalidDataException("product field validation must be an object");
+            if (validationElement.TryGetProperty("nullable", out var nullableElement))
+            {
+                if (nullableElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    throw new InvalidDataException("product field validation nullable must be a boolean");
+                allowBlank = !required && nullableElement.GetBoolean();
+            }
+            minimum = JsonValue(validationElement, "min");
+            maximum = JsonValue(validationElement, "max");
+        }
+        var enumValues = new List<string>();
+        if (field.TryGetProperty("enum_values", out var enumElement))
+        {
+            if (enumElement.ValueKind != JsonValueKind.Array)
+                throw new InvalidDataException("product field enum_values must be an array");
+            foreach (var item in enumElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String || String.IsNullOrWhiteSpace(item.GetString()))
+                    throw new InvalidDataException("product field enum_values must contain non-blank strings");
+                enumValues.Add(item.GetString()!);
+            }
+            if (enumValues.Count != enumValues.Distinct(StringComparer.Ordinal).Count())
+                throw new InvalidDataException("product field enum_values must be unique");
+        }
         if (String.IsNullOrWhiteSpace(id) || String.IsNullOrWhiteSpace(title)
             || source is not ("fixed" or "platform_attribute" or "platform_specification" or "merchant_extra"))
             throw new InvalidDataException("product field identity or source is invalid");
         ValidateFieldType(fieldType);
         ValidateNumberFormat(String.IsNullOrWhiteSpace(numberFormat) ? null : numberFormat);
-        fields.Add(new ProductField(id, title, source, fieldType, String.IsNullOrWhiteSpace(numberFormat) ? null : numberFormat));
+        if (!String.IsNullOrWhiteSpace(timezone) && fieldType != "datetime")
+            throw new InvalidDataException("product field timezone is only valid for datetime fields");
+        if (!String.IsNullOrWhiteSpace(timezone))
+        {
+            if (timezone.Length > 255 || timezone.Any(Char.IsControl))
+                throw new InvalidDataException("product field timezone is invalid");
+            ResolveTimeZone(timezone);
+        }
+        fields.Add(new ProductField(
+            id,
+            title,
+            source,
+            fieldType,
+            String.IsNullOrWhiteSpace(numberFormat) ? null : numberFormat,
+            String.IsNullOrWhiteSpace(timezone) ? null : timezone,
+            enumValues,
+            allowBlank,
+            String.IsNullOrWhiteSpace(minimum) ? null : minimum,
+            String.IsNullOrWhiteSpace(maximum) ? null : maximum
+        ));
     }
     if (fields.Count == 0 || fields.Count > 16384 || fields.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count() != fields.Count)
         throw new InvalidDataException("product field count or identity is invalid");
@@ -541,9 +732,11 @@ static void AddOrReplaceProductSheet(
     List<ProductField> fields,
     JsonElement rows,
     JsonElement sourceRows,
-    Dictionary<(string Category, uint SourceRow, string Field), string> issues,
+    Dictionary<(string Category, uint SourceRow, string Field), ProductIssue> issues,
     string merchantHeaderColor,
-    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache)
+    Dictionary<(uint SourceStyle, string Fill, string NumberFormat), uint> styleCache,
+    Dictionary<string, string> validationListCache,
+    string validationSheetName)
 {
     if (rows.ValueKind != JsonValueKind.Array || sourceRows.ValueKind != JsonValueKind.Array || rows.GetArrayLength() != sourceRows.GetArrayLength())
         throw new InvalidDataException("product rows and source_excel_rows must be aligned arrays");
@@ -591,10 +784,25 @@ static void AddOrReplaceProductSheet(
             var field = fields[columnIndex];
             var cell = new Cell { CellReference = ColumnName(columnIndex + 1) + row.RowIndex!.Value };
             JsonElement? value = rowElements[rowIndex].TryGetProperty(field.Id, out var property) ? property : null;
-            WriteSafeValue(cell, value, field.FieldType, Uses1904DateSystem(workbookPart));
-            issues.TryGetValue((categoryId, sourceRow, field.Id), out var issueColor);
-            if (!String.IsNullOrWhiteSpace(issueColor) || !String.IsNullOrWhiteSpace(field.NumberFormat))
-                cell.StyleIndex = FillStyle(workbookPart, 0u, issueColor, field.NumberFormat, styleCache);
+            issues.TryGetValue((categoryId, sourceRow, field.Id), out var issue);
+            if (field.Source == "merchant_extra")
+            {
+                WriteSafeValue(cell, value, field.FieldType, Uses1904DateSystem(workbookPart));
+            }
+            else
+            {
+                try
+                {
+                    ValidateTypedValue(value, field.FieldType, field.Timezone);
+                    WriteSafeValue(cell, value, field.FieldType, Uses1904DateSystem(workbookPart));
+                }
+                catch (InvalidDataException) when (issue is not null)
+                {
+                    WriteLiteralText(cell, value);
+                }
+            }
+            if (issue is not null || !String.IsNullOrWhiteSpace(field.NumberFormat))
+                cell.StyleIndex = FillStyle(workbookPart, 0u, issue?.Color, field.NumberFormat, styleCache);
             row.Append(cell);
         }
         data.Append(row);
@@ -602,12 +810,157 @@ static void AddOrReplaceProductSheet(
     var endColumn = ColumnName(fields.Count);
     var endRow = Math.Max(1, rows.GetArrayLength() + 1);
     worksheet.Append(new AutoFilter { Reference = $"A1:{endColumn}{endRow}" });
+    ApplyProductFieldValidations(workbookPart, worksheet, fields, validationListCache, validationSheetName);
     RecalculateDimension(worksheet);
     worksheet.Save();
     var workbook = workbookPart.Workbook ?? throw new InvalidDataException("workbook is missing");
     var sheets = workbook.Sheets ?? workbook.AppendChild(new Sheets());
     var nextId = sheets.Elements<Sheet>().Select(item => item.SheetId?.Value ?? 0u).DefaultIfEmpty(0u).Max() + 1u;
     sheets.Append(new Sheet { Id = workbookPart.GetIdOfPart(part), SheetId = nextId, Name = name });
+}
+
+static void ApplyProductFieldValidations(
+    WorkbookPart workbookPart,
+    Worksheet worksheet,
+    List<ProductField> fields,
+    Dictionary<string, string> validationListCache,
+    string validationSheetName)
+{
+    for (var index = 0; index < fields.Count; index++)
+    {
+        var field = fields[index];
+        DataValidation? validation = null;
+        if (field.EnumValues.Count > 0)
+        {
+            var rangeName = EnsureProductValidationList(
+                workbookPart,
+                field.EnumValues,
+                validationListCache,
+                validationSheetName
+            );
+            validation = new DataValidation {
+                Type = DataValidationValues.List,
+                AllowBlank = field.AllowBlank,
+                ShowErrorMessage = true,
+                ErrorTitle = "Invalid value",
+                Error = "Select a value from the platform catalog list.",
+                Formula1 = new Formula1(rangeName),
+            };
+        }
+        else if (field.FieldType is "integer" or "decimal" && (field.Minimum is not null || field.Maximum is not null))
+        {
+            validation = new DataValidation {
+                Type = field.FieldType == "integer" ? DataValidationValues.Whole : DataValidationValues.Decimal,
+                AllowBlank = field.AllowBlank,
+                ShowErrorMessage = true,
+                ErrorTitle = "Invalid number",
+                Error = "Enter a value within the platform catalog bounds.",
+            };
+            if (field.Minimum is not null && field.Maximum is not null)
+            {
+                validation.Operator = DataValidationOperatorValues.Between;
+                validation.Formula1 = new Formula1(field.Minimum);
+                validation.Formula2 = new Formula2(field.Maximum);
+            }
+            else if (field.Minimum is not null)
+            {
+                validation.Operator = DataValidationOperatorValues.GreaterThanOrEqual;
+                validation.Formula1 = new Formula1(field.Minimum);
+            }
+            else
+            {
+                validation.Operator = DataValidationOperatorValues.LessThanOrEqual;
+                validation.Formula1 = new Formula1(field.Maximum!);
+            }
+        }
+        if (validation is null) continue;
+        var column = ColumnName(index + 1);
+        validation.SequenceOfReferences = new ListValue<StringValue> { InnerText = $"{column}2:{column}1048576" };
+        var validations = worksheet.Elements<DataValidations>().FirstOrDefault();
+        if (validations is null)
+        {
+            validations = new DataValidations();
+            var following = worksheet.ChildElements.FirstOrDefault(item => item.LocalName is
+                "hyperlinks" or "printOptions" or "pageMargins" or "pageSetup" or "headerFooter" or
+                "rowBreaks" or "colBreaks" or "customProperties" or "cellWatches" or "ignoredErrors" or
+                "smartTags" or "drawing" or "legacyDrawing" or "legacyDrawingHF" or "picture" or
+                "oleObjects" or "controls" or "webPublishItems" or "tableParts" or "extLst");
+            if (following is null) worksheet.Append(validations);
+            else worksheet.InsertBefore(validations, following);
+        }
+        validations.Append(validation);
+        validations.Count = (uint)validations.ChildElements.Count;
+    }
+}
+
+static string EnsureProductValidationList(
+    WorkbookPart workbookPart,
+    List<string> values,
+    Dictionary<string, string> cache,
+    string sheetName)
+{
+    var key = String.Join("\u001F", values);
+    if (cache.TryGetValue(key, out var existingName)) return existingName;
+    var workbook = workbookPart.Workbook ?? throw new InvalidDataException("workbook is missing");
+    var sheets = workbook.Sheets ?? workbook.AppendChild(new Sheets());
+    var sheet = sheets.Elements<Sheet>().FirstOrDefault(item => StringComparer.Ordinal.Equals(item.Name?.Value, sheetName));
+    WorksheetPart part;
+    if (sheet is null)
+    {
+        part = workbookPart.AddNewPart<WorksheetPart>();
+        part.Worksheet = new Worksheet(new SheetData());
+        var nextId = sheets.Elements<Sheet>().Select(item => item.SheetId?.Value ?? 0u).DefaultIfEmpty(0u).Max() + 1u;
+        sheet = new Sheet {
+            Id = workbookPart.GetIdOfPart(part),
+            SheetId = nextId,
+            Name = sheetName,
+            State = SheetStateValues.VeryHidden,
+        };
+        sheets.Append(sheet);
+    }
+    else
+    {
+        part = workbookPart.GetPartById(sheet.Id?.Value ?? throw new InvalidDataException("validation worksheet relationship is missing")) as WorksheetPart
+            ?? throw new InvalidDataException("validation worksheet part is invalid");
+    }
+    var data = part.Worksheet?.GetFirstChild<SheetData>() ?? throw new InvalidDataException("validation worksheet data is missing");
+    var columnNumber = cache.Count + 1;
+    var column = ColumnName(columnNumber);
+    for (var index = 0; index < values.Count; index++)
+    {
+        var cell = FindOrCreateCell(part, column + (index + 1).ToString(CultureInfo.InvariantCulture));
+        cell.CellFormula = null;
+        cell.CellValue = null;
+        cell.DataType = CellValues.InlineString;
+        cell.InlineString = new InlineString(new Text(values[index]) { Space = SpaceProcessingModeValues.Preserve });
+    }
+    RecalculateDimension(part.Worksheet!);
+    part.Worksheet!.Save();
+    var definedNames = workbook.DefinedNames ?? workbook.AppendChild(new DefinedNames());
+    var ordinal = definedNames.Elements<DefinedName>().Count(item => item.Name?.Value?.StartsWith("_ExcelAuditorList", StringComparison.Ordinal) == true) + 1;
+    string name;
+    do name = "_ExcelAuditorList" + ordinal++.ToString(CultureInfo.InvariantCulture);
+    while (definedNames.Elements<DefinedName>().Any(item => StringComparer.OrdinalIgnoreCase.Equals(item.Name?.Value, name)));
+    definedNames.Append(new DefinedName {
+        Name = name,
+        Text = $"'{sheetName.Replace("'", "''", StringComparison.Ordinal)}'!${column}$1:${column}${values.Count}",
+    });
+    cache[key] = name;
+    return name;
+}
+
+static void WriteLiteralText(Cell cell, JsonElement? value)
+{
+    cell.CellFormula = null;
+    cell.CellValue = null;
+    cell.InlineString = null;
+    if (value is null || value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+    {
+        cell.DataType = null;
+        return;
+    }
+    cell.DataType = CellValues.InlineString;
+    cell.InlineString = new InlineString(new Text(value.Value.ToString()) { Space = SpaceProcessingModeValues.Preserve });
 }
 
 static void RemoveSheetIfPresent(WorkbookPart workbookPart, string name)
@@ -1726,7 +2079,19 @@ sealed record Args(string Input, string Output, string Manifest, bool DryRun)
 sealed record RenderManifest(string ManifestVersion, string JobId, string InputSha256, List<RenderOperation> Operations, RenderMetadata? Metadata);
 sealed record RenderMetadata(string? SchemaId, string? SchemaVersion, string? SchemaSha256, string? StandardSnapshotId, string? StandardSha256, string? ResultSha256);
 sealed record RenderOperation(string Type, string? Sheet, string? Cell, uint? Row, string? Before, string? After, string? CanonicalField, uint? HeaderRow, string? HeaderValue, string? FillColor, string? Comment, string? Name, string? SourceJson, JsonElement? Value, List<RenderValue>? Values, string? DifferenceId, string? FieldType, string? NumberFormat, RenderValidation? Validation, string? FormulaTemplate, uint? DataStartRow, List<uint>? FormulaRows, string? Timezone);
-sealed record ProductField(string Id, string Title, string Source, string FieldType, string? NumberFormat);
+sealed record ProductField(
+    string Id,
+    string Title,
+    string Source,
+    string FieldType,
+    string? NumberFormat,
+    string? Timezone,
+    List<string> EnumValues,
+    bool AllowBlank,
+    string? Minimum,
+    string? Maximum
+);
+sealed record ProductIssue(string Color, string Type);
 sealed record RenderValue(string? Cell, JsonElement? Value, string? FieldType, string? NumberFormat, string? FormulaTemplate, string? Timezone);
 sealed record RenderValidation(string? Type, List<string>? Values, string? Min, string? Max, bool AllowBlank = true);
 sealed record OperationResult(int OperationIndex, string Type, string? DifferenceId, string Status, string? ErrorCode, string? Message);

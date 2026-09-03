@@ -456,7 +456,7 @@ class AuditService:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def artifact(self, job_id: str, name: str) -> Path:
-        if name not in {"excel", "json", "differences_jsonl", "html", "manifest", "product_result", "product_excel", "product_manifest"}:
+        if name not in {"excel", "json", "differences_jsonl", "html", "manifest", "product_result", "product_excel", "product_manifest", "product_issues"}:
             raise FileNotFoundError("unknown artifact")
         status = self.status(job_id)
         file_name = status.get("artifacts", {}).get(name)

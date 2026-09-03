@@ -4,11 +4,13 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from enum import Enum
+from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SkipValidation, field_serializer, field_validator, model_validator
 
 from ..models import FieldType, StrictModel, ValidationConfig, normalize_header
+from ..spill import SpillableSequence
 
 
 class CatalogFieldSource(str, Enum):
@@ -56,6 +58,7 @@ class CatalogFieldDefinition(StrictModel):
     attribute_id: str | None = Field(default=None, max_length=256)
     enum_values: list[str] = Field(default_factory=list, max_length=10_000)
     number_format: str | None = Field(default=None, max_length=255)
+    timezone: str | None = Field(default=None, max_length=255)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     raw: dict[str, Any] = Field(default_factory=dict)
 
@@ -73,6 +76,18 @@ class CatalogFieldDefinition(StrictModel):
         if any(not value for value in normalized) or len(normalized) != len(set(normalized)):
             raise ValueError("field aliases must be non-blank and unique after normalization")
         return values
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str | None) -> str | None:
+        if value is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(value)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(f"unknown IANA timezone: {value}") from exc
+        return value
 
     @model_validator(mode="after")
     def source_contract(self) -> "CatalogFieldDefinition":
@@ -102,8 +117,9 @@ class CatalogFieldDefinition(StrictModel):
             or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in self.number_format)
         ):
             raise ValueError("catalog number_format must be printable and non-blank")
+        if self.timezone is not None and self.field_type != FieldType.DATETIME:
+            raise ValueError("catalog timezone is only valid for datetime fields")
         return self
-
 
 class CatalogSchemaSnapshot(StrictModel):
     snapshot_id: str = Field(min_length=1, max_length=128)
@@ -153,6 +169,49 @@ class CatalogSchemaSnapshot(StrictModel):
         return self
 
 
+class CategoryCatalogSnapshot(StrictModel):
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    connection_id: str = Field(min_length=1, max_length=128)
+    captured_at: datetime
+    categories: list[CategoryDefinition]
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        snapshot_id: str,
+        connection_id: str,
+        categories: list[CategoryDefinition],
+        captured_at: datetime | None = None,
+        source_metadata: dict[str, Any] | None = None,
+    ) -> "CategoryCatalogSnapshot":
+        ordered = sorted(categories, key=lambda category: category.category_id)
+        payload = [category.model_dump(mode="json") for category in ordered]
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return cls(
+            snapshot_id=snapshot_id,
+            connection_id=connection_id,
+            captured_at=captured_at or datetime.now(UTC),
+            categories=ordered,
+            content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            source_metadata=source_metadata or {},
+        )
+
+    @model_validator(mode="after")
+    def verify_snapshot(self) -> "CategoryCatalogSnapshot":
+        identifiers = [category.category_id for category in self.categories]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("category catalog snapshot category_id values must be unique")
+        payload = [category.model_dump(mode="json") for category in self.categories]
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if self.content_sha256 != expected:
+            raise ValueError("category catalog snapshot content hash does not match its categories")
+        return self
+
+
 class MappingCandidate(StrictModel):
     field_id: str
     title: str
@@ -173,11 +232,12 @@ class FieldMapping(StrictModel):
 
 class CategoryResolution(StrictModel):
     excel_row: int = Field(ge=1)
+    raw_category_id: str | None = None
     raw_category: str | None = None
     category_id: str | None = None
     category_name: str | None = None
     status: Literal["resolved", "manual_review", "unresolved"]
-    match_type: Literal["id", "exact", "confirmed", "fuzzy_suggestion", "missing", "ambiguous"]
+    match_type: Literal["id", "exact", "confirmed", "fuzzy_suggestion", "missing", "ambiguous", "id_name_conflict", "invalid_id"]
     confidence: float | None = Field(default=None, ge=0, le=100)
     candidates: list[MappingCandidate] = Field(default_factory=list)
 
@@ -219,7 +279,16 @@ class DynamicSchemaPlan(StrictModel):
 
 
 class ProductCellIssue(StrictModel):
-    issue_type: Literal["required_missing", "invalid_value", "ambiguous_mapping"]
+    issue_type: Literal[
+        "required_missing",
+        "invalid_value",
+        "excel_write_unsafe",
+        "ambiguous_mapping",
+        "duplicate_primary_key",
+        "unique_value",
+        "cross_field_error",
+        "sku_combination_limit",
+    ]
     excel_row: int = Field(ge=1)
     category_id: str | None = None
     field_id: str | None = None
@@ -241,18 +310,52 @@ class NormalizedCategorySheet(StrictModel):
     worksheet_name: str
     plan: DynamicSchemaPlan
     source_excel_rows: list[int]
-    rows: list[dict[str, Any]]
-    sku_rows: list[dict[str, Any]] = Field(default_factory=list)
+    rows: SkipValidation[Sequence[dict[str, Any]]]
+    sku_rows: SkipValidation[Sequence[dict[str, Any]]] = Field(default_factory=list)
+    sku_source_excel_rows: list[int] = Field(default_factory=list)
+
+    @field_validator("rows", "sku_rows", mode="before")
+    @classmethod
+    def validate_row_sequence(cls, value: Any) -> Sequence[dict[str, Any]]:
+        if isinstance(value, SpillableSequence):
+            return value
+        if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+            raise ValueError("product rows must be a sequence")
+        return [dict(item) for item in value]
+
+    @model_validator(mode="after")
+    def aligned_rows(self) -> "NormalizedCategorySheet":
+        if len(self.rows) != len(self.source_excel_rows):
+            raise ValueError("product rows must align with source_excel_rows")
+        if len(self.sku_rows) != len(self.sku_source_excel_rows):
+            raise ValueError("SKU rows must align with sku_source_excel_rows")
+        return self
+
+    @field_serializer("rows", "sku_rows")
+    def serialize_rows(self, value: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        return list(value)
+
+    def close(self) -> None:
+        for sequence in (self.rows, self.sku_rows):
+            close = getattr(sequence, "close", None)
+            if close is not None:
+                close()
 
 
 class ProductNormalizationResult(StrictModel):
+    category_catalog_snapshot: CategoryCatalogSnapshot
     catalog_snapshots: list[CatalogSchemaSnapshot]
     category_sheets: list[NormalizedCategorySheet]
+    source_headers: list[str] = Field(default_factory=list)
     unresolved_rows: list[UnresolvedProductRow] = Field(default_factory=list)
     review_items: list[ReviewItem] = Field(default_factory=list)
     issues: list[ProductCellIssue] = Field(default_factory=list)
     requires_manual_review: bool = False
     merchant_extra_header_color: str = Field(default="D9D9D9", pattern=r"^[0-9A-Fa-f]{6}$")
+
+    def close(self) -> None:
+        for sheet in self.category_sheets:
+            sheet.close()
 
 
 class ProductReviewDecision(StrictModel):
