@@ -227,44 +227,31 @@ def compare_workbook(
         pseudo = rules.sheets[0]
         differences.append(_difference(DifferenceType.EXTRA_SHEET, pseudo, f"存在规则未声明的工作表：{extra_name}", sheet_name=extra_name, severity="warning"))
     summary.differences = len(differences)
-    summary.mismatched_cells = sum(item.type == DifferenceType.VALUE_MISMATCH for item in differences)
-    summary.validation_errors = sum(item.type in {DifferenceType.INVALID_VALUE, DifferenceType.VALIDATION_ERROR} for item in differences)
-    summary.repairs_planned = sum(item.repair_status == "planned" for item in differences)
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: fuzzy_value_suggestion:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".fuzzy_suggestion")
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: formula_primary_key:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".formula_primary_key")
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: formula_append_requires_trusted_template"
-        for item in differences
-        if item.rule_id == "missing_record.formula_template_required"
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: formula_template_mismatch:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".formula_template_mismatch")
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: excel_numeric_write_precision:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".excel_write_precision")
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: excel_datetime_write_timezone:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".excel_write_timezone")
-    }))
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: formula_cached_value_write_blocked:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".formula_cached_write_blocked")
-    }))
+    review_reason_groups: list[set[str]] = [set() for _index in range(7)]
+    for item in differences:
+        if item.type == DifferenceType.VALUE_MISMATCH:
+            summary.mismatched_cells += 1
+        if item.type in {DifferenceType.INVALID_VALUE, DifferenceType.VALIDATION_ERROR}:
+            summary.validation_errors += 1
+        if item.repair_status == "planned":
+            summary.repairs_planned += 1
+        rule_id = item.rule_id or ""
+        if rule_id.endswith(".fuzzy_suggestion"):
+            review_reason_groups[0].add(f"{item.sheet_name}: fuzzy_value_suggestion:{item.canonical_field}")
+        if rule_id.endswith(".formula_primary_key"):
+            review_reason_groups[1].add(f"{item.sheet_name}: formula_primary_key:{item.canonical_field}")
+        if rule_id == "missing_record.formula_template_required":
+            review_reason_groups[2].add(f"{item.sheet_name}: formula_append_requires_trusted_template")
+        if rule_id.endswith(".formula_template_mismatch"):
+            review_reason_groups[3].add(f"{item.sheet_name}: formula_template_mismatch:{item.canonical_field}")
+        if rule_id.endswith(".excel_write_precision"):
+            review_reason_groups[4].add(f"{item.sheet_name}: excel_numeric_write_precision:{item.canonical_field}")
+        if rule_id.endswith(".excel_write_timezone"):
+            review_reason_groups[5].add(f"{item.sheet_name}: excel_datetime_write_timezone:{item.canonical_field}")
+        if rule_id.endswith(".formula_cached_write_blocked"):
+            review_reason_groups[6].add(f"{item.sheet_name}: formula_cached_value_write_blocked:{item.canonical_field}")
+    for reason_group in review_reason_groups:
+        manual_review_reasons.extend(sorted(reason_group))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -497,32 +484,41 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             record = standard_records[key]
         duplicate_in_excel = key in excel_duplicates
         requested_row = key[0][1] if sheet.primary_key_mode == "row_number" else append_row
-        unsafe_formula_fields = [
-            name
-            for name, rule in rules_by_name.items()
-            if rule.compare.formula_mode == "formula"
-            and is_formula_text(record.get(name))
-            and (
-                rule.formula_template is None
-                or rule.formula_template.replace("{row}", str(append_row)) != record.get(name)
-            )
-        ]
-        formula_append_blocked = bool(unsafe_formula_fields) and sheet.actions.missing_record == "append_and_mark_green"
-        parsed_record = {name: parse_value(record.get(name), rule) for name, rule in rules_by_name.items()}
-        unsafe_write_fields = [
-            name for name, rule in rules_by_name.items()
-            if not _excel_write_safe(parsed_record[name], rule)
-        ]
-        unsafe_datetime_fields = [
-            name for name in unsafe_write_fields
-            if rules_by_name[name].type.value == "datetime"
-        ]
-        write_append_blocked = bool(unsafe_write_fields) and sheet.actions.missing_record == "append_and_mark_green"
+        append_requested = sheet.actions.missing_record == "append_and_mark_green"
+        unsafe_formula_fields: list[str] = []
+        parsed_record: dict[str, ParsedValue] = {}
+        unsafe_write_fields: list[str] = []
+        unsafe_datetime_fields: list[str] = []
+        if append_requested:
+            unsafe_formula_fields = [
+                name
+                for name, rule in rules_by_name.items()
+                if rule.compare.formula_mode == "formula"
+                and is_formula_text(record.get(name))
+                and (
+                    rule.formula_template is None
+                    or rule.formula_template.replace("{row}", str(append_row)) != record.get(name)
+                )
+            ]
+            parsed_record = {
+                name: parse_value(record.get(name), rule)
+                for name, rule in rules_by_name.items()
+            }
+            unsafe_write_fields = [
+                name for name, rule in rules_by_name.items()
+                if not _excel_write_safe(parsed_record[name], rule)
+            ]
+            unsafe_datetime_fields = [
+                name for name in unsafe_write_fields
+                if rules_by_name[name].type.value == "datetime"
+            ]
+        formula_append_blocked = bool(unsafe_formula_fields)
+        write_append_blocked = bool(unsafe_write_fields)
         if write_append_blocked:
             for name in unsafe_write_fields:
                 _append_excel_write_safety_difference(differences, sheet, rules_by_name[name], parsed_record[name], key=key)
         append = (
-            sheet.actions.missing_record == "append_and_mark_green"
+            append_requested
             and not duplicate_in_excel
             and requested_row == append_row
             and not formula_append_blocked
