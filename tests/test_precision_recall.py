@@ -110,6 +110,84 @@ def test_product_category_resolution_matches_adversarial_release_annotations():
         assert [candidate.field_id for candidate in result.candidates] == expected["candidates"]
 
 
+def test_product_category_resolution_has_perfect_accuracy_on_500_annotated_adversarial_cases():
+    category_names = [
+        "Smartphone Devices", "Running Footwear", "Laptop Computers", "Digital Cameras", "Wireless Headphones",
+        "Kitchen Appliances", "Office Furniture", "Outdoor Lighting", "Fitness Equipment", "Camping Supplies",
+        "Baby Clothing", "Pet Nutrition", "Garden Machinery", "Automotive Tools", "Musical Instruments",
+        "Board Games", "Skincare Products", "Haircare Products", "Travel Luggage", "Wrist Watches",
+        "Home Textiles", "Dining Utensils", "Coffee Equipment", "Tea Accessories", "Cleaning Supplies",
+        "Bathroom Fixtures", "Bedroom Furniture", "Livingroom Furniture", "Storage Organizers", "Power Tools",
+        "Hand Tools", "Protective Equipment", "Cycling Accessories", "Swimming Equipment", "Winter Sports",
+        "Team Sports", "Educational Toys", "Building Blocks", "Art Supplies", "Writing Instruments",
+        "Computer Components", "Network Equipment", "Mobile Accessories", "Audio Equipment", "Video Equipment",
+        "Smart Lighting", "Security Cameras", "Climate Control", "Water Filtration", "Renewable Energy",
+    ]
+    categories = [
+        CategoryDefinition(
+            category_id=f"catalog-{index:03d}",
+            name=name,
+            aliases=[f"Merchant {name}"],
+        )
+        for index, name in enumerate(category_names)
+    ]
+    rows = []
+    expected = []
+    for index, category in enumerate(categories):
+        next_category = categories[(index + 1) % len(categories)]
+        first_word, suffix = category.name.split(" ", 1)
+        middle = max(1, len(first_word) // 2)
+        deleted = first_word[:middle] + first_word[middle + 1:] + " " + suffix
+        swapped = (
+            first_word[:middle]
+            + first_word[middle + 1]
+            + first_word[middle]
+            + first_word[middle + 2:]
+            + " "
+            + suffix
+        )
+        annotated = [
+            ({"platform_category_id": category.category_id, "merchant_category": category.name}, "resolved", "id", category.category_id),
+            ({"merchant_category": category.name}, "resolved", "exact", category.category_id),
+            ({"merchant_category": category.aliases[0]}, "resolved", "exact", category.category_id),
+            ({"merchant_category": category.name.lower()}, "resolved", "exact", category.category_id),
+            ({"merchant_category": f"  {first_word}   {suffix}  "}, "resolved", "exact", category.category_id),
+            ({"merchant_category": deleted}, "manual_review", "fuzzy_suggestion", category.category_id),
+            ({"merchant_category": swapped}, "manual_review", "fuzzy_suggestion", category.category_id),
+            ({"platform_category_id": "retired-id", "merchant_category": category.name}, "manual_review", "invalid_id", category.category_id),
+            ({"platform_category_id": category.category_id, "merchant_category": next_category.name}, "manual_review", "id_name_conflict", category.category_id),
+            ({}, "unresolved", "missing", None),
+        ]
+        for row, status, match_type, target in annotated:
+            rows.append(row)
+            expected.append((status, match_type, target, next_category.category_id if match_type == "id_name_conflict" else None))
+
+    results = resolve_categories(rows, categories, fuzzy_threshold=70, candidate_score_margin=5)
+    assert len(results) == len(expected) == 500
+    true_positive = false_positive = false_negative = 0
+    for result, (status, match_type, target, conflict_target) in zip(results, expected, strict=True):
+        assert result.status == status
+        assert result.match_type == match_type
+        candidate_ids = [candidate.field_id for candidate in result.candidates]
+        predicted = result.category_id or (candidate_ids[0] if candidate_ids else None)
+        if target is None:
+            false_positive += int(predicted is not None)
+            continue
+        if result.category_id == target or target in candidate_ids:
+            true_positive += 1
+        else:
+            false_negative += 1
+        if predicted is not None and predicted != target and match_type != "id_name_conflict":
+            false_positive += 1
+        if conflict_target is not None:
+            assert set(candidate_ids) == {target, conflict_target}
+
+    precision = true_positive / (true_positive + false_positive)
+    recall = true_positive / (true_positive + false_negative)
+    assert precision == 1.0
+    assert recall == 1.0
+
+
 def _assert_precision_recall(predicted, expected, label):
     predicted, expected = set(predicted), set(expected)
     true_positive = len(predicted & expected)
