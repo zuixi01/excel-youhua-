@@ -5,19 +5,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .models import RuleSet
 from .ids import new_ulid
+from .strict_serialization import load_json_strict, load_yaml_strict
 
 
 def load_rules(path: Path) -> RuleSet:
     text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() in {".yaml", ".yml"}:
-        payload = yaml.safe_load(text)
-    else:
-        payload = json.loads(text)
+    payload = parse_rule_document(text, path.suffix)
     return RuleSet.model_validate(payload)
+
+
+def parse_rule_document(document: str, suffix: str) -> Any:
+    normalized = suffix.lower()
+    if normalized in {".yaml", ".yml"}:
+        return load_yaml_strict(document, context="rule YAML")
+    if normalized == ".json":
+        return load_json_strict(document, context="rule JSON")
+    raise ValueError("only JSON and YAML rule documents are supported")
 
 
 class RuleRegistry:
@@ -31,7 +36,7 @@ class RuleRegistry:
         path = directory / f"{_safe_segment(rules.schema_version)}.json"
         payload = rules.model_dump(mode="json")
         if path.exists():
-            existing = RuleSet.model_validate_json(path.read_text(encoding="utf-8"))
+            existing = RuleSet.model_validate(load_json_strict(path.read_text(encoding="utf-8"), context="published rule JSON"))
             if existing.content_sha256 != rules.content_sha256:
                 raise FileExistsError("published rule versions are immutable")
             return path
@@ -42,7 +47,7 @@ class RuleRegistry:
         path = self.root / _safe_segment(schema_id) / f"{_safe_segment(version)}.json"
         if not path.is_file():
             raise FileNotFoundError(f"rule version not found: {schema_id}@{version}")
-        return RuleSet.model_validate_json(path.read_text(encoding="utf-8"))
+        return RuleSet.model_validate(load_json_strict(path.read_text(encoding="utf-8"), context="published rule JSON"))
 
     def versions(self, schema_id: str) -> list[dict[str, str]]:
         directory = self.root / _safe_segment(schema_id)
@@ -50,7 +55,7 @@ class RuleRegistry:
             return []
         result = []
         for path in sorted(directory.glob("*.json")):
-            rules = RuleSet.model_validate_json(path.read_text(encoding="utf-8"))
+            rules = RuleSet.model_validate(load_json_strict(path.read_text(encoding="utf-8"), context="published rule JSON"))
             result.append({"schema_id": rules.schema_id, "version": rules.schema_version, "config_sha256": rules.content_sha256, "status": "published"})
         return result
 
@@ -72,7 +77,7 @@ class DraftRegistry:
         path = self._path(schema_id, draft_id)
         if not path.is_file():
             raise FileNotFoundError(f"draft not found: {draft_id}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return load_json_strict(path.read_text(encoding="utf-8"), context="draft rule JSON")
 
     def update(self, schema_id: str, draft_id: str, config: dict[str, Any]) -> dict[str, Any]:
         record = self.get(schema_id, draft_id)

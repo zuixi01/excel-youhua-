@@ -1,8 +1,19 @@
 import json
+from decimal import Decimal
 
 import pytest
 
 from excel_auditor.snapshots import SpilledRecords, create_snapshot, load_snapshot
+
+
+def test_snapshot_preserves_nested_decimal_number_semantics(tmp_path):
+    exact = Decimal("1234567890.1234567890123456789")
+    snapshot = create_snapshot({"data": [{"id": "E1", "payload": {"amount": exact}}]}, tmp_path)
+    snapshot_text = snapshot.path.read_text(encoding="utf-8")
+    assert '"amount":"' not in snapshot_text
+
+    loaded = load_snapshot(snapshot)
+    assert loaded["data"][0]["payload"]["amount"] == exact
 
 
 def test_snapshot_can_stream_into_disk_backed_sequences(tmp_path):

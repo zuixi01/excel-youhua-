@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence, overload
 
 from .ids import new_ulid
+from .strict_serialization import dump_json_exact
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,32 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 
+class _ExactDecimalEncodingRequired(TypeError):
+    pass
+
+
+def _fast_snapshot_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        raise _ExactDecimalEncodingRequired
+    return _json_default(value)
+
+
+def _snapshot_json(value: Any) -> str:
+    try:
+        # Preserve the C encoder's throughput for the common string/integer
+        # workload. Decimal-bearing records take the exact numeric path.
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=_fast_snapshot_default,
+        )
+    except _ExactDecimalEncodingRequired:
+        return dump_json_exact(value, ensure_ascii=False, sort_keys=True, default=_json_default)
+
+
 def create_snapshot(standard: dict[str, Sequence[dict[str, Any]]], directory: Path, metadata: dict[str, Any] | None = None) -> StandardSnapshot:
     directory.mkdir(parents=True, exist_ok=True)
     snapshot_id = new_ulid("std_")
@@ -78,7 +105,7 @@ def create_snapshot(standard: dict[str, Sequence[dict[str, Any]]], directory: Pa
             # Source record order is part of the snapshot content.  Object keys are
             # canonicalized below, so no full in-memory sort/copy is required.
             for record in rows:
-                line = (json.dumps({"sheet_id": sheet_id, "record": record}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default) + "\n").encode("utf-8")
+                line = (_snapshot_json({"sheet_id": sheet_id, "record": record}) + "\n").encode("utf-8")
                 handle.write(line)
                 digest.update(line)
                 count += 1
@@ -97,7 +124,7 @@ def load_snapshot(snapshot: StandardSnapshot, spill_after_records: int = 100_000
             for line_number, line in enumerate(handle, start=1):
                 digest.update(line)
                 try:
-                    item = json.loads(line)
+                    item = json.loads(line, parse_float=Decimal)
                     sheet_id = str(item["sheet_id"])
                     record = item["record"]
                 except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:

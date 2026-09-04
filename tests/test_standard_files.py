@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,88 @@ def test_root_array_and_csv_are_streamed_for_single_sheet(tmp_path):
     finally:
         _close(json_standard)
         _close(csv_standard)
+
+
+def test_uploaded_json_preserves_high_precision_decimal_tokens(tmp_path):
+    path = tmp_path / "precise.json"
+    path.write_text(
+        '{"data":[{"id":"E1","amount":1234567890.1234567890123456789}]}',
+        encoding="utf-8",
+    )
+    rules = RuleSet.model_validate({
+        "schema_id": "precise", "schema_version": "1.0.0", "name": "Precise",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "amount", "title": "Amount", "type": "decimal"},
+            ],
+        }],
+    })
+
+    standard = load_standard_file(path, rules, spill_after_records=10)
+    try:
+        assert standard["data"][0]["amount"] == Decimal("1234567890.1234567890123456789")
+    finally:
+        _close(standard)
+
+
+@pytest.mark.parametrize("suffix", [".json", ".csv"])
+def test_standard_field_names_use_header_normalization(tmp_path, suffix):
+    path = tmp_path / f"normalized{suffix}"
+    if suffix == ".json":
+        path.write_text(json.dumps({"data": [{" ＩＤ ": "E1", "Name\u00a0": "Alice"}]}), encoding="utf-8")
+    else:
+        path.write_text(" ＩＤ ,Name\u00a0\nE1,Alice\n", encoding="utf-8-sig")
+
+    standard = load_standard_file(path, _rules(), spill_after_records=10)
+    try:
+        assert list(standard["data"]) == [{"id": "E1", "name": "Alice"}]
+    finally:
+        _close(standard)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"id": "E1", "ID": "E2"},
+        {"ID": "E1", "Identifier": "E2"},
+        {"ID": "E1", " ID ": "E2"},
+    ],
+)
+def test_standard_rejects_conflicting_canonical_title_or_alias_values(tmp_path, record):
+    path = tmp_path / "conflicting.json"
+    path.write_text(json.dumps({"data": [record]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"STANDARD_DATA_INVALID: data\.id has conflicting field representations at record 1"):
+        load_standard_file(path, _rules(), spill_after_records=10)
+
+
+def test_standard_accepts_equivalent_duplicate_field_representations(tmp_path):
+    path = tmp_path / "equivalent.json"
+    path.write_text(json.dumps({"data": [{"id": "E1", "ID": "E1", "Identifier": "E1"}]}), encoding="utf-8")
+
+    standard = load_standard_file(path, _rules(), spill_after_records=10)
+    try:
+        assert list(standard["data"]) == [{"id": "E1"}]
+    finally:
+        _close(standard)
+
+
+def test_standard_rejects_duplicate_json_keys_before_value_loss(tmp_path):
+    path = tmp_path / "duplicate-key.json"
+    path.write_text('{"data":[{"ID":"E1","ID":"E2"}]}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate object key"):
+        load_standard_file(path, _rules(), spill_after_records=10)
+
+
+def test_standard_rejects_duplicate_csv_headers_before_value_loss(tmp_path):
+    path = tmp_path / "duplicate-header.csv"
+    path.write_text("ID,ID\nE1,E2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate field names"):
+        load_standard_file(path, _rules(), spill_after_records=10)
 
 
 @pytest.mark.parametrize(

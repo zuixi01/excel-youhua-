@@ -18,6 +18,14 @@ from excel_auditor.persistence import AuditEventRow, ComparisonJobRow, DatabaseR
 from excel_auditor.queueing import RedisJobQueue
 from excel_auditor.service import AuditService
 from excel_auditor.storage import S3ArtifactStore
+from excel_auditor.product_workflow import (
+    CatalogFieldDefinition,
+    CatalogFieldSource,
+    CategoryDefinition,
+    InMemoryCatalogAdapter,
+    ProductReviewDecision,
+)
+from excel_auditor.product_workflow.service import ProductWorkflowService
 
 
 @pytest.mark.integration
@@ -70,6 +78,57 @@ def test_postgres_redis_rq_minio_renderer_end_to_end(tmp_path, monkeypatch):
     with Session(database.engine) as session:
         row = session.scalar(select(ComparisonJobRow).where(ComparisonJobRow.id == job_id))
         assert row is not None and row.status == "completed" and row.tenant_id == "integration"
+
+    product_rules = RuleSet.model_validate({
+        "schema_id": "infra-product", "schema_version": "1.0.0", "name": "Infrastructure product",
+        "sheets": [{"id": "products", "name": "Products", "primary_key": ["product_id"], "columns": [
+            {"name": "product_id", "title": "Product ID", "required": True},
+            {"name": "category_id", "title": "Category ID"},
+            {"name": "category_name", "title": "Category"},
+        ]}],
+        "product_workflow": {
+            "sheet_id": "products", "catalog_connection_id": "integration-catalog", "mapping_fuzzy_threshold": 50,
+            "category": {
+                "source_field": "category_name", "id_field": "category_id",
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+    product_job = service.create_job(tenant_id="integration", user_id="ci")
+    product_input = service.job_directory(product_job) / "product-input.xlsx"
+    book = Workbook(); sheet = book.active; sheet.title = "Products"
+    sheet.append(["Product ID", "Category ID", "Category", "Brnad"])
+    sheet.append(["P-1", "phone", "Phone", "Example"])
+    book.save(product_input)
+    product_catalog = InMemoryCatalogAdapter(
+        [CategoryDefinition(category_id="phone", name="Phone")],
+        {"phone": [CatalogFieldDefinition(
+            field_id="brand", title="Brand", source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+            category_id="phone", attribute_id="brand", required=True,
+        )]},
+        connection_id="integration-catalog",
+    )
+    product_workflow = ProductWorkflowService(service, database)
+    product_workflow.run(
+        product_job, product_input, product_rules, product_catalog,
+        tenant_id="integration", actor_id="ci",
+    )
+    review = next(item for item in product_workflow.list_reviews(product_job, tenant_id="integration") if item["review_type"] == "field_mapping")
+    product_workflow.decide_review(
+        product_job,
+        review["review_id"],
+        ProductReviewDecision(action="confirm_mapping", field_id="brand", raw_header="Brnad"),
+        tenant_id="integration",
+        actor_id="ci",
+    )
+    queue.enqueue_product_revision(
+        root, product_job, product_rules, "integration", "ci", 1,
+    )
+    assert SimpleWorker([queue.queue], connection=queue.connection).work(burst=True, logging_level="WARNING")
+    product_status = service.status(product_job)
+    assert product_status["status"] == "completed" and product_status["revision_number"] == 2
+    assert s3.head_object(Bucket=bucket, Key=product_status["object_keys"]["product-result.xlsx"])["ContentLength"] > 0
 
 
 @pytest.mark.integration

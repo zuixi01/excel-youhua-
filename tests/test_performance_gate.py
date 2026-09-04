@@ -82,3 +82,26 @@ def test_performance_gate_checks_uploaded_standard_identity():
             {**current, "source_format": "csv_upload"},
             [MetricLimit("normalized_cpu_units", 0.25, 5.0)],
         )
+
+
+def test_performance_gate_checks_workbook_mode_and_product_width():
+    workbook_reference = _workbook(benchmark_version=5, large_mode=False)
+    with pytest.raises(PerformanceGateError, match="large_mode"):
+        compare_performance(
+            {**workbook_reference, "large_mode": True},
+            workbook_reference,
+            [MetricLimit("elapsed_seconds", 0.25, 5.0)],
+        )
+
+    product_reference = {
+        "benchmark_version": 2,
+        "rows": 100_000,
+        "platform_attributes": 20,
+        "elapsed_seconds": 10.0,
+    }
+    with pytest.raises(PerformanceGateError, match="platform_attributes"):
+        compare_performance(
+            {**product_reference, "platform_attributes": 10},
+            product_reference,
+            [MetricLimit("elapsed_seconds", 0.25, 5.0)],
+        )

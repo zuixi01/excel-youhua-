@@ -7,7 +7,8 @@ from typing import Any, BinaryIO, Sequence
 import ijson
 from ijson.common import ObjectBuilder
 
-from .models import RuleSet, SheetRule
+from .models import RuleSet, SheetRule, normalize_header
+from .normalization import parse_value
 from .snapshots import SpilledRecords
 
 
@@ -23,16 +24,7 @@ class _RecordAccumulator:
         self.detached = False
 
     def append(self, row: Any) -> None:
-        if not isinstance(row, dict):
-            raise ValueError(f"STANDARD_DATA_INVALID: {self.sheet.id} must be an array of objects")
-        canonical: dict[str, Any] = {}
-        for column in self.sheet.columns:
-            matched = next(
-                (candidate for candidate in [column.name, column.title, *column.aliases] if candidate in row),
-                None,
-            )
-            if matched is not None:
-                canonical[column.name] = row[matched]
+        canonical = canonicalize_standard_row(row, self.sheet, record_index=len(self.records) + 1)
         if isinstance(self.records, list) and len(self.records) >= self.spill_after_records:
             spilled = SpilledRecords()
             try:
@@ -54,6 +46,62 @@ class _RecordAccumulator:
         close = getattr(self.records, "close", None)
         if close is not None:
             close()
+
+
+def canonicalize_standard_row(
+    row: Any,
+    sheet: SheetRule,
+    *,
+    record_index: int | None = None,
+) -> dict[str, Any]:
+    """Map source field names without silently choosing conflicting aliases."""
+    if not isinstance(row, dict):
+        raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} must be an array of objects")
+    if any(not isinstance(key, str) for key in row):
+        location = f" at record {record_index}" if record_index is not None else ""
+        raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} has a non-string field name{location}")
+
+    normalized_keys: dict[str, list[str]] = {}
+    for raw_key in row:
+        normalized_keys.setdefault(normalize_header(raw_key), []).append(raw_key)
+
+    canonical: dict[str, Any] = {}
+    for column in sheet.columns:
+        candidates = [column.name, column.title, *column.aliases]
+        matched_keys: list[str] = []
+        for candidate in candidates:
+            for raw_key in normalized_keys.get(normalize_header(candidate), []):
+                if raw_key not in matched_keys:
+                    matched_keys.append(raw_key)
+        if not matched_keys:
+            continue
+
+        if len(matched_keys) > 1:
+            parsed = [parse_value(row[key], column) for key in matched_keys]
+            if any(not _same_canonical_value(parsed[0], value) for value in parsed[1:]):
+                location = f" at record {record_index}" if record_index is not None else ""
+                raise ValueError(
+                    f"STANDARD_DATA_INVALID: {sheet.id}.{column.name} has conflicting field representations{location}"
+                )
+        canonical[column.name] = row[matched_keys[0]]
+    if sheet.primary_key_mode == "row_number" and sheet.row_number_field not in canonical:
+        matched_row_fields = normalized_keys.get(normalize_header(sheet.row_number_field), [])
+        if len(matched_row_fields) > 1:
+            location = f" at record {record_index}" if record_index is not None else ""
+            raise ValueError(
+                f"STANDARD_DATA_INVALID: {sheet.id}.{sheet.row_number_field} has conflicting field representations{location}"
+            )
+        if matched_row_fields:
+            canonical[sheet.row_number_field] = row[matched_row_fields[0]]
+    return canonical
+
+
+def _same_canonical_value(left: Any, right: Any) -> bool:
+    if left.valid and right.valid:
+        return left.normalized == right.normalized
+    if left.valid != right.valid:
+        return False
+    return type(left.raw) is type(right.raw) and left.raw == right.raw
 
 
 def load_standard_file(
@@ -78,7 +126,11 @@ def _load_csv(path: Path, rules: RuleSet, spill_after_records: int) -> dict[str,
     count = 0
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle):
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            if len(fieldnames) != len(set(fieldnames)):
+                raise ValueError("STANDARD_DATA_INVALID: uploaded CSV has duplicate field names")
+            for row in reader:
                 count = _append(accumulator, row, count, rules)
         return {sheet.id: accumulator.detach()}
     except (UnicodeDecodeError, csv.Error) as exc:
@@ -100,13 +152,13 @@ def _load_json(path: Path, rules: RuleSet, spill_after_records: int) -> dict[str
                 accumulator = _RecordAccumulator(sheet, spill_after_records)
                 accumulators.append(accumulator)
                 count = 0
-                for row in ijson.items(handle, "item", use_float=True):
+                for row in ijson.items(handle, "item", use_float=False):
                     count = _append(accumulator, row, count, rules)
                 result[sheet.id] = accumulator.detach()
                 return result
             if marker != b"{":
                 raise ValueError("STANDARD_DATA_INVALID: root must be an object or array")
-            parser = iter(ijson.parse(handle, use_float=True))
+            parser = iter(ijson.parse(handle, use_float=False))
             _expect(next(parser), "start_map", "STANDARD_DATA_INVALID: root must be an object or array")
             count = 0
             seen_input_keys: set[str] = set()
@@ -180,13 +232,26 @@ def _expect(item: tuple[str, str, Any], event: str, message: str) -> None:
 def _build_value(parser: Any, first: tuple[str, str, Any]) -> Any:
     builder = ObjectBuilder()
     depth = 0
+    containers: list[set[str] | None] = []
     current = first
     while True:
         _prefix, event, value = current
+        if event == "map_key":
+            seen = containers[-1] if containers else None
+            if seen is not None:
+                key = str(value)
+                if key in seen:
+                    raise ValueError("STANDARD_DATA_INVALID: uploaded JSON has a duplicate object key")
+                seen.add(key)
         builder.event(event, value)
-        if event in {"start_map", "start_array"}:
+        if event == "start_map":
+            containers.append(set())
+            depth += 1
+        elif event == "start_array":
+            containers.append(None)
             depth += 1
         elif event in {"end_map", "end_array"}:
+            containers.pop()
             depth -= 1
             if depth == 0:
                 return builder.value

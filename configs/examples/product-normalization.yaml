@@ -1,0 +1,118 @@
+schema_id: product-normalization
+schema_version: 1.0.0
+name: 平台商品表动态整理
+workbook:
+  allowed_extensions: [xlsx]
+  preserve_macros: false
+  reject_protected: true
+  unsupported_feature_action: manual_review
+  max_upload_mib: 30
+  max_rows_per_sheet: 100000
+  max_columns_per_sheet: 200
+sheets:
+  - id: products
+    name: 商品信息
+    aliases: [商品表, 产品信息]
+    header:
+      row: 1
+      auto_detect: false
+      fuzzy_suggestion_threshold: 92
+    data_region:
+      start_row: 2
+      end_strategy: used_range
+      include_hidden_rows: true
+    primary_key: [product_id]
+    columns:
+      - name: product_id
+        title: 商品ID
+        aliases: [商品编号, 商家商品编码]
+        required: true
+        type: string
+        normalize: [trim, unicode_nfkc]
+        validation:
+          nullable: false
+          unique: true
+      - name: product_name
+        title: 商品名称
+        aliases: [产品名称, 标题]
+        required: true
+        type: string
+        normalize: [trim, unicode_nfkc, collapse_spaces]
+        validation:
+          nullable: false
+          max_length: 255
+      - name: platform_category_id
+        title: 平台类目ID
+        aliases: [平台分类ID]
+        required: false
+        type: string
+        normalize: [trim, unicode_nfkc]
+      - name: merchant_category
+        title: 商家类目
+        aliases: [商家分类, 原始类目]
+        required: true
+        type: string
+        normalize: [trim, unicode_nfkc, collapse_spaces]
+        validation:
+          nullable: false
+product_workflow:
+  sheet_id: products
+  catalog_connection_id: platform-catalog
+  mapping_fuzzy_threshold: 92
+  minimum_category_confidence: 95
+  category:
+    source_field: merchant_category
+    id_field: platform_category_id
+    category_list_path: /api/v1/categories
+    category_list_json_path: $.data
+    category_list_method: GET
+    category_list_pagination:
+      type: page_number
+      page_param: page
+      size_param: size
+      size: 500
+      total_json_path: $.total
+      max_pages: 1000
+    record_mapping:
+      id_key: id
+      name_key: name
+      parent_id_key: parent_id
+      path_key: path
+      aliases_key: aliases
+      active_key: active
+    attributes:
+      path_template: /api/v1/categories/{category_id}/attributes
+      data_json_path: $.data
+      method: GET
+      record_mapping:
+        id_key: id
+        title_key: title
+        aliases_key: aliases
+        type_key: type
+        required_key: required
+        multiple_key: multiple
+        display_order_key: display_order
+        enum_values_key: enum_values
+        number_format_key: number_format
+    specifications:
+      path_template: /api/v1/categories/{category_id}/specifications
+      data_json_path: $.data
+      method: GET
+      record_mapping:
+        id_key: id
+        title_key: title
+        aliases_key: aliases
+        type_key: type
+        required_key: required
+        multiple_key: multiple
+        display_order_key: display_order
+        enum_values_key: enum_values
+        number_format_key: number_format
+  output:
+    multi_category_mode: split_sheets
+    merchant_extra_mode: append_right
+    sku_sheet_mode: when_present
+    required_missing_color: F4CCCC
+    invalid_value_color: F9CB9C
+    ambiguous_color: D9D2E9
+    merchant_extra_header_color: D9D9D9

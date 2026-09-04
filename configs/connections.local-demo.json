@@ -1,0 +1,14 @@
+{
+  "connections": [
+    {
+      "id": "platform-catalog",
+      "base_url": "http://127.0.0.1:8011/",
+      "allowed_paths": ["/api/v1/categories"],
+      "timeout_seconds": 10,
+      "max_response_bytes": 1048576,
+      "max_records": 10000,
+      "allow_private_network": true,
+      "allow_insecure_http": true
+    }
+  ]
+}

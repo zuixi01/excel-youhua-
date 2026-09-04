@@ -10,33 +10,33 @@
 
 | # | 要求 | 状态 | 当前证据 | 仍需证据 |
 |---:|---|---|---|---|
-| 1 | API 上传 Excel/标准数据或受管接口获取 | 本地已证明 | `src/excel_auditor/api.py`、`standard_files.py`、`standard_sources.py`；上传文件分块落盘并流式解析；生产只读连接/秘密挂载；`tests/test_api.py`、`test_standard_files.py`、`test_standard_sources.py` | 真实业务接口契约验收 |
+| 1 | API 上传 Excel/标准数据或受管接口获取 | 本地已证明 | `src/excel_auditor/api.py`、`standard_files.py`、`standard_sources.py`；上传文件分块落盘并流式解析；规则/API 内联 JSON、连接注册表严格拒绝重复键；标准多表键按规范名/别名大小写不敏感映射，重复映射明确拒绝；受管路径规范化、白名单编码绕过和参数覆盖回归；生产只读连接/秘密挂载；`tests/test_api.py`、`test_standard_files.py`、`test_standard_sources.py` | 真实业务接口契约验收 |
 | 2 | 标准数据固化为带 SHA-256 的审计快照 | 本地已证明 | `snapshots.py` 回读校验、对象存储路径；`test_storage.py`、基础设施集成测试 | 生产对象存储保留策略验收 |
-| 3 | 按规则识别工作表和表头行 | 本地已证明 | `workbook.py`、`engine.py`；别名/自动定位/缺失表头测试 | 业务模板样例 |
-| 4 | 缺失、多余、别名、重复、歧义表头 | 本地已证明 | 15 个核心 Golden、模糊表头人工审核端到端测试 | 业务异常样例 |
-| 5 | 缺失列确定插入并标绿，多余列保留标红 | 本地已证明 | 首/中/末 Golden 的完整表头和填充断言；Renderer before/after 合约 | Excel 客户端视觉抽验 |
-| 6 | 单主键和联合主键准确匹配 | 本地已证明 | `engine.py`、属性测试；`typed_compound.xlsx` 固定 Golden | 人工标注业务基准集 |
-| 7 | 多余/缺失记录、空/重复主键 | 本地已证明 | 核心 Golden、`test_end_to_end.py` | 业务异常样例 |
-| 8 | 类型化比较字符串、数值、日期时间、布尔、枚举、集合 | 本地已证明 | `normalization.py`、单元/属性测试；高级类型 Golden | 人工标注业务基准集 |
-| 9 | 字段及跨字段数据质量规则 | 本地已证明 | `pandera_adapter.py`、注册校验器；`test_validation.py` | 业务规则清单 |
-| 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试 | 业务方修复策略签署 |
-| 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言 | 客户端下载抽验 |
-| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；提交 `e66788d` 的 [主 CI/LibreOffice 兼容作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 及 JUnit 制品已通过；Excel COM 自动打开/另存、关键宏部件哈希和独立人工签核工具已就绪 | Microsoft Excel 桌面实际运行及人工验收记录 |
-| 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试 | 生产审计抽样 |
-| 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | `service.py` 修复审计、差异模型、数据库测试 | 生产审计抽样 |
-| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；本地生产 Renderer 完整回归通过；提交 `e66788d` 的 [主 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33253936071) 七项与[性能基线 v4](https://github.com/zuixi01/excel-youhua-/actions/runs/33254109004) 九项全部绿色并保存制品；500k 上传 JSON、500k 标准/400,001 差异直接比较及 100 页受管 HTTP 服务全链路均通过；小型人工标注 precision/recall | 业务标注基准 |
+| 3 | 按规则识别工作表和表头行 | 本地已证明 | `workbook.py`、`engine.py`；Inspector/比较/标准规范化统一按 `casefold()` 匹配工作表规范名与别名，并将真实物理名称贯穿差异及渲染；规则发布拒绝 sheet id 与其他表物理名称的折叠冲突，标准数据重复映射也不静默任选；安全预检与比较共享自动定位结果，覆盖前导说明行后的允许公式及合并表头；规范表名与别名同时存在时生成 `AMBIGUOUS_SHEET` 并进入人工审核；数据起始行必须晚于定位表头，普通/磁盘模式均在有界扫描后从实际首数据行精确计算最大数据行数 | 业务模板样例 |
+| 4 | 缺失、多余、别名、重复、歧义表头 | 本地已证明 | 15 个核心 Golden、模糊表头人工审核端到端测试；不同文字映射到同一规范字段的语义重复回归 | 业务异常样例 |
+| 5 | 缺失列确定插入并标绿，多余列保留标红 | 本地已证明 | 首/中/末 Golden 的完整表头和填充断言；Renderer before/after 合约；缺失公式列使用解析后的实际表头、数据起始行及非空目标行清单，标准公式与受信任模板不一致时转人工审核 | Excel 客户端视觉抽验 |
+| 6 | 单主键和联合主键准确匹配 | 本地已证明 | `engine.py`、属性测试；`typed_compound.xlsx` 固定 Golden；规则拒绝非精确/模糊/公式主键模式，运行时公式主键排除匹配并转人工审核 | 人工标注业务基准集 |
+| 7 | 多余/缺失记录、空/重复主键 | 本地已证明 | 核心 Golden、`test_end_to_end.py`；空主键报告/跳过/行号回退在标准校验和比较层语义一致，且行号回退不放宽其他字段校验；显式行号主键通过上传标准端到端验证并禁止错位追加，严格拒绝布尔/小数/空白/越界值；多个缺失记录验证连续行分配且互不覆盖 | 业务异常样例 |
+| 8 | 类型化比较字符串、数值、日期时间、布尔、枚举、集合 | 本地已证明 | `normalization.py`、单元/属性测试；高级类型 Golden；公式文本模式支持非字符串字段、双向公式存在性差异及标准字段省略；未格式化 Excel 日期/日期时间序列按 1900/1904 工作簿 epoch 解析，日期/日期时间修复按同一 epoch 写入且覆盖 1900 虚构闰日、1904 日期及时间小数原始序列；IANA DST 不存在/重复本地时间拒绝静默选 offset，显式 offset 按 UTC 时刻区分且 day 精度保留目标时区自然日；显式 offset 的 DST 重复时刻可精确比较，但因 Excel 日期序列无法保留 offset/fold，覆盖、空值填充、静态默认和缺失记录追加均转人工审核且不写回，非重复时段仍验证为日期数值单元格；上传、内联及受管 HTTP 标准 JSON 的高精度小数 token 不经过二进制 float，顶层 decimal 与嵌套 JSON 数字经过快照仍保持精确 number 语义；字符串 JSON 字段递归拒绝重复对象键，标准端与 Excel 端分别明确失败或报告无效，不采用 last-key-wins；绝对/相对容差、差值及小数位量化使用按操作数系数长度扩展的 Decimal 上下文，40 位以上数值的相对容差边界不会被默认 28 位上下文舍入成假相等；规则发布拒绝空集合分隔符和标准化后不可达的值别名/枚举；非有限 Decimal、大精度量化和大小写枚举对抗回归；自动修复按规范类型写回布尔、枚举、百分比 Decimal、时区日期时间、集合和稳定 JSON，同时保留原始审计值；数值/日期显示格式只有在字段显式开启 `normalize_display_format` 且提供 `format` 时才修复，非法值不误修，样式操作保持原数值/日期/公式及字体、边框、填充；任意精度数值参与精确比较，超过 Excel 数值单元格 15 位有效数字或安全指数范围的修复值转人工审核且不写回 | 人工标注业务基准集 |
+| 9 | 字段及跨字段数据质量规则 | 本地已证明 | `pandera_adapter.py`、注册校验器；标准/Excel 统一基于规范化值校验长度、正则、枚举和可空唯一字段，Decimal 唯一性按数值而非字符串 token 判定并覆盖跨分块的尾零/负零等价表示；带时区 datetime 唯一性按 UTC 时刻判定，能区分 DST 两个 fold 并识别不同 offset 表示的同一时刻；重复/空/公式主键行不参与连接但其非主键字段仍执行类型、唯一性和跨字段校验，显式 `skip_row` 保持整行跳过，统计使用实际校验行数；发布时拒绝字段类型不支持的长度/正则/日期时间精度及无效解析格式，日期格式与运行时共用 token 编译器并拒绝未知 token、缺失年月日、`%` 指令及不安全时区后缀；内置跨字段规则严格校验参数集合、条件值、字段类型和规则 ID 唯一性；`test_validation.py`、`test_adapters.py` | 业务规则清单 |
+| 10 | 默认不覆盖非空数据、不删除列/记录 | 本地已证明 | 默认动作模型、修复授权检查、端到端测试；标准记录省略可选字段不会清空 Excel，显式空值才进入授权覆盖；超精度大整数/小数不会因已授权覆盖而被静默舍入或写成文本；`cached_value` 仅用于比较，覆盖/填充/静态默认均不得把目标公式替换成常量并转人工审核；已有用户批注保留原文本和作者，审计内容写入独立幂等区块；Renderer 直接调用也拒绝输入输出同路径并验证原文件哈希不变 | 业务方修复策略签署 |
+| 11 | 输出标色 Excel、JSON、HTML | 本地已证明 | `service.py`、`reporting.py`、Renderer；端到端与 Golden 渲染断言；生产/开发路径共用 `EXTRA/MISSING < MISMATCH < INVALID < AMBIGUOUS/DUPLICATE` 主颜色优先级，整行红色不会覆盖更高优先级单元格，同单元格多问题批注合并保留 | 客户端下载抽验 |
+| 12 | Excel 与 LibreOffice 可打开，结构回归通过 | 部分证明 | Open XML Validator、回读、结构化 Golden；插列公式回归同时覆盖普通/绝对/跨表/小写 A1 引用、数字结尾函数及越界命名区域，避免把非引用 token 改写；真实普通批注 VML 预检、原文本/作者保留、重复应用及多批注顺序回归；插列后原位平移批注坐标并保持自定义批注框尺寸、偏移、颜色和可见性；提交 `0a2986b` 的 [核心代码 CI/LibreOffice 与 Windows Renderer 作业](https://github.com/zuixi01/excel-youhua-/actions/runs/33744714686) 七项全部通过并保存制品；Windows 自包含 Renderer 制品按实际检出 SHA 命名，内嵌分支 HEAD、运行 ID、构建 ID 和文件哈希并已回下载复核；Excel COM 自动打开/另存、关键宏部件哈希和独立人工签核工具已就绪 | Microsoft Excel 桌面实际运行及人工验收记录 |
+| 13 | 差异追踪至任务、规则、快照、工作表、单元格、业务主键 | 本地已证明 | `Difference`/`AuditReport`、数据库索引、报告投影测试；最终 JSON 与 Excel 内嵌修复状态逐项一致，隐藏元数据锁定规则/输入/标准哈希及结果内容哈希；字段统计按工作表隔离同名字段，差异/校验率使用各自准确分母且内存/磁盘口径一致 | 生产审计抽样 |
+| 14 | 修复含规则 ID、原值、标准值和审计 | 本地已证明 | 缺失表头、别名改名、空值填充、覆盖与追加的 Excel 批注均包含脱敏原值、脱敏标准值及实际修复规则 ID；完整报告保留相同来源值；数据库逐操作审计同时记录修复规则 ID、差异规则 ID、结果状态与输出哈希；公开 manifest 保留规则来源但再次脱敏批注业务值；生产/开发 Renderer、Golden 与隐私回归断言 | 生产审计抽样 |
+| 15 | Golden、集成、安全、性能测试全部通过 | 部分证明 | 19 个固定 Golden；提交 `0a2986b` 的 [核心代码 CI](https://github.com/zuixi01/excel-youhua-/actions/runs/33744714686) 七项与代码提交 `9f48477` 的[性能基线](https://github.com/zuixi01/excel-youhua-/actions/runs/33741447727) 十项全部绿色并保存制品；本地使用可追踪 CI Renderer 制品执行 387 项，结果为 378 passed、9 个专用环境条件跳过、0 failure/error；真实 PostgreSQL/Redis/RQ/MinIO、LibreOffice、Windows Renderer、Python 3.12/3.14、Web 构建和依赖安全扫描均通过；500k 上传 JSON、500k 标准/400,001 差异直接比较、100 页受管 HTTP 服务全链路及 100k×20 商品规范化均通过；通用人工标注 precision/recall 基准门槛为 99%，另有 50 类目×10 变体共 500 个确定性类目匹配对抗用例达到 100% precision/recall | Microsoft Excel 桌面签核；业务标注基准 |
 | 16 | 许可证、NOTICE、锁定和 SBOM 完整 | 部分证明 | 三类锁文件、`THIRD_PARTY_NOTICES.md`；提交 `e66788d` 的依赖安全作业已通过并保存 `dependency-governance`（SBOM、许可证、漏洞扫描）制品 | 对正式发布 SHA 保存并归档同类制品 |
 | 17 | CI 构建版本化镜像，服务器只拉取启动 | 待外部验收 | Git remote 已配置；`ci.yml`/`release.yml` 先测试扫描后推送并验证版本标签指向当前 SHA；生产 Compose 强制 API/Web 独立完整镜像引用 | 成功的标签发布运行、GHCR 中的 SHA/digest 镜像 |
 | 18 | 精确回滚版本与命令 | 待外部验收 | `release_manifest.py` 严格校验 API/Web 独立 digest 并生成 `release.env`；`docs/deployment.md` 使用发布前后环境制品执行精确回滚 | 发布前后真实 digest 和一次回滚演练记录 |
-| 19 | 日志/报告不泄密或未脱敏敏感数据 | 本地已证明 | 掩码、manifest 脱敏、安全错误；Web Bearer 令牌仅存会话且下载走鉴权请求；`test_privacy.py`、`test_startup_security.py` | 生产日志抽检 |
-| 20 | 不支持/不安全场景明确失败或人工审核 | 本地已证明（已知边界） | 严格 manifest、未知操作拒绝；复杂公式/图表/透视/外链插列拒绝；已支持结构只报告而不误拦截；真正不支持的包结构即使配置 `allow/report` 也不可绕过人工审核；模糊/合并表头测试 | 业务真实复杂工作簿扩充 Golden，持续维护边界清单 |
+| 19 | 日志/报告不泄密或未脱敏敏感数据 | 本地已证明 | 掩码、manifest 脱敏、安全错误；敏感解析失败主键与自动修复值覆盖 JSON/JSONL/HTML、Excel 报告/修复批注、公开 manifest、状态和数据库逐操作审计的否定及掩码值断言；公式模板在规则发布和 Renderer 两层拒绝 DDE、外部访问及旧式宏副作用调用，普通字符串常量不误拦截；超长批注按 Excel UTF-16 上限截断且保留来源标签和规则；临时私有工件终止后删除；Web Bearer 令牌仅存会话且下载走鉴权请求；`test_privacy.py`、`test_startup_security.py` | 生产日志抽检 |
+| 20 | 不支持/不安全场景明确失败或人工审核 | 本地已证明（已知边界） | Renderer 在写输出前拒绝缺失/null 操作、未知操作、越界坐标、跨行追加、缺失/错配字段类型、超出 Excel 安全精度或范围的数值、带业务时区 datetime 的不存在/重复墙上时间和 offset 不匹配、无模板公式行、非法公式占位符、DDE/外部访问/副作用公式模板、未知字段/验证类型、保留报告名及操作不生效字段；比较层在覆盖、空值填充、静态默认和追加路径统一把不可安全往返的大整数/高精度小数及会丢失 DST offset/fold 的重复时刻转人工审核且不生成 Excel；datetime 时区契约覆盖顶层 set 与嵌套 append values，并在 Windows/Linux 解析 IANA 时区；命令行错误结构化返回，Python 适配器保留 `ARGUMENT_INVALID`、`MANIFEST_OR_STRUCTURE_INVALID`、`OUTPUT_VERIFICATION_FAILED`、`UNSUPPORTED_FEATURE` 和 `RENDER_FAILED` 分类且不泄露内部明细；复杂公式/图表/透视/外链插列拒绝，复杂条件格式/数据验证公式同样熔断，真实 A1 引用若会越过 XFD 也明确返回 `UNSUPPORTED_FEATURE`，不写入非法 XFE 公式；公式主键不参与记录匹配并转人工审核，标准公式记录及缺失公式列的标准公式仅在精确匹配受信任模板时允许自动写入；ActiveX 及任意非批注 VML 形状/宏在流式包预检中转人工审核，真实普通 Note VML 不误拦截；已有批注剩余空间不足、形状数量冲突或坐标/锚点无法可靠解释时返回 `UNSUPPORTED_FEATURE`，不截断用户内容、不丢弃批注框属性，也不猜测性改写；已支持结构只报告而不误拦截；真正不支持的包结构即使配置 `allow/report` 也不可绕过人工审核；模糊/合并表头和多物理工作表匹配同一规则的人工审核测试；受管标准 sheet id/name 重复映射、规则/连接重复键、非规范路径与参数覆盖均明确拒绝 | 业务真实复杂工作簿扩充 Golden，持续维护边界清单 |
 
 ## 关键场景 A–F
 
 | 场景 | 状态 | 证据 |
 |---|---|---|
 | A 表头缺失和多余 | 本地已证明 | `missing_and_extra_header.xlsx`；完整差异与渲染表头/颜色断言 |
-| B 记录级差异 | 本地已证明 | `extra_and_missing_record.xlsx`；默认不追加与显式 `append_and_mark_green` 端到端测试 |
+| B 记录级差异 | 本地已证明 | `extra_and_missing_record.xlsx`；默认不追加与显式 `append_and_mark_green` 端到端测试；追加行扩展 Table/AutoFilter，并覆盖单格和范围数据验证 `sqref` |
 | C 数值容差 | 本地已证明 | `test_end_to_end.py` 的 `10000.005` 对 `10000.00`、属性边界测试 |
 | D 主键重复 | 本地已证明 | `duplicate_primary_key.xlsx`；两行紫色且不参与一对一匹配 |
 | E 模糊表头 | 本地已证明 | `test_fuzzy_header_suggestion_requires_manual_review` |

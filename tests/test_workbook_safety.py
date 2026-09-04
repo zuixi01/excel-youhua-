@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from excel_auditor.models import RuleSet
@@ -21,6 +22,60 @@ def test_package_feature_inventory_detects_drawings(tmp_path):
     snapshot = inspect_workbook(path, load_rules(Path("configs/examples/employee-roster.yaml")))
     assert "workbook: drawings" in snapshot.warnings
     assert "workbook: drawings" in snapshot.manual_review_reasons
+
+
+def test_real_cell_comment_vml_is_not_misclassified_as_a_drawing_or_control(tmp_path):
+    path = tmp_path / "ordinary-comment.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID"])
+    sheet.append(["E1"])
+    sheet["A2"].comment = Comment("user note", "Alice")
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "ordinary-comment", "schema_version": "1.0.0", "name": "Ordinary comment",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+        ]}],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert "Data: existing_comments" in snapshot.warnings
+    assert "workbook: drawings" not in snapshot.warnings
+    assert "workbook: legacy_controls" not in snapshot.warnings
+    assert snapshot.manual_review_reasons == []
+
+
+@pytest.mark.parametrize(
+    ("object_type", "requires_review"),
+    [("Note", False), ("Radio", True), ("Scroll", True)],
+)
+def test_vml_inventory_distinguishes_comments_from_legacy_controls(tmp_path, object_type, requires_review):
+    path = tmp_path / f"vml-{object_type}.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["ID"])
+    book.save(path)
+    vml = (
+        '<xml xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:x="urn:schemas-microsoft-com:office:excel">'
+        f'<v:shape id="shape1"><x:ClientData ObjectType="{object_type}"/></v:shape>'
+        '</xml>'
+    )
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/drawings/vmlDrawing1.vml", vml)
+    rules = RuleSet.model_validate({
+        "schema_id": "vml", "schema_version": "1.0.0", "name": "VML",
+        "sheets": [{"id": "data", "name": "Data", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True},
+        ]}],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+    assert ("workbook: legacy_controls" in snapshot.manual_review_reasons) is requires_review
 
 
 def test_unsafe_package_feature_cannot_be_bypassed_by_report_action(tmp_path):
@@ -121,6 +176,167 @@ def test_workbook_sheet_limit_and_structure_inventory(tmp_path):
     assert not snapshot.manual_review_reasons
 
 
+def test_workbook_without_workbook_properties_is_not_misclassified_as_protected(tmp_path):
+    source = tmp_path / "with-properties.xlsx"
+    path = tmp_path / "without-properties.xlsx"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID"])
+    book.active.append(["E1"])
+    book.save(source)
+    with zipfile.ZipFile(source, "r") as archive, zipfile.ZipFile(path, "w") as rewritten:
+        for entry in archive.infolist():
+            payload = archive.read(entry)
+            if entry.filename == "xl/workbook.xml":
+                payload = payload.replace(b"<workbookPr/>", b"")
+            rewritten.writestr(entry, payload)
+    rules = RuleSet.model_validate({
+        "schema_id": "no-workbook-properties", "schema_version": "1.0.0", "name": "No workbook properties",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert snapshot.sheets["Data"].rows[1][1] == ["E1"]
+    snapshot.close()
+
+
+def test_workbook_without_worksheet_dimension_uses_actual_bounds(tmp_path, monkeypatch):
+    source = tmp_path / "with-dimension.xlsx"
+    path = tmp_path / "without-dimension.xlsx"
+    book = Workbook()
+    book.active.title = "Data"
+    book.active.append(["ID", "Value"])
+    book.active.append(["E1", "A"])
+    book.save(source)
+    with zipfile.ZipFile(source, "r") as archive, zipfile.ZipFile(path, "w") as rewritten:
+        for entry in archive.infolist():
+            payload = archive.read(entry)
+            if entry.filename == "xl/worksheets/sheet1.xml":
+                payload = payload.replace(b'<dimension ref="A1:B2"/>', b"")
+            rewritten.writestr(entry, payload)
+    rules = RuleSet.model_validate({
+        "schema_id": "no-worksheet-dimension", "schema_version": "1.0.0", "name": "No worksheet dimension",
+        "sheets": [{
+            "id": "data", "name": "Data", "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value"},
+            ],
+        }],
+    })
+
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    def fail_if_dimension_is_reparsed(*_args, **_kwargs):
+        raise AssertionError("dimensionless worksheets must use package-scan bounds")
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "calculate_dimension", fail_if_dimension_is_reparsed)
+
+    snapshot = inspect_workbook(path, rules, max_in_memory_cells=10_000)
+
+    assert snapshot.large_mode is False
+    assert snapshot.sheets["Data"].max_row == 2
+    assert snapshot.sheets["Data"].max_column == 2
+    snapshot.close()
+
+
+def test_large_mode_uses_total_workbook_cells_across_sheets(tmp_path):
+    path = tmp_path / "aggregate-cell-limit.xlsx"
+    book = Workbook()
+    for sheet_index in range(2):
+        sheet = book.active if sheet_index == 0 else book.create_sheet()
+        sheet.title = f"Data{sheet_index + 1}"
+        for row_index in range(600):
+            sheet.append([f"{sheet_index}-{row_index}-{column}" for column in range(10)])
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "aggregate-cell-limit", "schema_version": "1.0.0", "name": "Aggregate cell limit",
+        "workbook": {"max_in_memory_cells": 10_000},
+        "sheets": [
+            {
+                "id": f"data_{sheet_index + 1}", "name": f"Data{sheet_index + 1}",
+                "primary_key_mode": "row_number",
+                "columns": [{"name": "value", "title": "Value"}],
+            }
+            for sheet_index in range(2)
+        ],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+
+    assert snapshot.large_mode is True
+    assert snapshot.report_only is True
+    assert all(isinstance(sheet.rows, SpilledRows) for sheet in snapshot.sheets.values())
+    snapshot.close()
+
+
+def test_row_limit_is_counted_from_the_configured_data_start(tmp_path):
+    path = tmp_path / "data-start-limit.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "ID"
+    sheet["A5"] = "E1"
+    sheet["A6"] = "E2"
+    sheet["A7"] = "E3"
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "data-start-limit", "schema_version": "1.0.0", "name": "Data start limit",
+        "workbook": {"max_rows_per_sheet": 3},
+        "sheets": [{
+            "id": "data", "name": "Data", "data_region": {"start_row": 5},
+            "primary_key": ["id"], "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules)
+    assert snapshot.sheets["Data"].max_row == 7
+    snapshot.close()
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "ID"
+    sheet["A8"] = "E4"
+    book.save(path)
+    with pytest.raises(WorkbookSafetyError, match="FILE_LIMIT_EXCEEDED"):
+        inspect_workbook(path, rules)
+
+
+@pytest.mark.parametrize("max_in_memory_cells", [10_000, 1])
+def test_row_limit_is_counted_from_the_auto_detected_header(tmp_path, max_in_memory_cells):
+    path = tmp_path / f"auto-header-limit-{max_in_memory_cells}.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet["A1"] = "Report title"
+    sheet["A3"] = "ID"
+    sheet["A4"] = "E1"
+    sheet["A5"] = "E2"
+    book.save(path)
+    rules = RuleSet.model_validate({
+        "schema_id": "auto-header-limit", "schema_version": "1.0.0", "name": "Auto header limit",
+        "workbook": {"max_rows_per_sheet": 2},
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True},
+            "primary_key": ["id"], "columns": [{"name": "id", "title": "ID", "required": True}],
+        }],
+    })
+
+    snapshot = inspect_workbook(path, rules, max_in_memory_cells=max_in_memory_cells)
+    assert snapshot.sheets["Data"].max_row == 5
+    snapshot.close()
+
+    sheet["A6"] = "E3"
+    book.save(path)
+    with pytest.raises(WorkbookSafetyError, match="FILE_LIMIT_EXCEEDED"):
+        inspect_workbook(path, rules, max_in_memory_cells=max_in_memory_cells)
+
+
 def test_only_merged_header_requires_review(tmp_path):
     path = tmp_path / "merged.xlsx"
     book = Workbook()
@@ -156,3 +372,39 @@ def test_only_merged_header_requires_review(tmp_path):
     book.save(path)
     header_merge = inspect_workbook(path, rules)
     assert "Data: merged_header" in header_merge.manual_review_reasons
+
+
+def test_auto_detected_header_drives_formula_and_merge_safety_checks(tmp_path):
+    formula_path = tmp_path / "auto-header-formula.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Report title"])
+    sheet.append(["ID", "Value"])
+    sheet.append(["E1", "=1+1"])
+    book.save(formula_path)
+    rules = RuleSet.model_validate({
+        "schema_id": "auto-header-safety", "schema_version": "1.0.0", "name": "Auto header safety",
+        "sheets": [{
+            "id": "data", "name": "Data", "header": {"auto_detect": True}, "primary_key": ["id"],
+            "columns": [
+                {"name": "id", "title": "ID", "required": True},
+                {"name": "value", "title": "Value", "compare": {"formula_mode": "formula"}},
+            ],
+        }],
+    })
+    formula_snapshot = inspect_workbook(formula_path, rules)
+    assert "Data: formulas" not in formula_snapshot.manual_review_reasons
+    formula_snapshot.close()
+
+    merged_path = tmp_path / "auto-header-merged.xlsx"
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.append(["Report title"])
+    sheet.append(["ID", "Value"])
+    sheet.merge_cells("A2:B2")
+    book.save(merged_path)
+    merged_snapshot = inspect_workbook(merged_path, rules)
+    assert "Data: merged_header" in merged_snapshot.manual_review_reasons
+    merged_snapshot.close()

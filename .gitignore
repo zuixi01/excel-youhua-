@@ -14,3 +14,5 @@ build/
 node_modules/
 services/excel_renderer/bin/
 services/excel_renderer/obj/
+.codex-artifacts/
+outputs/

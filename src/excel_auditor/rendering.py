@@ -26,6 +26,16 @@ from .models import Difference, DifferenceType, RuleSet
 from .workbook import WorkbookSnapshot, sha256_file
 
 
+RENDER_ACTION_PRIORITY = {
+    "mark_red": 1,
+    "mark_row_red": 1,
+    "mark_yellow": 2,
+    "mark_orange": 3,
+    "mark_purple": 4,
+    "mark_row_purple": 4,
+}
+
+
 @dataclass
 class RenderResult:
     output_path: Path
@@ -60,65 +70,119 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
             "mark_purple": rules.colors.ambiguous,
             "mark_row_purple": rules.colors.ambiguous,
         }
-        for difference in comparison.differences:
+        differences_by_id = {item.difference_id: item for item in comparison.differences}
+        renderable_differences = [
+            difference for difference in comparison.differences
+            if difference.render_action in color_by_action
+        ]
+        for difference in sorted(
+            renderable_differences,
+            key=lambda item: (
+                RENDER_ACTION_PRIORITY[item.render_action],
+                item.sheet_name,
+                item.excel_row or 0,
+                item.cell or "",
+                item.difference_id,
+            ),
+        ):
             if difference.sheet_name not in book.sheetnames:
                 continue
             sheet = book[difference.sheet_name]
             color = color_by_action.get(difference.render_action)
-            if not color:
-                continue
             fill = PatternFill("solid", fgColor=color)
             if difference.cell:
                 cell = sheet[difference.cell]
                 cell.fill = fill
-                cell.comment = Comment(_comment(difference), "Excel Auditor")
+                _set_audit_comment(cell, _comment(difference))
                 operation_count += 1
             elif difference.excel_row:
                 for cell in sheet[difference.excel_row]:
                     cell.fill = fill
-                sheet.cell(difference.excel_row, 1).comment = Comment(_comment(difference), "Excel Auditor")
+                _set_audit_comment(sheet.cell(difference.excel_row, 1), _comment(difference))
                 operation_count += 1
         for repair in comparison.repairs:
-            if repair.type != "set_cell" or repair.sheet_name not in book.sheetnames or not repair.cell:
+            if repair.type not in {"set_cell", "set_number_format"} or repair.sheet_name not in book.sheetnames or not repair.cell:
                 continue
             cell = book[repair.sheet_name][repair.cell]
-            _set_safe_value(cell, repair.value)
-            cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-            cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+            if repair.type == "set_cell":
+                _set_safe_value(cell, repair.value)
+                cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
+            else:
+                cell.number_format = str(repair.value)
+            _set_audit_comment(
+                cell,
+                _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
+            )
             operation_count += 1
         for sheet_rule in rules.sheets:
-            if sheet_rule.name not in book.sheetnames:
+            physical_name = next(
+                (name for name in [sheet_rule.name, *sheet_rule.aliases] if name in book.sheetnames),
+                None,
+            )
+            if physical_name is None:
                 continue
-            sheet = book[sheet_rule.name]
-            risky = workbook.sheets[sheet_rule.name].risky_features
+            sheet = book[physical_name]
+            risky = workbook.sheets[physical_name].risky_features
             missing = [item for item in comparison.differences if item.sheet_id == sheet_rule.id and item.type == DifferenceType.MISSING_HEADER and item.render_action == "insert_and_mark_green"]
             if missing and risky:
-                warnings.append(f"{sheet_rule.name}: development renderer refused column insertion because of {', '.join(risky)}")
+                warnings.append(f"{physical_name}: development renderer refused column insertion because of {', '.join(risky)}")
                 continue
-            operation_count += _insert_missing_columns(sheet, sheet_rule, missing, rules.colors.inserted)
+            operation_count += _insert_missing_columns(
+                sheet,
+                sheet_rule,
+                missing,
+                rules.colors.inserted,
+                header_row=(comparison.resolved_header_rows_by_sheet or {}).get(sheet_rule.id),
+                formula_rows=(comparison.formula_rows_by_sheet or {}).get(sheet_rule.id, []),
+            )
         for repair in comparison.repairs:
             if repair.sheet_name not in book.sheetnames:
                 continue
             sheet = book[repair.sheet_name]
             if repair.type == "set_field" and repair.excel_row and repair.canonical_field:
-                positions = _canonical_positions(sheet, next(item for item in rules.sheets if item.id == repair.sheet_id))
+                sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
+                positions = _canonical_positions(
+                    sheet,
+                    sheet_rule,
+                    header_row=(comparison.resolved_header_rows_by_sheet or {}).get(repair.sheet_id),
+                )
                 if repair.canonical_field not in positions:
                     raise RuntimeError(f"RENDER_FAILED: repaired field has no final column: {repair.canonical_field}")
                 cell = sheet.cell(repair.excel_row, positions[repair.canonical_field])
-                _set_safe_value(cell, repair.value)
+                column_rule = next(item for item in sheet_rule.columns if item.name == repair.canonical_field)
+                allow_formula = bool(
+                    column_rule.formula_template
+                    and repair.value == column_rule.formula_template.replace("{row}", str(repair.excel_row))
+                )
+                _set_safe_value(cell, repair.value, allow_formula=allow_formula)
                 cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                cell.comment = Comment(f"自动修复；规则：{repair.rule_id}", "Excel Auditor")
+                _set_audit_comment(
+                    cell,
+                    _repair_provenance_comment("自动修复", repair.rule_id, differences_by_id.get(repair.difference_id)),
+                )
                 operation_count += 1
             elif repair.type == "append_record" and repair.excel_row and repair.values is not None:
                 sheet_rule = next(item for item in rules.sheets if item.id == repair.sheet_id)
-                positions = _canonical_positions(sheet, sheet_rule)
+                positions = _canonical_positions(
+                    sheet,
+                    sheet_rule,
+                    header_row=(comparison.resolved_header_rows_by_sheet or {}).get(repair.sheet_id),
+                )
                 for field, value in repair.values.items():
                     if field not in positions:
                         continue
                     cell = sheet.cell(repair.excel_row, positions[field])
-                    _set_safe_value(cell, value)
+                    column_rule = next(item for item in sheet_rule.columns if item.name == field)
+                    allow_formula = bool(
+                        column_rule.formula_template
+                        and value == column_rule.formula_template.replace("{row}", str(repair.excel_row))
+                    )
+                    _set_safe_value(cell, value, allow_formula=allow_formula)
                     cell.fill = PatternFill("solid", fgColor=rules.colors.inserted)
-                sheet.cell(repair.excel_row, 1).comment = Comment(f"自动追加标准记录；规则：{repair.rule_id}", "Excel Auditor")
+                _set_audit_comment(
+                    sheet.cell(repair.excel_row, 1),
+                    _repair_provenance_comment("自动追加标准记录", repair.rule_id, differences_by_id.get(repair.difference_id)),
+                )
                 operation_count += 1
         if "核验报告" in book.sheetnames:
             del book["核验报告"]
@@ -128,9 +192,18 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
         for key, value in summary.items():
             report_sheet.append([key, value])
         report_sheet.append([])
-        report_sheet.append(["类型", "工作表", "单元格", "业务主键", "说明"])
+        report_sheet.append([
+            "类型", "级别", "工作表", "单元格", "字段", "业务主键", "Excel 原值",
+            "Excel 规范值", "标准原值", "标准规范值", "规则 ID", "动作", "修复状态", "说明",
+        ])
         for item in report_payload.get("differences", []):
-            report_sheet.append([item["type"], item["sheet_name"], item.get("cell"), json.dumps(item.get("business_key"), ensure_ascii=False), item["message"]])
+            report_sheet.append([
+                item["type"], item.get("severity"), item["sheet_name"], item.get("cell"),
+                item.get("canonical_field"), json.dumps(item.get("business_key"), ensure_ascii=False),
+                _report_cell_value(item.get("excel_raw_value")), _report_cell_value(item.get("excel_normalized_value")),
+                _report_cell_value(item.get("standard_raw_value")), _report_cell_value(item.get("standard_normalized_value")),
+                item.get("rule_id"), item.get("render_action"), item.get("repair_status"), item["message"],
+            ])
         report_sheet.sheet_state = "visible"
         operation_count += 1
         if "__ExcelAuditorMetadata" in book.sheetnames:
@@ -161,6 +234,14 @@ class OpenPyxlDevelopmentRenderer(ExcelRenderer):
 
 
 class DotNetOpenXmlRenderer(ExcelRenderer):
+    REQUIRED_CONTRACT_VERSION = 2
+    REQUIRED_CAPABILITIES = frozenset({
+        "standard-repair-v1",
+        "product-sheets-v1",
+        "report-sheet-v1",
+        "result-content-hash-v1",
+    })
+
     def __init__(self, command: Path) -> None:
         if not command.is_file():
             raise FileNotFoundError(f"renderer command not found: {command}")
@@ -183,19 +264,51 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
         version = payload.get("version")
         if payload.get("name") != "ExcelRenderer" or not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
             raise RuntimeError("renderer self-check returned an invalid identity or version")
+        capabilities = payload.get("capabilities")
+        if payload.get("contract_version") != self.REQUIRED_CONTRACT_VERSION or not isinstance(capabilities, list):
+            raise RuntimeError("renderer self-check returned an incompatible contract")
+        if any(not isinstance(capability, str) for capability in capabilities):
+            raise RuntimeError("renderer self-check returned invalid capabilities")
+        missing = self.REQUIRED_CAPABILITIES - set(capabilities)
+        build_id = payload.get("build_id")
+        if missing or not isinstance(build_id, str) or not re.fullmatch(r"[0-9a-f]{32}", build_id):
+            raise RuntimeError("renderer self-check is missing required capabilities or build identity")
         return version
 
     def render(self, source: Path, destination: Path, workbook: WorkbookSnapshot, rules: RuleSet, comparison: ComparisonResult, report_payload: dict[str, Any]) -> RenderResult:
         manifest = destination.parent / "render-manifest.private.json"
+        return self.render_manifest(source, destination, manifest, rules.workbook.processing_timeout_seconds)
+
+    def render_manifest(
+        self,
+        source: Path,
+        destination: Path,
+        manifest: Path,
+        timeout_seconds: int,
+    ) -> RenderResult:
         completed = subprocess.run(
             [str(self.command), "--input", str(source), "--output", str(destination), "--manifest", str(manifest)],
             capture_output=True,
             text=True,
-            timeout=rules.workbook.processing_timeout_seconds,
+            timeout=timeout_seconds,
             check=False,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"RENDER_FAILED: {completed.stderr[:1000]}")
+            try:
+                failure = json.loads(completed.stderr)
+            except json.JSONDecodeError:
+                raise RuntimeError("RENDER_FAILED: renderer process failed without structured JSON")
+            error_code = failure.get("error_code")
+            known_codes = {
+                "ARGUMENT_INVALID",
+                "MANIFEST_OR_STRUCTURE_INVALID",
+                "OUTPUT_VERIFICATION_FAILED",
+                "RENDER_FAILED",
+                "UNSUPPORTED_FEATURE",
+            }
+            if error_code not in known_codes:
+                raise RuntimeError("RENDER_FAILED: renderer returned an unknown error code")
+            raise RuntimeError(f"{error_code}: renderer process failed")
         try:
             payload = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
@@ -209,11 +322,20 @@ class DotNetOpenXmlRenderer(ExcelRenderer):
         return RenderResult(destination, digest, operation_results=operation_results)
 
 
-def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Difference], color: str) -> int:
-    missing_names = {item.canonical_field for item in missing}
+def _insert_missing_columns(
+    sheet: Any,
+    sheet_rule: Any,
+    missing: list[Difference],
+    color: str,
+    *,
+    header_row: int | None = None,
+    formula_rows: list[int] | None = None,
+) -> int:
+    missing_by_name = {item.canonical_field: item for item in missing}
+    missing_names = set(missing_by_name)
     if not missing_names:
         return 0
-    header_row = sheet_rule.header.row
+    header_row = header_row or sheet_rule.header.row
     known_positions: dict[str, int] = {}
     normalized_headers = {str(sheet.cell(header_row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
     for rule in sheet_rule.columns:
@@ -235,7 +357,18 @@ def _insert_missing_columns(sheet: Any, sheet_rule: Any, missing: list[Differenc
             source = sheet.cell(header_row, before - 1)
             cell.font, cell.border, cell.alignment, cell.number_format, cell.protection = copy(source.font), copy(source.border), copy(source.alignment), source.number_format, copy(source.protection)
         cell.fill = PatternFill("solid", fgColor=color)
-        cell.comment = Comment(f"缺失表头；由规则 {sheet_rule.id} 插入", "Excel Auditor")
+        difference = missing_by_name[rule.name]
+        _set_audit_comment(
+            cell,
+            _repair_provenance_comment("自动插入缺失表头", difference.rule_id or f"{rule.name}.missing_column", difference),
+        )
+        if rule.formula_template:
+            for row_number in formula_rows or []:
+                formula_cell = sheet.cell(row_number, before)
+                formula_cell.value = rule.formula_template.replace("{row}", str(row_number))
+                formula_cell.data_type = "f"
+                if rule.format:
+                    formula_cell.number_format = rule.format
     return len(plans)
 
 
@@ -310,9 +443,10 @@ def _set_result_content_hash(path: Path, metadata_entry: str) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
-def _canonical_positions(sheet: Any, sheet_rule: Any) -> dict[str, int]:
+def _canonical_positions(sheet: Any, sheet_rule: Any, *, header_row: int | None = None) -> dict[str, int]:
     positions: dict[str, int] = {}
-    normalized_headers = {str(sheet.cell(sheet_rule.header.row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
+    header_row = header_row or sheet_rule.header.row
+    normalized_headers = {str(sheet.cell(header_row, col).value).strip(): col for col in range(1, sheet.max_column + 1)}
     for rule in sheet_rule.columns:
         for candidate in [rule.title, rule.name, *rule.aliases]:
             if candidate in normalized_headers:
@@ -321,10 +455,18 @@ def _canonical_positions(sheet: Any, sheet_rule: Any) -> dict[str, int]:
     return positions
 
 
-def _set_safe_value(cell: Any, value: Any) -> None:
+def _set_safe_value(cell: Any, value: Any, *, allow_formula: bool = False) -> None:
     cell.value = value
-    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")) and not allow_formula:
         cell.data_type = "s"
+
+
+def _report_cell_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=isinstance(value, dict), default=str)
+    return str(value)
 
 
 def _comment(item: Difference) -> str:
@@ -336,3 +478,59 @@ def _comment(item: Difference) -> str:
     if item.rule_id:
         parts.append(f"规则：{item.rule_id}")
     return "；".join(parts)[:32000]
+
+
+def _set_audit_comment(cell: Any, text: str) -> None:
+    audit_marker = "\n\n[Excel Auditor]\n"
+    author = "Excel Auditor"
+    if cell.comment is not None:
+        existing_text = cell.comment.text or ""
+        author = cell.comment.author or author
+        if cell.comment.author == "Excel Auditor":
+            audit_text = _merge_audit_comment_text(existing_text, text)
+            output = audit_text
+        else:
+            original, marker, previous_audit = existing_text.partition(audit_marker)
+            audit_text = _merge_audit_comment_text(previous_audit if marker else "", text)
+            output = original + audit_marker + audit_text
+    else:
+        output = text
+    if len(output.encode("utf-16-le")) // 2 > 32767:
+        raise RuntimeError("UNSUPPORTED_FEATURE: existing comment leaves insufficient room for an audit comment without data loss")
+    cell.comment = Comment(output, author)
+
+
+def _merge_audit_comment_text(existing: str, next_text: str) -> str:
+    if not existing:
+        return next_text
+    if existing == next_text or next_text in existing.split(" | "):
+        return existing
+    return f"{existing} | {next_text}"
+
+
+def _repair_provenance_comment(prefix: str, rule_id: str, difference: Difference | None) -> str:
+    """Build a deterministic, privacy-safe repair comment.
+
+    Difference values have already passed the field masking policy. Never fall
+    back to the actual repair payload here because it may contain sensitive
+    business data that is intentionally absent from reports and comments.
+    """
+    if difference is None:
+        original = standard = "（报告中不可用）"
+    else:
+        original = "（缺失）" if difference.type in {DifferenceType.MISSING_HEADER, DifferenceType.MISSING_RECORD} else _comment_value(difference.excel_raw_value)
+        standard_source = difference.standard_raw_value
+        if standard_source is None and difference.standard_normalized_value is not None:
+            standard_source = difference.standard_normalized_value
+        standard = _comment_value(standard_source)
+    return f"{prefix}；原值：{original}；标准值：{standard}；规则：{rule_id}"
+
+
+def _comment_value(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    # Two values of at most 7,000 Unicode code points remain below Excel's
+    # 32,767 UTF-16 code-unit comment limit even for surrogate-pair characters.
+    return text if len(text) <= 7000 else f"{text[:6999]}…"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import json
 from decimal import Decimal
 from typing import Any, Sequence
 
@@ -9,7 +8,7 @@ import pandas as pd
 import pandera.pandas as pa
 
 from .models import RuleSet, SheetRule
-from .normalization import parse_value
+from .normalization import is_formula_text, normalized_uniqueness_key, parse_row_number, parse_value
 from .validators import run_validator
 
 
@@ -41,7 +40,10 @@ class StandardDataValidator:
             schema = self.compile_sheet(sheet)
             self._validate_unique_columns(rows, sheet)
             for start in range(0, len(rows), self.chunk_size):
-                chunk = list(rows[start : start + self.chunk_size])
+                chunk = [
+                    row for row in rows[start : start + self.chunk_size]
+                    if not self._skip_empty_primary_key_row(row, sheet)
+                ]
                 frame = pd.DataFrame(chunk, columns=[column.name for column in sheet.columns])
                 try:
                     schema.validate(frame, lazy=True)
@@ -55,26 +57,20 @@ class StandardDataValidator:
     def compile_sheet(self, sheet: SheetRule) -> pa.DataFrameSchema:
         columns: dict[str, pa.Column] = {}
         for rule in sheet.columns:
-            checks: list[pa.Check] = []
             validation = rule.validation
-            if validation.min_length is not None:
-                minimum = validation.min_length
-                checks.append(pa.Check(lambda series, minimum=minimum: series.dropna().astype(str).str.len().ge(minimum).all(), name="min_length"))
-            if validation.max_length is not None:
-                maximum = validation.max_length
-                checks.append(pa.Check(lambda series, maximum=maximum: series.dropna().astype(str).str.len().le(maximum).all(), name="max_length"))
-            if validation.regex:
-                pattern = re.compile(validation.regex)
-                checks.append(pa.Check(lambda series, pattern=pattern: series.dropna().astype(str).map(lambda value: pattern.fullmatch(value) is not None).all(), name="regex"))
-            if rule.enum_values:
-                accepted = set(rule.enum_values) | set(rule.enum_aliases)
-                checks.append(pa.Check(lambda series, accepted=accepted: series.dropna().astype(str).isin(accepted).all(), name="enum"))
-            # Business types are parsed above. Keeping the physical dtype unset avoids
-            # rejecting pandas StringDtype columns as non-object text columns.
+            row_number_fallback = (
+                sheet.primary_key_mode == "fields"
+                and sheet.empty_primary_key_action == "use_row_number"
+                and rule.name in sheet.primary_key
+            )
+            # Business types and rules are checked against parsed/normalized values
+            # before Pandera sees a chunk. Pandera owns structural required/nullability
+            # checks only; checking raw strings here would disagree with Excel-side
+            # normalization (for example trim + uppercase + regex).
             columns[rule.name] = pa.Column(
                 dtype=None,
-                checks=checks,
-                nullable=validation.nullable and not rule.required,
+                checks=[],
+                nullable=row_number_fallback or (validation.nullable and not rule.required),
                 # Cross-chunk uniqueness is checked explicitly in
                 # _validate_unique_columns; Pandera would only see one chunk.
                 unique=False,
@@ -86,12 +82,31 @@ class StandardDataValidator:
     def _validate_typed_values(rows: Sequence[dict[str, Any]], sheet: SheetRule) -> dict[str, int]:
         failures: dict[str, int] = {}
         for row in rows:
+            if StandardDataValidator._skip_empty_primary_key_row(row, sheet):
+                continue
             for rule in sheet.columns:
-                parsed = parse_value(row.get(rule.name), rule)
+                raw = row.get(rule.name)
+                parsed = parse_value(raw, rule)
                 invalid = not parsed.valid
+                if rule.compare.formula_mode == "formula" and is_formula_text(raw):
+                    continue
                 if parsed.valid and parsed.normalized is None:
-                    invalid = rule.required or not rule.validation.nullable
+                    row_number_fallback = (
+                        sheet.primary_key_mode == "fields"
+                        and sheet.empty_primary_key_action == "use_row_number"
+                        and rule.name in sheet.primary_key
+                    )
+                    invalid = not row_number_fallback and (rule.required or not rule.validation.nullable)
                 if parsed.valid and parsed.normalized is not None:
+                    text = str(parsed.normalized)
+                    minimum_length = rule.validation.min_length
+                    maximum_length = rule.validation.max_length
+                    invalid = invalid or (minimum_length is not None and len(text) < minimum_length)
+                    invalid = invalid or (maximum_length is not None and len(text) > maximum_length)
+                    invalid = invalid or (
+                        rule.validation.regex is not None
+                        and re.fullmatch(rule.validation.regex, text) is None
+                    )
                     minimum = rule.validation.min
                     maximum = rule.validation.max
                     if minimum is not None or maximum is not None:
@@ -112,12 +127,13 @@ class StandardDataValidator:
         for row_index, row in enumerate(rows, start=1):
             if sheet.primary_key_mode == "row_number":
                 try:
-                    row_number = int(row.get(sheet.row_number_field))
+                    row_number = parse_row_number(row.get(sheet.row_number_field))
                 except (TypeError, ValueError) as exc:
-                    raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} requires integer {sheet.row_number_field} at record {row_index}") from exc
+                    raise ValueError(
+                        f"STANDARD_DATA_INVALID: {sheet.id} has invalid {sheet.row_number_field} "
+                        f"at record {row_index}: {exc}"
+                    ) from exc
                 composite = (("row_number", row_number),)
-                if row_number < 1:
-                    raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} has invalid row number at record {row_index}")
                 if composite in observed:
                     raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id} has duplicate row number at record {row_index}")
                 observed.add(composite)
@@ -142,6 +158,8 @@ class StandardDataValidator:
     def _validate_cross_fields(rows: Sequence[dict[str, Any]], sheet: SheetRule) -> None:
         rules_by_name = {column.name: column for column in sheet.columns}
         for row_index, row in enumerate(rows, start=1):
+            if StandardDataValidator._skip_empty_primary_key_row(row, sheet):
+                continue
             parsed = {name: parse_value(row.get(name), rule) for name, rule in rules_by_name.items()}
             for cross_rule in sheet.cross_field_rules:
                 params = dict(cross_rule.params)
@@ -156,16 +174,26 @@ class StandardDataValidator:
         for rule in sheet.columns:
             if not rule.validation.unique:
                 continue
-            observed: set[str] = set()
+            observed: set[Any] = set()
             for row_index, row in enumerate(rows, start=1):
+                if StandardDataValidator._skip_empty_primary_key_row(row, sheet):
+                    continue
                 parsed = parse_value(row.get(rule.name), rule)
-                token = json.dumps(
-                    {"type": rule.type.value, "value": parsed.normalized},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                )
-                if token in observed:
+                if parsed.normalized is None:
+                    continue
+                normalized = normalized_uniqueness_key(parsed, rule)
+                if normalized in observed:
                     raise ValueError(f"STANDARD_DATA_INVALID: {sheet.id}.{rule.name} is not unique at record {row_index}")
-                observed.add(token)
+                observed.add(normalized)
+
+    @staticmethod
+    def _skip_empty_primary_key_row(row: dict[str, Any], sheet: SheetRule) -> bool:
+        if sheet.primary_key_mode != "fields" or sheet.empty_primary_key_action != "skip_row":
+            return False
+        for rule in sheet.columns:
+            if rule.name not in sheet.primary_key:
+                continue
+            parsed = parse_value(row.get(rule.name), rule)
+            if not parsed.valid or parsed.normalized is None or parsed.normalized == "":
+                return True
+        return False

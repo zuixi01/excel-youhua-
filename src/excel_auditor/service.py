@@ -17,11 +17,17 @@ from typing import Any, Sequence
 
 from .engine import compare_workbook
 from .models import AuditReport, RuleSet
-from .rendering import DotNetOpenXmlRenderer, ExcelRenderer, OpenPyxlDevelopmentRenderer
+from .rendering import (
+    DotNetOpenXmlRenderer,
+    ExcelRenderer,
+    OpenPyxlDevelopmentRenderer,
+    RENDER_ACTION_PRIORITY,
+    _repair_provenance_comment,
+)
 from .reporting import write_differences_jsonl, write_html_report, write_json_report
 from .snapshots import SpilledRecords, create_snapshot, load_snapshot
 from .standard_sources import ManagedHttpSource
-from .standard_files import load_standard_file
+from .standard_files import canonicalize_standard_row, load_standard_file
 from .persistence import DatabaseRepository
 from .storage import ArtifactStore
 from .ids import new_ulid
@@ -364,6 +370,10 @@ class AuditService:
                 for item in render.operation_results
                 if item.get("status") == "applied" and item.get("difference_id")
             }
+            repair_rule_ids = {
+                repair.difference_id: repair.rule_id
+                for repair in comparison.repairs
+            }
             for difference in report.differences:
                 if difference.repair_status == "planned":
                     difference.repair_status = "applied" if difference.difference_id in applied_ids else "failed"
@@ -375,7 +385,8 @@ class AuditService:
                             user_id,
                             metadata={
                                 "job_id": job_id,
-                                "rule_id": difference.rule_id,
+                                "rule_id": repair_rule_ids.get(difference.difference_id, difference.rule_id),
+                                "difference_rule_id": difference.rule_id,
                                 "status": difference.repair_status,
                                 "excel_raw_value": difference.excel_raw_value,
                                 "standard_raw_value": difference.standard_raw_value,
@@ -445,7 +456,7 @@ class AuditService:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def artifact(self, job_id: str, name: str) -> Path:
-        if name not in {"excel", "json", "differences_jsonl", "html", "manifest"}:
+        if name not in {"excel", "json", "differences_jsonl", "html", "manifest", "product_result", "product_excel", "product_manifest", "product_issues"}:
             raise FileNotFoundError("unknown artifact")
         status = self.status(job_id)
         file_name = status.get("artifacts", {}).get(name)
@@ -552,14 +563,34 @@ def _sha256(path: Path) -> str:
 def _field_statistics(comparison: Any) -> dict[str, dict[str, Any]]:
     if comparison.report_only:
         return _field_statistics_on_disk(comparison)
-    affected: dict[str, set[tuple[str, int | None]]] = {}
+    fields = {
+        (mapping.sheet_id, mapping.canonical_field)
+        for mapping in comparison.mappings
+        if mapping.status == "matched" and mapping.canonical_field
+    }
+    mismatches: dict[tuple[str, str], set[int]] = {}
+    validation_errors: dict[tuple[str, str], set[int]] = {}
     for item in comparison.differences:
-        if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
-            affected.setdefault(item.canonical_field, set()).add((item.sheet_id, item.excel_row))
-    denominator = comparison.summary.matched_records
+        if not item.canonical_field or item.excel_row is None:
+            continue
+        key = (item.sheet_id, item.canonical_field)
+        fields.add(key)
+        if item.type.value == "VALUE_MISMATCH":
+            mismatches.setdefault(key, set()).add(item.excel_row)
+        elif item.type.value in {"INVALID_VALUE", "VALIDATION_ERROR"}:
+            validation_errors.setdefault(key, set()).add(item.excel_row)
+    matched_by_sheet = comparison.matched_records_by_sheet or {}
+    validated_by_sheet = comparison.validated_records_by_sheet or {}
     return {
-        name: {"difference_count": len(rows), "difference_rate": (min(1.0, len(rows) / denominator) if denominator else None)}
-        for name, rows in sorted(affected.items())
+        f"{sheet_id}.{name}": _field_statistic(
+            sheet_id,
+            name,
+            len(mismatches.get((sheet_id, name), set())),
+            len(validation_errors.get((sheet_id, name), set())),
+            matched_by_sheet,
+            validated_by_sheet,
+        )
+        for sheet_id, name in sorted(fields)
     }
 
 
@@ -571,29 +602,64 @@ def _field_statistics_on_disk(comparison: Any) -> dict[str, dict[str, Any]]:
     try:
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA synchronous=OFF")
-        connection.execute(
-            "CREATE TABLE affected (field TEXT NOT NULL, sheet_id TEXT NOT NULL, excel_row INTEGER, UNIQUE(field, sheet_id, excel_row))"
-        )
-        batch: list[tuple[str, str, int | None]] = []
+        connection.execute("CREATE TABLE affected (sheet_id TEXT NOT NULL, field TEXT NOT NULL, kind TEXT NOT NULL, excel_row INTEGER NOT NULL, UNIQUE(sheet_id, field, kind, excel_row))")
+        batch: list[tuple[str, str, str, int]] = []
         for item in comparison.differences:
-            if item.canonical_field and item.type.value in {"VALUE_MISMATCH", "INVALID_VALUE", "VALIDATION_ERROR"}:
-                batch.append((item.canonical_field, item.sheet_id, item.excel_row))
+            kind = "difference" if item.type.value == "VALUE_MISMATCH" else "validation" if item.type.value in {"INVALID_VALUE", "VALIDATION_ERROR"} else None
+            if item.canonical_field and item.excel_row is not None and kind:
+                batch.append((item.sheet_id, item.canonical_field, kind, item.excel_row))
                 if len(batch) >= 1_000:
-                    connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
+                    connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?, ?)", batch)
                     batch.clear()
         if batch:
-            connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?)", batch)
-        denominator = comparison.summary.matched_records
+            connection.executemany("INSERT OR IGNORE INTO affected VALUES (?, ?, ?, ?)", batch)
+        counts = {
+            (str(sheet_id), str(field), str(kind)): int(count)
+            for sheet_id, field, kind, count in connection.execute("SELECT sheet_id, field, kind, COUNT(*) FROM affected GROUP BY sheet_id, field, kind")
+        }
+        fields = {
+            (mapping.sheet_id, mapping.canonical_field)
+            for mapping in comparison.mappings
+            if mapping.status == "matched" and mapping.canonical_field
+        } | {(sheet_id, field) for sheet_id, field, _kind in counts}
+        matched_by_sheet = comparison.matched_records_by_sheet or {}
+        validated_by_sheet = comparison.validated_records_by_sheet or {}
         return {
-            str(name): {
-                "difference_count": int(count),
-                "difference_rate": (min(1.0, int(count) / denominator) if denominator else None),
-            }
-            for name, count in connection.execute("SELECT field, COUNT(*) FROM affected GROUP BY field ORDER BY field")
+            f"{sheet_id}.{field}": _field_statistic(
+                sheet_id,
+                field,
+                counts.get((sheet_id, field, "difference"), 0),
+                counts.get((sheet_id, field, "validation"), 0),
+                matched_by_sheet,
+                validated_by_sheet,
+            )
+            for sheet_id, field in sorted(fields)
         }
     finally:
         connection.close()
         path.unlink(missing_ok=True)
+
+
+def _field_statistic(
+    sheet_id: str,
+    field: str,
+    difference_count: int,
+    validation_error_count: int,
+    matched_by_sheet: dict[str, int],
+    validated_by_sheet: dict[str, int],
+) -> dict[str, Any]:
+    matched = matched_by_sheet.get(sheet_id, 0)
+    validated = validated_by_sheet.get(sheet_id, 0)
+    return {
+        "sheet_id": sheet_id,
+        "canonical_field": field,
+        "compared_records": matched,
+        "difference_count": difference_count,
+        "difference_rate": difference_count / matched if matched else None,
+        "validated_records": validated,
+        "validation_error_count": validation_error_count,
+        "validation_error_rate": validation_error_count / validated if validated else None,
+    }
 
 
 def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str, Sequence[dict[str, Any]]]:
@@ -603,22 +669,29 @@ def _canonicalize_standard(payload: dict[str, Any], rules: RuleSet) -> dict[str,
         if isinstance(rows, (str, bytes, bytearray)) or not isinstance(rows, SequenceABC):
             _close_record_sequences(result)
             raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
-        sheet_rule = next((sheet for sheet in rules.sheets if sheet.id == str(key) or sheet.name == str(key)), None)
+        key_text = str(key)
+        sheet_rule = next(
+            (
+                sheet
+                for sheet in rules.sheets
+                if sheet.id == key_text
+                or key_text.casefold() in {name.casefold() for name in [sheet.name, *sheet.aliases]}
+            ),
+            None,
+        )
         if sheet_rule is None:
             result[str(key)] = rows
             continue
+        if sheet_rule.id in result:
+            close_source = getattr(rows, "close", None)
+            if close_source is not None:
+                close_source()
+            _close_record_sequences(result)
+            raise ValueError(f"STANDARD_DATA_INVALID: duplicate sheet mapping: {sheet_rule.id}")
         canonical_rows: list[dict[str, Any]] | SpilledRecords = SpilledRecords() if len(rows) > spill_threshold else []
         try:
-            for row in rows:
-                if not isinstance(row, dict):
-                    raise ValueError(f"STANDARD_DATA_INVALID: {key} must be an array of objects")
-                canonical: dict[str, Any] = {}
-                for column in sheet_rule.columns:
-                    candidates = [column.name, column.title, *column.aliases]
-                    matched = next((candidate for candidate in candidates if candidate in row), None)
-                    if matched is not None:
-                        canonical[column.name] = row[matched]
-                canonical_rows.append(canonical)
+            for record_index, row in enumerate(rows, start=1):
+                canonical_rows.append(canonicalize_standard_row(row, sheet_rule, record_index=record_index))
         except Exception:
             close = getattr(canonical_rows, "close", None)
             if close is not None:
@@ -684,6 +757,7 @@ def _manifest(
         "mark_row_purple": rules.colors.ambiguous,
     }
     sheets_by_id = {sheet.id: sheet for sheet in rules.sheets}
+    differences_by_id = {item.difference_id: item for item in report.differences}
     mapped_by_sheet: dict[str, dict[str, int]] = {}
     for mapping in report.header_mappings:
         if mapping.status == "matched" and mapping.canonical_field:
@@ -691,6 +765,12 @@ def _manifest(
     final_columns_by_sheet: dict[str, dict[str, int]] = {}
     for sheet in rules.sheets:
         columns = dict(mapped_by_sheet.get(sheet.id, {}))
+        resolved_header_row = (comparison.resolved_header_rows_by_sheet or {}).get(sheet.id, sheet.header.row)
+        data_start_row = (comparison.data_start_rows_by_sheet or {}).get(
+            sheet.id,
+            sheet.data_region.start_row or resolved_header_row + 1,
+        )
+        formula_rows = (comparison.formula_rows_by_sheet or {}).get(sheet.id, [])
         missing = {
             item.canonical_field: item
             for item in report.differences
@@ -712,14 +792,20 @@ def _manifest(
                 "sheet": item.sheet_name,
                 "before": _column_letter(before_index),
                 "canonical_field": item.canonical_field,
-                "header_row": sheet.header.row,
+                "header_row": resolved_header_row,
+                "data_start_row": data_start_row,
                 "header_value": column.title,
                 "fill_color": rules.colors.inserted,
                 "field_type": column.type.value,
                 "number_format": _number_format(column),
                 "validation": _excel_validation(column),
                 "formula_template": column.formula_template,
-                "comment": f"缺失表头；由规则 {rules.schema_id}@{rules.schema_version} 的 {column.name}.missing_column 插入",
+                "formula_rows": formula_rows if column.formula_template else None,
+                "comment": _repair_provenance_comment(
+                    "自动插入缺失表头",
+                    f"{rules.schema_id}@{rules.schema_version}:{column.name}.missing_column",
+                    item,
+                ),
                 "difference_id": item.difference_id,
             })
             for name, position in list(columns.items()):
@@ -727,21 +813,13 @@ def _manifest(
                     columns[name] = position + 1
             columns[column.name] = before_index
         final_columns_by_sheet[sheet.id] = columns
-    mark_priority = {
-        "mark_purple": 1,
-        "mark_row_purple": 1,
-        "mark_yellow": 2,
-        "mark_orange": 3,
-        "mark_red": 4,
-        "mark_row_red": 4,
-    }
     mark_targets: dict[tuple[str, str], dict[str, Any]] = {}
     for item in sorted(report.differences, key=lambda value: value.difference_id):
         if item.render_action.startswith("mark_row"):
-            candidate = {"type": "mark_row", "sheet": item.sheet_name, "row": item.excel_row, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": mark_priority[item.render_action]}
+            candidate = {"type": "mark_row", "sheet": item.sheet_name, "row": item.excel_row, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": RENDER_ACTION_PRIORITY[item.render_action]}
             key = (item.sheet_name, f"row:{item.excel_row}")
         elif item.render_action in color_by_action:
-            candidate = {"type": "mark_cell", "sheet": item.sheet_name, "cell": item.cell, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": mark_priority[item.render_action]}
+            candidate = {"type": "mark_cell", "sheet": item.sheet_name, "cell": item.cell, "fill_color": color_by_action[item.render_action], "comment": item.message, "difference_id": item.difference_id, "_priority": RENDER_ACTION_PRIORITY[item.render_action]}
             key = (item.sheet_name, f"cell:{item.cell}")
         else:
             continue
@@ -758,22 +836,52 @@ def _manifest(
     for repair in comparison.repairs:
         sheet_rule = sheets_by_id[repair.sheet_id]
         column_rule = next((column for column in sheet_rule.columns if column.name == repair.canonical_field), None)
+        repair_comment = _repair_provenance_comment(
+            "自动追加标准记录" if repair.type == "append_record" else "自动修复",
+            repair.rule_id,
+            differences_by_id.get(repair.difference_id),
+        )
         if repair.type == "set_cell":
-            repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": f"自动修复；规则：{repair.rule_id}", "difference_id": repair.difference_id})
-            repair_operations[-1].update({"field_type": column_rule.type.value if column_rule else None, "number_format": _number_format(column_rule)})
+            repair_operations.append({"type": "set_cell", "sheet": repair.sheet_name, "cell": repair.cell, "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
+            header_rename = repair.rule_id.endswith(".rename_confirmed_alias")
+            repair_operations[-1].update({
+                "field_type": "string" if header_rename else column_rule.type.value if column_rule else "string",
+                "number_format": None if header_rename else _number_format(column_rule),
+                "timezone": None if header_rename else _datetime_timezone(column_rule),
+            })
+        elif repair.type == "set_number_format":
+            repair_operations.append({
+                "type": "set_number_format",
+                "sheet": repair.sheet_name,
+                "cell": repair.cell,
+                "number_format": repair.value,
+                "comment": repair_comment,
+                "difference_id": repair.difference_id,
+            })
         elif repair.type == "set_field":
             column = final_columns_by_sheet.get(repair.sheet_id, {}).get(repair.canonical_field or "")
             if column is None or repair.excel_row is None:
                 raise ValueError(f"RENDER_FAILED: repaired field has no final column: {repair.canonical_field}")
-            repair_operations.append({"type": "set_cell_after_insert", "sheet": repair.sheet_name, "cell": f"{_column_letter(column)}{repair.excel_row}", "value": repair.value, "fill_color": rules.colors.inserted, "comment": f"自动修复；规则：{repair.rule_id}", "difference_id": repair.difference_id})
-            repair_operations[-1].update({"field_type": column_rule.type.value if column_rule else None, "number_format": _number_format(column_rule)})
+            repair_operations.append({"type": "set_cell_after_insert", "sheet": repair.sheet_name, "cell": f"{_column_letter(column)}{repair.excel_row}", "value": repair.value, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
+            repair_operations[-1].update({
+                "field_type": column_rule.type.value if column_rule else None,
+                "number_format": _number_format(column_rule),
+                "timezone": _datetime_timezone(column_rule),
+            })
         elif repair.type == "append_record":
             values = []
             for column in sheets_by_id[repair.sheet_id].columns:
                 position = final_columns_by_sheet.get(repair.sheet_id, {}).get(column.name)
                 if position is not None:
-                    values.append({"cell": f"{_column_letter(position)}{repair.excel_row}", "value": (repair.values or {}).get(column.name), "field_type": column.type.value, "number_format": _number_format(column), "formula_template": column.formula_template})
-            repair_operations.append({"type": "append_row", "sheet": repair.sheet_name, "row": repair.excel_row, "values": values, "fill_color": rules.colors.inserted, "comment": f"自动追加标准记录；规则：{repair.rule_id}", "difference_id": repair.difference_id})
+                    values.append({
+                        "cell": f"{_column_letter(position)}{repair.excel_row}",
+                        "value": (repair.values or {}).get(column.name),
+                        "field_type": column.type.value,
+                        "number_format": _number_format(column),
+                        "timezone": None if column.formula_template else _datetime_timezone(column),
+                        "formula_template": column.formula_template,
+                    })
+            repair_operations.append({"type": "append_row", "sheet": repair.sheet_name, "row": repair.excel_row, "values": values, "fill_color": rules.colors.inserted, "comment": repair_comment, "difference_id": repair.difference_id})
     operations = [*mark_operations, *insert_operations, *repair_operations]
     operations.append({"type": "add_or_replace_report_sheet", "name": "核验报告", "source_json": "report.json"})
     operations[-1].update({"name": "核验报告", "source_json": report_source})
@@ -805,6 +913,12 @@ def _number_format(column: Any | None) -> str | None:
     }.get(column.type.value)
 
 
+def _datetime_timezone(column: Any | None) -> str | None:
+    if column is None or column.type.value != "datetime":
+        return None
+    return column.compare.timezone
+
+
 def _excel_validation(column: Any) -> dict[str, Any] | None:
     if column.type.value == "enum" and column.enum_values:
         return {"type": "list", "values": [str(value) for value in column.enum_values], "allow_blank": column.validation.nullable}
@@ -828,11 +942,17 @@ def _redact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         metadata.pop("standard_snapshot_id", None)
     for operation in redacted["operations"]:
         operation.pop("difference_id", None)
+        if operation.get("type") in {"set_cell", "set_cell_after_insert", "append_row"} and isinstance(operation.get("comment"), str):
+            rule_marker = "；规则："
+            rule_id = operation["comment"].rsplit(rule_marker, 1)[-1] if rule_marker in operation["comment"] else "unknown"
+            prefix = "自动追加标准记录" if operation.get("type") == "append_row" else "自动修复"
+            operation["comment"] = f"{prefix}；原值和标准值已脱敏；规则：{rule_id}"
+            operation["comment_values_redacted"] = True
         if "value" in operation:
             operation.pop("value")
             operation["value_redacted"] = True
         if "values" in operation:
-            operation["values"] = [{"cell": item.get("cell"), "field_type": item.get("field_type"), "number_format": item.get("number_format"), "formula_template": item.get("formula_template"), "value_redacted": True} for item in operation["values"]]
+            operation["values"] = [{"cell": item.get("cell"), "field_type": item.get("field_type"), "number_format": item.get("number_format"), "timezone": item.get("timezone"), "formula_template": item.get("formula_template"), "value_redacted": True} for item in operation["values"]]
     return redacted
 
 
@@ -846,7 +966,7 @@ def _column_letter(index: int) -> str:
 
 def _safe_error_code(exc: Exception) -> str:
     message = str(exc)
-    known = ["FILE_UNSUPPORTED_FORMAT", "FILE_CORRUPTED", "FILE_LIMIT_EXCEEDED", "WORKBOOK_PROTECTED", "STANDARD_TOO_LARGE", "STANDARD_DATA_INVALID", "STANDARD_SOURCE_FAILED", "MANUAL_REVIEW_REQUIRED", "RENDER_FAILED", "OUTPUT_VERIFICATION_FAILED"]
+    known = ["FILE_UNSUPPORTED_FORMAT", "FILE_CORRUPTED", "FILE_LIMIT_EXCEEDED", "WORKBOOK_PROTECTED", "STANDARD_TOO_LARGE", "STANDARD_DATA_INVALID", "STANDARD_SOURCE_FAILED", "MANUAL_REVIEW_REQUIRED", "OUTPUT_VERIFICATION_FAILED", "UNSUPPORTED_FEATURE", "MANIFEST_OR_STRUCTURE_INVALID", "ARGUMENT_INVALID", "RENDER_FAILED"]
     return next((code for code in known if code in message), "COMPARISON_FAILED")
 
 
@@ -862,6 +982,9 @@ def _safe_error_message(error_code: str) -> str:
         "MANUAL_REVIEW_REQUIRED": "The workbook requires manual review.",
         "RENDER_FAILED": "Workbook rendering failed.",
         "OUTPUT_VERIFICATION_FAILED": "The rendered workbook failed output verification.",
+        "UNSUPPORTED_FEATURE": "The workbook contains a feature the renderer cannot modify safely.",
+        "MANIFEST_OR_STRUCTURE_INVALID": "The render request or workbook structure is invalid.",
+        "ARGUMENT_INVALID": "The renderer invocation is invalid.",
         "COMPARISON_FAILED": "The comparison failed.",
     }
     return messages.get(error_code, messages["COMPARISON_FAILED"])

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-import json
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .models import ColumnRule, FieldType
+from openpyxl.utils.datetime import from_excel
+
+from .models import ColumnRule, FieldType, to_python_datetime_format
+from .strict_serialization import dump_json_exact, load_json_strict
+
+
+_EXCEL_MIN_POSITIVE_NUMBER = Decimal("2.2251E-308")
+_EXCEL_MAX_ABSOLUTE_NUMBER = Decimal("9.99999999999999E307")
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,25 @@ class ParsedValue:
     normalized: Any
     valid: bool
     error: str | None = None
+
+
+def is_formula_text(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def parse_row_number(value: Any) -> int:
+    """Parse an exact positive Excel row number without lossy coercion."""
+    if isinstance(value, bool):
+        raise ValueError("row number must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        parsed = int(value)
+    else:
+        raise ValueError("row number must be an integer")
+    if not 1 <= parsed <= 1_048_576:
+        raise ValueError("row number is outside the Excel row range")
+    return parsed
 
 
 def _text(value: Any) -> str:
@@ -51,6 +77,8 @@ def apply_normalizers(value: Any, names: list[str]) -> Any:
 
 def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
     try:
+        if rule.compare.formula_mode == "formula" and is_formula_text(value):
+            return ParsedValue(value, value, True)
         normalized = apply_normalizers(value, rule.normalize)
         if rule.regex_replacements and normalized is not None:
             text = str(normalized)
@@ -66,11 +94,16 @@ def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
             return ParsedValue(value, str(normalized), True)
         if rule.type == FieldType.INTEGER:
             decimal = Decimal(str(normalized))
+            if not decimal.is_finite():
+                raise ValueError("not a finite integer")
             if decimal != decimal.to_integral_value():
                 raise ValueError("not an integer")
             return ParsedValue(value, int(decimal), True)
         if rule.type == FieldType.DECIMAL:
-            return ParsedValue(value, Decimal(str(normalized)), True)
+            decimal = Decimal(str(normalized))
+            if not decimal.is_finite():
+                raise ValueError("not a finite decimal")
+            return ParsedValue(value, decimal, True)
         if rule.type == FieldType.DATE:
             return ParsedValue(value, _parse_date(normalized, rule.parse_formats), True)
         if rule.type == FieldType.DATETIME:
@@ -86,7 +119,13 @@ def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
             raise ValueError("not a recognized boolean")
         if rule.type == FieldType.ENUM:
             text = str(normalized)
-            mapped = rule.enum_aliases.get(text, text)
+            if rule.compare.mode == "ignore_case":
+                aliases = {str(alias).casefold(): target for alias, target in rule.enum_aliases.items()}
+                mapped = aliases.get(text.casefold(), text)
+                canonical = {str(value).casefold(): value for value in rule.enum_values}
+                mapped = canonical.get(str(mapped).casefold(), mapped)
+            else:
+                mapped = rule.enum_aliases.get(text, text)
             if mapped not in rule.enum_values:
                 raise ValueError(f"not in enum: {mapped}")
             return ParsedValue(value, mapped, True)
@@ -97,12 +136,36 @@ def parse_value(value: Any, rule: ColumnRule) -> ParsedValue:
                 items = str(normalized).split(rule.separator)
             return ParsedValue(value, tuple(sorted({str(item).strip() for item in items if str(item).strip()})), True)
         if rule.type == FieldType.JSON:
-            obj = normalized if isinstance(normalized, (dict, list)) else json.loads(str(normalized))
-            stable = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if isinstance(normalized, (dict, list)):
+                obj = normalized
+            else:
+                try:
+                    obj = load_json_strict(
+                        str(normalized),
+                        context="JSON field",
+                        preserve_decimal=True,
+                    )
+                except ValueError as exc:
+                    if "contains duplicate key:" in str(exc):
+                        raise ValueError("JSON field contains duplicate object key") from exc
+                    raise
+            stable = dump_json_exact(obj, ensure_ascii=False, sort_keys=True)
             return ParsedValue(value, stable, True)
         raise ValueError(f"unsupported type: {rule.type}")
-    except (ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, InvalidOperation) as exc:
         return ParsedValue(value, None, False, str(exc))
+
+
+def parse_excel_value(value: Any, rule: ColumnRule, epoch: datetime) -> ParsedValue:
+    """Parse an Excel cell value, interpreting numeric date serials by workbook epoch."""
+    if rule.type not in {FieldType.DATE, FieldType.DATETIME} or isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return parse_value(value, rule)
+    try:
+        converted = from_excel(float(value), epoch=epoch)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return ParsedValue(value, None, False, f"invalid Excel date serial: {exc}")
+    parsed = parse_value(converted, rule)
+    return ParsedValue(value, parsed.normalized, parsed.valid, parsed.error)
 
 
 def _parse_date(value: Any, formats: list[str]) -> date:
@@ -111,7 +174,7 @@ def _parse_date(value: Any, formats: list[str]) -> date:
     if isinstance(value, date):
         return value
     text = str(value).strip()
-    python_formats = [_to_python_format(item) for item in formats]
+    python_formats = [to_python_datetime_format(item) for item in formats]
     for fmt in [*python_formats, "%Y-%m-%d", "%Y/%m/%d"]:
         try:
             return datetime.strptime(text, fmt).date()
@@ -126,7 +189,7 @@ def _parse_datetime(value: Any, formats: list[str], timezone_name: str | None, a
     else:
         text = str(value).strip()
         parsed = None
-        for fmt in [_to_python_format(item) for item in formats]:
+        for fmt in [to_python_datetime_format(item) for item in formats]:
             try:
                 parsed = datetime.strptime(text, fmt)
                 break
@@ -137,7 +200,7 @@ def _parse_datetime(value: Any, formats: list[str], timezone_name: str | None, a
     target = ZoneInfo(timezone_name) if timezone_name else None
     if parsed.tzinfo is None:
         if target is not None:
-            parsed = parsed.replace(tzinfo=target)
+            parsed = _localize_naive_datetime(parsed, target)
         elif not allow_naive:
             raise ValueError("naive datetime requires compare.timezone or allow_naive_datetime=true")
         else:
@@ -145,10 +208,72 @@ def _parse_datetime(value: Any, formats: list[str], timezone_name: str | None, a
     return parsed.astimezone(target or timezone.utc)
 
 
-def _to_python_format(value: str) -> str:
-    tokens = {"yyyy": "%Y", "MM": "%m", "dd": "%d", "HH": "%H", "mm": "%M", "ss": "%S", "M": "%m", "d": "%d"}
-    pattern = re.compile("|".join(sorted(tokens, key=len, reverse=True)))
-    return pattern.sub(lambda match: tokens[match.group(0)], value)
+def _localize_naive_datetime(value: datetime, target: ZoneInfo) -> datetime:
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = value.replace(tzinfo=target, fold=fold)
+        round_trip = candidate.astimezone(timezone.utc).astimezone(target).replace(tzinfo=None)
+        if round_trip == value:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError(f"nonexistent local datetime in timezone {target.key}; include an explicit UTC offset")
+    offsets = {candidate.utcoffset() for candidate in candidates}
+    if len(offsets) > 1:
+        raise ValueError(f"ambiguous local datetime in timezone {target.key}; include an explicit UTC offset")
+    return candidates[0]
+
+
+def excel_datetime_write_safe(value: datetime, timezone_name: str | None) -> bool:
+    """Return whether an Excel serial can preserve this normalized datetime's instant."""
+    if value.tzinfo is None:
+        return timezone_name is None
+    if timezone_name is None:
+        return True
+    target = ZoneInfo(timezone_name)
+    local_value = value.astimezone(target)
+    try:
+        restored = _localize_naive_datetime(local_value.replace(tzinfo=None), target)
+    except ValueError:
+        return False
+    return restored.astimezone(timezone.utc) == value.astimezone(timezone.utc)
+
+
+def excel_numeric_write_safe(value: Any) -> bool:
+    """Return whether Excel can round-trip a number without precision loss."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    if not parsed.is_finite():
+        return False
+    absolute = abs(parsed)
+    if absolute != 0 and (
+        absolute < _EXCEL_MIN_POSITIVE_NUMBER
+        or absolute > _EXCEL_MAX_ABSOLUTE_NUMBER
+    ):
+        return False
+    digits = list(parsed.as_tuple().digits)
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+    if len(digits) > 15:
+        return False
+    try:
+        as_float = float(parsed)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(as_float) or (parsed != 0 and as_float == 0):
+        return False
+    return Decimal(str(as_float)) == parsed
+
+
+def normalized_uniqueness_key(parsed: ParsedValue, rule: ColumnRule) -> tuple[str, Any] | None:
+    """Return a hashable key with the same normalized value semantics on every path."""
+    value = parsed.normalized
+    if value is None:
+        return None
+    if rule.type == FieldType.DATETIME and isinstance(value, datetime) and value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return rule.type.value, value
 
 
 def values_equal(left: ParsedValue, right: ParsedValue, rule: ColumnRule) -> bool:
@@ -158,13 +283,17 @@ def values_equal(left: ParsedValue, right: ParsedValue, rule: ColumnRule) -> boo
         return left.normalized is right.normalized
     if rule.type == FieldType.DECIMAL or rule.compare.mode == "numeric":
         a, b = Decimal(left.normalized), Decimal(right.normalized)
-        if rule.compare.decimal_places is not None:
-            quantum = Decimal(1).scaleb(-rule.compare.decimal_places)
-            a, b = a.quantize(quantum), b.quantize(quantum)
-        delta = abs(a - b)
         absolute = rule.compare.absolute_tolerance
-        relative = rule.compare.relative_tolerance * max(abs(a), abs(b))
-        return delta <= absolute or delta <= relative
+        relative = rule.compare.relative_tolerance
+        places = rule.compare.decimal_places
+        with localcontext() as context:
+            context.prec = _decimal_comparison_precision(a, b, absolute, relative, places)
+            if places is not None:
+                quantum = Decimal(1).scaleb(-places)
+                a, b = a.quantize(quantum), b.quantize(quantum)
+            delta = abs(a - b)
+            relative_limit = relative * max(abs(a), abs(b))
+            return delta <= absolute or delta <= relative_limit
     if rule.compare.mode == "ignore_case":
         return str(left.normalized).casefold() == str(right.normalized).casefold()
     if rule.type == FieldType.DATETIME:
@@ -172,11 +301,29 @@ def values_equal(left: ParsedValue, right: ParsedValue, rule: ColumnRule) -> boo
     return left.normalized == right.normalized
 
 
+def _decimal_comparison_precision(
+    left: Decimal,
+    right: Decimal,
+    absolute_tolerance: Decimal,
+    relative_tolerance: Decimal,
+    decimal_places: int | None,
+) -> int:
+    """Choose enough coefficient precision for exact tolerance-boundary decisions."""
+    values = (left, right, absolute_tolerance, relative_tolerance)
+    coefficient_budget = sum(len(value.as_tuple().digits) for value in values) + 8
+    quantize_budget = 0
+    if decimal_places is not None:
+        quantize_budget = max(left.adjusted(), right.adjusted()) + decimal_places + 2
+    return max(28, coefficient_budget, quantize_budget)
+
+
 def _truncate_datetime(value: datetime, precision: str) -> datetime | date:
     if precision == "day":
         return value.date()
     if precision == "hour":
-        return value.replace(minute=0, second=0, microsecond=0)
-    if precision == "minute":
-        return value.replace(second=0, microsecond=0)
-    return value.replace(microsecond=0)
+        truncated = value.replace(minute=0, second=0, microsecond=0)
+    elif precision == "minute":
+        truncated = value.replace(second=0, microsecond=0)
+    else:
+        truncated = value.replace(microsecond=0)
+    return truncated.astimezone(timezone.utc) if truncated.tzinfo is not None else truncated

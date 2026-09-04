@@ -10,6 +10,17 @@
       "max_records": 500000,
       "allow_private_network": false,
       "allow_insecure_http": false
+    },
+    {
+      "id": "platform-catalog",
+      "base_url": "https://catalog.example.com/",
+      "allowed_paths": ["/api/v1/categories"],
+      "auth_secret_ref": "platform_catalog_token",
+      "timeout_seconds": 15,
+      "max_response_bytes": 16777216,
+      "max_records": 500000,
+      "allow_private_network": false,
+      "allow_insecure_http": false
     }
   ]
 }

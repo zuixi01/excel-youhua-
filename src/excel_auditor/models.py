@@ -11,10 +11,89 @@ from typing import Any, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
 
 from .spill import SpillableSequence
+from .source_paths import validate_managed_http_path, validate_parameter_name, validate_simple_json_path
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+_FORBIDDEN_FORMULA_CODE = re.compile(
+    r"\[|https?://|\||(?<![A-Z0-9_.])(?:(?:_XLFN|_XLWS|_XLL)\.)?"
+    r"(?:WEBSERVICE|HYPERLINK|RTD|CALL|DDE|EXEC|REGISTER(?:\.ID)?|RUN|IMAGE|STOCKHISTORY)\s*\(",
+    re.IGNORECASE,
+)
+
+_DATETIME_FORMAT_TOKENS = {
+    "yyyy": ("%Y", "year"),
+    "MM": ("%m", "month"),
+    "dd": ("%d", "day"),
+    "HH": ("%H", "hour"),
+    "mm": ("%M", "minute"),
+    "ss": ("%S", "second"),
+    "M": ("%m", "month"),
+    "d": ("%d", "day"),
+}
+
+
+def to_python_datetime_format(value: str) -> str:
+    """Compile the documented date tokens and reject silently ineffective formats."""
+    output: list[str] = []
+    components: set[str] = set()
+    index = 0
+    ordered_tokens = sorted(_DATETIME_FORMAT_TOKENS, key=len, reverse=True)
+    while index < len(value):
+        token = next((candidate for candidate in ordered_tokens if value.startswith(candidate, index)), None)
+        if token is not None:
+            replacement, component = _DATETIME_FORMAT_TOKENS[token]
+            output.append(replacement)
+            components.add(component)
+            index += len(token)
+            continue
+        character = value[index]
+        if character == "%" or (character.isascii() and character.isalpha() and character != "T"):
+            raise ValueError(f"unsupported date format token near {value[index:]!r}")
+        output.append(character)
+        index += 1
+    missing = {"year", "month", "day"} - components
+    if missing:
+        raise ValueError(f"date format must include year, month and day; missing={sorted(missing)}")
+    compiled = "".join(output)
+    sample = datetime(2004, 2, 29, 23, 58, 57)
+    try:
+        datetime.strptime(sample.strftime(compiled), compiled)
+    except ValueError as exc:
+        raise ValueError(f"invalid date format: {value!r}") from exc
+    return compiled
+
+
+def _formula_code_outside_string_literals(formula: str) -> str | None:
+    """Return formula code with Excel string literals blanked, or None for an unclosed literal."""
+    output: list[str] = []
+    index = 0
+    while index < len(formula):
+        if formula[index] != '"':
+            output.append(formula[index])
+            index += 1
+            continue
+        output.append(" ")
+        index += 1
+        closed = False
+        while index < len(formula):
+            output.append(" ")
+            if formula[index] != '"':
+                index += 1
+                continue
+            if index + 1 < len(formula) and formula[index + 1] == '"':
+                output.append(" ")
+                index += 2
+                continue
+            index += 1
+            closed = True
+            break
+        if not closed:
+            return None
+    return "".join(output)
 
 
 class FieldType(str, Enum):
@@ -36,6 +115,7 @@ class FieldType(str, Enum):
 class DifferenceType(str, Enum):
     MISSING_SHEET = "MISSING_SHEET"
     EXTRA_SHEET = "EXTRA_SHEET"
+    AMBIGUOUS_SHEET = "AMBIGUOUS_SHEET"
     MISSING_HEADER = "MISSING_HEADER"
     EXTRA_HEADER = "EXTRA_HEADER"
     DUPLICATE_HEADER = "DUPLICATE_HEADER"
@@ -83,14 +163,22 @@ class CompareConfig(StrictModel):
                 raise ValueError(f"unknown IANA timezone: {value}") from exc
         return value
 
+    @model_validator(mode="after")
+    def non_negative_tolerances(self) -> "CompareConfig":
+        if not self.absolute_tolerance.is_finite() or not self.relative_tolerance.is_finite():
+            raise ValueError("numeric tolerances must be finite")
+        if self.absolute_tolerance < 0 or self.relative_tolerance < 0:
+            raise ValueError("numeric tolerances must be non-negative")
+        return self
+
 
 class ValidationConfig(StrictModel):
     nullable: bool = True
     unique: bool = False
     min: Decimal | None = None
     max: Decimal | None = None
-    min_length: int | None = None
-    max_length: int | None = None
+    min_length: int | None = Field(default=None, ge=0)
+    max_length: int | None = Field(default=None, ge=0)
     regex: str | None = None
 
     @field_validator("regex")
@@ -103,6 +191,16 @@ class ValidationConfig(StrictModel):
                 raise ValueError("regex contains a forbidden high-complexity construct")
             re.compile(value)
         return value
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> "ValidationConfig":
+        if any(bound is not None and not bound.is_finite() for bound in (self.min, self.max)):
+            raise ValueError("validation numeric bounds must be finite")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("validation min cannot exceed max")
+        if self.min_length is not None and self.max_length is not None and self.min_length > self.max_length:
+            raise ValueError("validation min_length cannot exceed max_length")
+        return self
 
 
 class RegexReplacement(StrictModel):
@@ -124,9 +222,9 @@ class RegexReplacement(StrictModel):
 
 
 class ColumnRule(StrictModel):
-    name: str
-    title: str
-    aliases: list[str] = Field(default_factory=list)
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+    title: str = Field(min_length=1, max_length=255)
+    aliases: list[str] = Field(default_factory=list, max_length=128)
     required: bool = False
     type: FieldType = FieldType.STRING
     normalize: list[str] = Field(default_factory=list)
@@ -138,14 +236,55 @@ class ColumnRule(StrictModel):
     regex_replacements: list[RegexReplacement] = Field(default_factory=list, max_length=8)
     boolean_true_values: list[str] = Field(default_factory=lambda: ["true", "1", "yes", "y", "是", "真"])
     boolean_false_values: list[str] = Field(default_factory=lambda: ["false", "0", "no", "n", "否", "假"])
-    parse_formats: list[str] = Field(default_factory=list)
-    format: str | None = None
+    parse_formats: list[str] = Field(default_factory=list, max_length=32)
+    format: str | None = Field(default=None, min_length=1, max_length=255)
+    normalize_display_format: bool = False
     formula_template: str | None = None
-    separator: str = ","
+    separator: str = Field(default=",", min_length=1, max_length=16)
     missing_column_action: Literal["insert", "report_only"] | None = None
     fill_static_default: bool = False
     static_default: Any = None
     sensitive: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def non_empty_header_title(cls, value: str) -> str:
+        if not normalize_header(value):
+            raise ValueError("column title must not be blank after normalization")
+        return value
+
+    @field_validator("aliases")
+    @classmethod
+    def valid_header_aliases(cls, values: list[str]) -> list[str]:
+        normalized: set[str] = set()
+        for value in values:
+            if len(value) > 255 or not normalize_header(value):
+                raise ValueError("column alias must be a non-blank header no longer than 255 characters")
+            key = normalize_header(value)
+            if key in normalized:
+                raise ValueError(f"duplicate normalized column alias: {value!r}")
+            normalized.add(key)
+        return values
+
+    @field_validator("parse_formats")
+    @classmethod
+    def valid_parse_formats(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > 128 for value in values):
+            raise ValueError("parse formats must be non-blank and no longer than 128 characters")
+        if len(values) != len(set(values)):
+            raise ValueError("parse formats must be unique")
+        return values
+
+    @field_validator("format")
+    @classmethod
+    def valid_excel_number_format(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("Excel number format must not be blank")
+        if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+            raise ValueError("Excel number format must not contain control characters")
+        return value
 
     @model_validator(mode="after")
     def validate_field(self) -> "ColumnRule":
@@ -155,10 +294,44 @@ class ColumnRule(StrictModel):
             raise ValueError(f"unknown normalizers for {self.name!r}: {sorted(unknown)}")
         if self.type == FieldType.ENUM and not self.enum_values:
             raise ValueError(f"enum field {self.name!r} requires enum_values")
+        if self.type != FieldType.ENUM and (self.enum_values or self.enum_aliases):
+            raise ValueError(f"enum configuration is incompatible with {self.type.value}")
+        if len(self.enum_values) != len(set(self.enum_values)):
+            raise ValueError(f"enum field {self.name!r} has duplicate enum_values")
+        invalid_enum_targets = set(self.enum_aliases.values()) - set(self.enum_values)
+        if invalid_enum_targets:
+            raise ValueError(f"enum aliases for {self.name!r} target unknown values: {sorted(invalid_enum_targets)}")
+        remapped_canonical_values = {
+            alias: target
+            for alias, target in self.enum_aliases.items()
+            if alias in self.enum_values and alias != target
+        }
+        if remapped_canonical_values:
+            raise ValueError(f"enum aliases for {self.name!r} remap canonical values")
         if (self.value_aliases or self.regex_replacements) and self.type not in {
             FieldType.STRING, FieldType.PHONE, FieldType.ID_CODE, FieldType.POSTAL_CODE, FieldType.FUZZY_STRING
         }:
             raise ValueError(f"string aliases and regex replacements are incompatible with {self.type.value}")
+        if self.value_aliases:
+            from .normalization import apply_normalizers
+
+            def before_value_alias(value: str) -> str:
+                normalized = apply_normalizers(value, self.normalize)
+                text = str(normalized)
+                for replacement in self.regex_replacements:
+                    flags = re.IGNORECASE if replacement.ignore_case else 0
+                    text = re.sub(replacement.pattern, replacement.replacement, text, flags=flags)
+                return text
+
+            for alias, target in self.value_aliases.items():
+                if before_value_alias(alias) != alias:
+                    raise ValueError(
+                        f"value alias {alias!r} for {self.name!r} is unreachable after normalization"
+                    )
+                if before_value_alias(target) != target:
+                    raise ValueError(
+                        f"value alias target {target!r} for {self.name!r} is not a stable normalized value"
+                    )
         compatible_modes = {
             FieldType.STRING: {"exact", "ignore_case"},
             FieldType.PHONE: {"exact", "ignore_case"},
@@ -176,6 +349,81 @@ class ColumnRule(StrictModel):
         }
         if self.compare.mode not in compatible_modes[self.type]:
             raise ValueError(f"{self.compare.mode} comparison is incompatible with {self.type.value}")
+        if self.type == FieldType.ENUM and self.compare.mode == "ignore_case":
+            folded_values = [value.casefold() for value in self.enum_values]
+            if len(folded_values) != len(set(folded_values)):
+                raise ValueError(f"enum field {self.name!r} is ambiguous under ignore_case")
+            folded_aliases: dict[str, str] = {}
+            for alias, target in self.enum_aliases.items():
+                folded = alias.casefold()
+                owner = folded_aliases.get(folded)
+                if owner is not None and owner != target:
+                    raise ValueError(f"enum aliases for {self.name!r} are ambiguous under ignore_case")
+                folded_aliases[folded] = target
+            canonical_by_fold = {value.casefold(): value for value in self.enum_values}
+            for alias, target in self.enum_aliases.items():
+                canonical = canonical_by_fold.get(alias.casefold())
+                if canonical is not None and canonical != target:
+                    raise ValueError(f"enum aliases for {self.name!r} remap canonical values under ignore_case")
+        if self.type == FieldType.ENUM and self.normalize:
+            from .normalization import apply_normalizers
+
+            def enum_key(value: str) -> str:
+                normalized = str(apply_normalizers(value, self.normalize))
+                return normalized.casefold() if self.compare.mode == "ignore_case" else normalized
+
+            configured_key = (lambda value: value.casefold()) if self.compare.mode == "ignore_case" else (lambda value: value)
+            for value in [*self.enum_values, *self.enum_aliases]:
+                if enum_key(value) != configured_key(value):
+                    raise ValueError(
+                        f"enum value or alias {value!r} for {self.name!r} is unreachable after normalization"
+                    )
+        numeric = self.type in {FieldType.INTEGER, FieldType.DECIMAL}
+        if (self.validation.min is not None or self.validation.max is not None) and not numeric:
+            raise ValueError(f"numeric validation bounds are incompatible with {self.type.value}")
+        numeric_options_configured = (
+            self.compare.absolute_tolerance != 0
+            or self.compare.relative_tolerance != 0
+            or self.compare.decimal_places is not None
+        )
+        if numeric_options_configured and not numeric:
+            raise ValueError(f"numeric comparison options are incompatible with {self.type.value}")
+        if numeric_options_configured and self.compare.mode != "numeric":
+            raise ValueError("numeric comparison options require compare.mode=numeric")
+        if self.compare.timezone is not None and self.type != FieldType.DATETIME:
+            raise ValueError(f"compare.timezone is incompatible with {self.type.value}")
+        if self.compare.allow_naive_datetime and self.type != FieldType.DATETIME:
+            raise ValueError(f"allow_naive_datetime is incompatible with {self.type.value}")
+        if self.compare.precision != "second" and self.type != FieldType.DATETIME:
+            raise ValueError(f"datetime precision is incompatible with {self.type.value}")
+        if self.parse_formats and self.type not in {FieldType.DATE, FieldType.DATETIME}:
+            raise ValueError(f"parse_formats are incompatible with {self.type.value}")
+        for parse_format in self.parse_formats:
+            to_python_datetime_format(parse_format)
+        if self.normalize_display_format:
+            if self.type not in {FieldType.INTEGER, FieldType.DECIMAL, FieldType.DATE, FieldType.DATETIME}:
+                raise ValueError(
+                    f"normalize_display_format is incompatible with {self.type.value}"
+                )
+            if self.format is None:
+                raise ValueError(
+                    f"field {self.name!r} enables normalize_display_format without an explicit format"
+                )
+        textual = self.type in {
+            FieldType.STRING,
+            FieldType.PHONE,
+            FieldType.ID_CODE,
+            FieldType.POSTAL_CODE,
+            FieldType.FUZZY_STRING,
+        }
+        if (
+            self.validation.min_length is not None
+            or self.validation.max_length is not None
+            or self.validation.regex is not None
+        ) and not textual:
+            raise ValueError(f"text length and regex validation are incompatible with {self.type.value}")
+        if self.type != FieldType.SET and self.separator != ",":
+            raise ValueError(f"separator is incompatible with {self.type.value}")
         if self.fill_static_default and self.static_default is None:
             raise ValueError(f"field {self.name!r} enables fill_static_default without static_default")
         if self.fill_static_default:
@@ -184,6 +432,20 @@ class ColumnRule(StrictModel):
             parsed = parse_value(self.static_default, self)
             if not parsed.valid:
                 raise ValueError(f"static_default for {self.name!r} is invalid: {parsed.error}")
+            if parsed.normalized is None:
+                raise ValueError(f"static_default for {self.name!r} normalizes to an empty value")
+            text = str(parsed.normalized)
+            validation = self.validation
+            if validation.min_length is not None and len(text) < validation.min_length:
+                raise ValueError(f"static_default for {self.name!r} is shorter than min_length")
+            if validation.max_length is not None and len(text) > validation.max_length:
+                raise ValueError(f"static_default for {self.name!r} is longer than max_length")
+            if validation.regex is not None and re.fullmatch(validation.regex, text) is None:
+                raise ValueError(f"static_default for {self.name!r} does not match validation regex")
+            if validation.min is not None and Decimal(str(parsed.normalized)) < validation.min:
+                raise ValueError(f"static_default for {self.name!r} is below validation min")
+            if validation.max is not None and Decimal(str(parsed.normalized)) > validation.max:
+                raise ValueError(f"static_default for {self.name!r} exceeds validation max")
         if self.type == FieldType.BOOLEAN:
             truthy = {str(value).strip().casefold() for value in self.boolean_true_values}
             falsy = {str(value).strip().casefold() for value in self.boolean_false_values}
@@ -191,11 +453,17 @@ class ColumnRule(StrictModel):
                 raise ValueError(f"boolean true/false aliases overlap for {self.name!r}")
         if self.formula_template is not None:
             formula = self.formula_template
+            if self.compare.formula_mode != "formula":
+                raise ValueError(f"formula_template for {self.name!r} requires compare.formula_mode=formula")
+            if self.fill_static_default:
+                raise ValueError(f"formula_template for {self.name!r} cannot be combined with fill_static_default")
             if len(formula) > 512 or not formula.startswith("="):
                 raise ValueError(f"formula_template for {self.name!r} must start with '=' and be at most 512 characters")
-            if re.search(r"\[[^\]]+\]|https?://|(?:WEBSERVICE|HYPERLINK|RTD|CALL)\s*\(", formula, re.IGNORECASE):
+            formula_code = _formula_code_outside_string_literals(formula)
+            if formula_code is None or _FORBIDDEN_FORMULA_CODE.search(formula_code):
                 raise ValueError(f"formula_template for {self.name!r} contains an external or forbidden function")
-            if set(re.findall(r"\{([^{}]+)\}", formula)) - {"row"}:
+            without_row_placeholder = formula.replace("{row}", "")
+            if "{" in without_row_placeholder or "}" in without_row_placeholder:
                 raise ValueError(f"formula_template for {self.name!r} only permits the {{row}} placeholder")
         return self
 
@@ -227,7 +495,7 @@ class SheetActions(StrictModel):
 
 
 class CrossFieldRule(StrictModel):
-    rule_id: str
+    rule_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     validator: str
     params: dict[str, Any]
     severity: Literal["info", "warning", "error"] = "error"
@@ -241,6 +509,28 @@ class CrossFieldRule(StrictModel):
             raise ValueError(f"unregistered cross-field validator: {value}")
         return value
 
+    @model_validator(mode="after")
+    def valid_builtin_parameters(self) -> "CrossFieldRule":
+        builtin_contracts = {
+            "conditional_required": {"when_field", "equals", "required_field"},
+            "date_order": {"start_field", "end_field"},
+        }
+        expected = builtin_contracts.get(self.validator)
+        if expected is None:
+            return self
+        actual = set(self.params)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unknown = sorted(actual - expected)
+            raise ValueError(
+                f"{self.validator} parameters must match its contract; missing={missing}, unknown={unknown}"
+            )
+        for parameter in (name for name in expected if name.endswith("_field")):
+            value = self.params[parameter]
+            if not isinstance(value, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", value) is None:
+                raise ValueError(f"{self.validator} parameter {parameter} must be a canonical field name")
+        return self
+
 
 class SheetRule(StrictModel):
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -251,7 +541,7 @@ class SheetRule(StrictModel):
     data_region: DataRegionRule = Field(default_factory=DataRegionRule)
     primary_key: list[str] = Field(default_factory=list)
     primary_key_mode: Literal["fields", "row_number"] = "fields"
-    row_number_field: str = "__row_number__"
+    row_number_field: str = Field(default="__row_number__", min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
     empty_primary_key_action: Literal["report_invalid", "skip_row", "use_row_number"] = "report_invalid"
     columns: list[ColumnRule] = Field(min_length=1)
     cross_field_rules: list[CrossFieldRule] = Field(default_factory=list)
@@ -273,6 +563,16 @@ class SheetRule(StrictModel):
 
     @model_validator(mode="after")
     def validate_sheet(self) -> "SheetRule":
+        physical_names = [self.name, *self.aliases]
+        folded_physical_names = [name.casefold() for name in physical_names]
+        if len(folded_physical_names) != len(set(folded_physical_names)):
+            raise ValueError(f"worksheet {self.id!r} repeats its name or an alias")
+        if (
+            self.data_region.start_row is not None
+            and not self.header.auto_detect
+            and self.data_region.start_row <= self.header.row
+        ):
+            raise ValueError("data_region.start_row must be after the configured header row")
         names = [column.name for column in self.columns]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate canonical column in sheet {self.id!r}")
@@ -280,14 +580,26 @@ class SheetRule(StrictModel):
             raise ValueError("field primary key mode requires at least one primary key field")
         if self.primary_key_mode == "row_number" and self.primary_key:
             raise ValueError("row_number primary key mode must not also declare primary_key fields")
+        if self.primary_key_mode == "row_number" and self.empty_primary_key_action != "report_invalid":
+            raise ValueError("row_number primary key mode cannot use an empty primary key fallback action")
         missing = set(self.primary_key) - set(names)
         if missing:
             raise ValueError(f"primary key fields do not exist: {sorted(missing)}")
         by_name = {column.name: column for column in self.columns}
         for key in self.primary_key:
-            if not by_name[key].required:
+            key_rule = by_name[key]
+            if not key_rule.required:
                 raise ValueError(f"primary key field {key!r} must be required")
-            lossy = set(by_name[key].normalize) & {"collapse_spaces", "remove_group_separator", "remove_currency_symbol"}
+            if key_rule.type == FieldType.FUZZY_STRING:
+                raise ValueError(f"primary key field {key!r} cannot use fuzzy_string")
+            if key_rule.compare.mode != "exact":
+                raise ValueError(
+                    f"primary key field {key!r} must use compare.mode=exact; "
+                    "matching keys cannot use comparison-only equivalence rules"
+                )
+            if key_rule.compare.formula_mode != "reject":
+                raise ValueError(f"primary key field {key!r} must reject formulas")
+            lossy = set(key_rule.normalize) & {"collapse_spaces", "remove_group_separator", "remove_currency_symbol"}
             if lossy:
                 raise ValueError(f"primary key field {key!r} uses potentially lossy normalizers: {sorted(lossy)}")
         for cross_rule in self.cross_field_rules:
@@ -295,6 +607,30 @@ class SheetRule(StrictModel):
             missing_references = referenced - set(names)
             if missing_references:
                 raise ValueError(f"cross-field rule {cross_rule.rule_id!r} references missing fields: {sorted(missing_references)}")
+            if cross_rule.validator == "conditional_required":
+                when_rule = by_name[cross_rule.params["when_field"]]
+                from .normalization import parse_value
+
+                expected = parse_value(cross_rule.params["equals"], when_rule)
+                if not expected.valid:
+                    raise ValueError(
+                        f"cross-field rule {cross_rule.rule_id!r} has an invalid equals value: {expected.error}"
+                    )
+            if cross_rule.validator == "date_order":
+                start_rule = by_name[cross_rule.params["start_field"]]
+                end_rule = by_name[cross_rule.params["end_field"]]
+                if (
+                    start_rule.type not in {FieldType.DATE, FieldType.DATETIME}
+                    or end_rule.type != start_rule.type
+                    or start_rule.compare.formula_mode == "formula"
+                    or end_rule.compare.formula_mode == "formula"
+                ):
+                    raise ValueError(
+                        f"cross-field rule {cross_rule.rule_id!r} requires comparable date fields of the same type"
+                    )
+        cross_rule_ids = [rule.rule_id for rule in self.cross_field_rules]
+        if len(cross_rule_ids) != len(set(cross_rule_ids)):
+            raise ValueError(f"duplicate cross-field rule id in sheet {self.id!r}")
         normalized: dict[str, str] = {}
         for column in self.columns:
             for raw in [column.name, column.title, *column.aliases]:
@@ -303,6 +639,12 @@ class SheetRule(StrictModel):
                 if owner is not None and owner != column.name:
                     raise ValueError(f"header alias collision: {raw!r} maps to {owner!r} and {column.name!r}")
                 normalized[key] = column.name
+        if self.primary_key_mode == "row_number":
+            row_field_owner = normalized.get(normalize_header(self.row_number_field))
+            if row_field_owner is not None and row_field_owner != self.row_number_field:
+                raise ValueError(
+                    f"row_number_field {self.row_number_field!r} collides with column {row_field_owner!r}"
+                )
         return self
 
 
@@ -351,16 +693,27 @@ class Colors(StrictModel):
 
 class PaginationConfig(StrictModel):
     type: Literal["page_number"] = "page_number"
-    page_param: str = "page"
-    size_param: str = "size"
+    page_param: str = Field(default="page", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    size_param: str = Field(default="size", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     size: int = Field(default=500, ge=1, le=5000)
     total_json_path: str | None = None
     max_pages: int = Field(default=1000, ge=1, le=10000)
 
+    @field_validator("total_json_path")
+    @classmethod
+    def valid_total_json_path(cls, value: str | None) -> str | None:
+        return validate_simple_json_path(value, field_name="pagination.total_json_path")
+
+    @model_validator(mode="after")
+    def distinct_parameter_names(self) -> "PaginationConfig":
+        if self.page_param == self.size_param:
+            raise ValueError("pagination page_param and size_param must be distinct")
+        return self
+
 
 class StandardSourceConfig(StrictModel):
     type: Literal["upload", "managed_http"] = "upload"
-    connection_id: str | None = None
+    connection_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     method: Literal["GET", "POST"] = "GET"
     path: str | None = None
     data_json_path: str = "$.data"
@@ -368,13 +721,240 @@ class StandardSourceConfig(StrictModel):
     parameter_mapping: dict[str, str] = Field(default_factory=dict)
     pagination: PaginationConfig | None = None
 
+    @field_validator("path")
+    @classmethod
+    def valid_managed_path(cls, value: str | None) -> str | None:
+        return validate_managed_http_path(value, field_name="standard_source.path") if value is not None else None
+
+    @field_validator("data_json_path")
+    @classmethod
+    def valid_data_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="standard_source.data_json_path") or "$"
+
     @model_validator(mode="after")
     def validate_source(self) -> "StandardSourceConfig":
         if self.type == "managed_http" and (not self.connection_id or not self.path):
             raise ValueError("managed_http requires connection_id and path")
-        if self.path and ("://" in self.path or not self.path.startswith("/")):
-            raise ValueError("standard source path must be an absolute path without scheme or host")
+        if self.type == "upload":
+            ignored = (
+                self.connection_id is not None
+                or self.path is not None
+                or self.method != "GET"
+                or bool(self.static_parameters)
+                or bool(self.parameter_mapping)
+                or self.pagination is not None
+                or self.data_json_path != "$.data"
+            )
+            if ignored:
+                raise ValueError("upload standard source cannot contain managed HTTP configuration")
+            return self
+
+        for name in self.static_parameters:
+            validate_parameter_name(str(name), field_name="standard_source.static_parameters key")
+        for request_name, task_name in self.parameter_mapping.items():
+            validate_parameter_name(str(request_name), field_name="standard_source.parameter_mapping request name")
+            validate_parameter_name(str(task_name), field_name="standard_source.parameter_mapping task name")
+        overlap = set(self.static_parameters) & set(self.parameter_mapping)
+        if overlap:
+            raise ValueError(f"static and mapped HTTP parameters overlap: {sorted(overlap)}")
+        if self.pagination is not None:
+            occupied = set(self.static_parameters) | set(self.parameter_mapping)
+            collisions = occupied & {self.pagination.page_param, self.pagination.size_param}
+            if collisions:
+                raise ValueError(f"pagination parameters overlap configured HTTP parameters: {sorted(collisions)}")
         return self
+
+
+class ProductCategoryRecordMapping(StrictModel):
+    id_key: str = "id"
+    name_key: str = "name"
+    parent_id_key: str | None = "parent_id"
+    path_key: str | None = "path"
+    aliases_key: str | None = "aliases"
+    active_key: str | None = "active"
+
+    @field_validator("id_key", "name_key", "parent_id_key", "path_key", "aliases_key", "active_key")
+    @classmethod
+    def valid_record_key(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or len(value) > 128 or any(ord(character) < 32 for character in value)):
+            raise ValueError("catalog record keys must be printable, non-blank, and no longer than 128 characters")
+        return value
+
+    @model_validator(mode="after")
+    def distinct_keys(self) -> "ProductCategoryRecordMapping":
+        keys = [value for value in self.model_dump().values() if value is not None]
+        if len(keys) != len(set(keys)):
+            raise ValueError("category record mapping keys must be distinct")
+        return self
+
+
+class ProductFieldRecordMapping(StrictModel):
+    id_key: str = "id"
+    title_key: str = "title"
+    aliases_key: str | None = "aliases"
+    type_key: str | None = "type"
+    required_key: str | None = "required"
+    multiple_key: str | None = "multiple"
+    display_order_key: str | None = "display_order"
+    enum_values_key: str | None = "enum_values"
+    number_format_key: str | None = "number_format"
+    timezone_key: str | None = "timezone"
+    nullable_key: str | None = "nullable"
+    unique_key: str | None = "unique"
+    min_key: str | None = "min"
+    max_key: str | None = "max"
+    min_length_key: str | None = "min_length"
+    max_length_key: str | None = "max_length"
+    regex_key: str | None = "regex"
+    type_value_aliases: dict[str, FieldType] = Field(default_factory=dict, max_length=64)
+
+    @field_validator(
+        "id_key", "title_key", "aliases_key", "type_key", "required_key", "multiple_key",
+        "display_order_key", "enum_values_key", "number_format_key", "timezone_key", "nullable_key", "unique_key",
+        "min_key", "max_key", "min_length_key", "max_length_key", "regex_key",
+    )
+    @classmethod
+    def valid_record_key(cls, value: str | None) -> str | None:
+        return ProductCategoryRecordMapping.valid_record_key(value)
+
+    @model_validator(mode="after")
+    def distinct_keys(self) -> "ProductFieldRecordMapping":
+        keys = [
+            value
+            for name, value in self.model_dump().items()
+            if name.endswith("_key") and value is not None
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("field record mapping keys must be distinct")
+        aliases: dict[str, FieldType] = {}
+        canonical = {field_type.value: field_type for field_type in FieldType}
+        for raw, target in self.type_value_aliases.items():
+            normalized = raw.strip().casefold()
+            if not normalized or len(raw) > 128:
+                raise ValueError("field type aliases must be non-blank and no longer than 128 characters")
+            if normalized in aliases:
+                raise ValueError("field type aliases must be unique after trimming and case folding")
+            if normalized in canonical and canonical[normalized] != target:
+                raise ValueError("field type aliases cannot remap a canonical field type")
+            aliases[normalized] = target
+        return self
+
+
+class ProductCatalogEndpoint(StrictModel):
+    """A managed catalog endpoint whose category placeholder is substituted safely."""
+
+    path_template: str
+    data_json_path: str = "$.data"
+    method: Literal["GET", "POST"] = "GET"
+    category_parameter: str | None = None
+    static_parameters: dict[str, Any] = Field(default_factory=dict)
+    pagination: PaginationConfig | None = None
+    record_mapping: ProductFieldRecordMapping = Field(default_factory=ProductFieldRecordMapping)
+
+    @field_validator("path_template")
+    @classmethod
+    def valid_path_template(cls, value: str) -> str:
+        if value.count("{category_id}") != 1:
+            raise ValueError("catalog path_template must contain exactly one {category_id} placeholder")
+        if "{" in value.replace("{category_id}", "") or "}" in value.replace("{category_id}", ""):
+            raise ValueError("catalog path_template contains an unsupported placeholder")
+        validate_managed_http_path(
+            value.replace("{category_id}", "category-id"),
+            field_name="product_workflow catalog path_template",
+        )
+        return value
+
+    @field_validator("data_json_path")
+    @classmethod
+    def valid_catalog_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="product_workflow catalog data_json_path") or "$"
+
+    @field_validator("category_parameter")
+    @classmethod
+    def valid_category_parameter(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_parameter_name(value, field_name="product_workflow catalog category_parameter")
+        return value
+
+    @model_validator(mode="after")
+    def validate_parameters(self) -> "ProductCatalogEndpoint":
+        for name in self.static_parameters:
+            validate_parameter_name(str(name), field_name="product_workflow catalog static parameter")
+        occupied = set(self.static_parameters)
+        if self.category_parameter is not None and self.category_parameter in occupied:
+            raise ValueError("catalog category_parameter overlaps a static parameter")
+        if self.pagination is not None:
+            collisions = occupied & {self.pagination.page_param, self.pagination.size_param}
+            if collisions:
+                raise ValueError(f"catalog pagination parameters overlap static parameters: {sorted(collisions)}")
+        return self
+
+
+class ProductCategoryConfig(StrictModel):
+    source_field: str = Field(default="merchant_category", min_length=1, max_length=128)
+    id_field: str | None = Field(default="platform_category_id", min_length=1, max_length=128)
+    category_list_path: str = "/categories"
+    category_list_json_path: str = "$.data"
+    category_list_method: Literal["GET", "POST"] = "GET"
+    category_list_static_parameters: dict[str, Any] = Field(default_factory=dict)
+    category_list_pagination: PaginationConfig | None = None
+    record_mapping: ProductCategoryRecordMapping = Field(default_factory=ProductCategoryRecordMapping)
+    attributes: ProductCatalogEndpoint
+    specifications: ProductCatalogEndpoint
+
+    @field_validator("category_list_path")
+    @classmethod
+    def valid_category_list_path(cls, value: str) -> str:
+        return validate_managed_http_path(value, field_name="product_workflow category_list_path")
+
+    @field_validator("category_list_json_path")
+    @classmethod
+    def valid_category_list_json_path(cls, value: str) -> str:
+        return validate_simple_json_path(value, field_name="product_workflow category_list_json_path") or "$"
+
+    @model_validator(mode="after")
+    def valid_category_list_parameters(self) -> "ProductCategoryConfig":
+        for name in self.category_list_static_parameters:
+            validate_parameter_name(str(name), field_name="product_workflow category list static parameter")
+        if self.category_list_pagination is not None:
+            collisions = set(self.category_list_static_parameters) & {
+                self.category_list_pagination.page_param,
+                self.category_list_pagination.size_param,
+            }
+            if collisions:
+                raise ValueError(f"category list pagination parameters overlap static parameters: {sorted(collisions)}")
+        return self
+
+
+class ProductOutputConfig(StrictModel):
+    multi_category_mode: Literal["split_sheets"] = "split_sheets"
+    merchant_extra_mode: Literal["append_right"] = "append_right"
+    sku_sheet_mode: Literal["when_present", "always", "disabled"] = "when_present"
+    max_sku_combinations_per_product: int = Field(default=1_000, ge=1, le=100_000)
+    required_missing_color: str = "F4CCCC"
+    invalid_value_color: str = "F9CB9C"
+    ambiguous_color: str = "D9D2E9"
+    merchant_extra_header_color: str = "D9D9D9"
+
+    @field_validator(
+        "required_missing_color",
+        "invalid_value_color",
+        "ambiguous_color",
+        "merchant_extra_header_color",
+    )
+    @classmethod
+    def valid_product_color(cls, value: str) -> str:
+        return Colors.rgb(value)
+
+
+class ProductWorkflowConfig(StrictModel):
+    sheet_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    catalog_connection_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    category: ProductCategoryConfig
+    output: ProductOutputConfig = Field(default_factory=ProductOutputConfig)
+    mapping_fuzzy_threshold: int = Field(default=92, ge=0, le=100)
+    minimum_category_confidence: int = Field(default=95, ge=0, le=100)
+    category_candidate_score_margin: int = Field(default=5, ge=0, le=100)
 
 
 class RuleSet(StrictModel):
@@ -386,6 +966,7 @@ class RuleSet(StrictModel):
     sheets: list[SheetRule] = Field(min_length=1)
     colors: Colors = Field(default_factory=Colors)
     standard_source: StandardSourceConfig = Field(default_factory=StandardSourceConfig)
+    product_workflow: ProductWorkflowConfig | None = None
 
     @field_validator("schema_version")
     @classmethod
@@ -407,6 +988,31 @@ class RuleSet(StrictModel):
                 if owner is not None and owner != sheet.id:
                     raise ValueError(f"worksheet name or alias {physical_name!r} is shared by sheets {owner!r} and {sheet.id!r}")
                 physical_names[key] = sheet.id
+        for sheet in self.sheets:
+            physical_owner = physical_names.get(sheet.id.casefold())
+            if physical_owner is not None and physical_owner != sheet.id:
+                raise ValueError(
+                    f"sheet id {sheet.id!r} conflicts with a worksheet name or alias owned by sheet {physical_owner!r}"
+                )
+        if self.product_workflow is not None:
+            product_sheet = next(
+                (sheet for sheet in self.sheets if sheet.id == self.product_workflow.sheet_id),
+                None,
+            )
+            if product_sheet is None:
+                raise ValueError(
+                    f"product_workflow sheet_id does not exist: {self.product_workflow.sheet_id}"
+                )
+            names = {column.name for column in product_sheet.columns}
+            category = self.product_workflow.category
+            required_fields = {category.source_field}
+            if category.id_field is not None:
+                required_fields.add(category.id_field)
+            missing = required_fields - names
+            if missing:
+                raise ValueError(
+                    f"product_workflow category fields do not exist on sheet {product_sheet.id!r}: {sorted(missing)}"
+                )
         return self
 
     @property

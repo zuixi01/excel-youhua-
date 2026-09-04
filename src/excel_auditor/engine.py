@@ -20,11 +20,11 @@ from .models import (
     SheetRule,
     normalize_header,
 )
-from .normalization import ParsedValue, parse_value, values_equal
+from .normalization import ParsedValue, excel_datetime_write_safe, excel_numeric_write_safe, is_formula_text, normalized_uniqueness_key, parse_excel_value, parse_row_number, parse_value, values_equal
 from .record_store import DiskBackedRecordMap
 from .snapshots import SpilledRecords
 from .spill import SpillableSequence
-from .workbook import SheetSnapshot, WorkbookSnapshot
+from .workbook import SheetSnapshot, WorkbookSnapshot, locate_header_row
 from .validators import run_validator
 from .ids import new_ulid
 
@@ -39,6 +39,11 @@ class ComparisonResult:
     join_backends: list[str] | None = None
     report_only: bool = False
     storage_backends: list[str] | None = None
+    matched_records_by_sheet: dict[str, int] | None = None
+    validated_records_by_sheet: dict[str, int] | None = None
+    resolved_header_rows_by_sheet: dict[str, int] | None = None
+    data_start_rows_by_sheet: dict[str, int] | None = None
+    formula_rows_by_sheet: dict[str, list[int]] | None = None
 
     def close(self) -> None:
         for sequence in (self.differences, self.repairs):
@@ -78,7 +83,6 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
             exact.setdefault(normalize_header(alias), (column.name, "confirmed_alias"))
     choices = {column.name: normalize_header(column.title) for column in sheet.columns}
     mappings: list[HeaderMapping] = []
-    canonical_columns: dict[str, int] = {}
     for index, (raw, normalized) in enumerate(zip(header_values, normalized_values), start=1):
         raw_text = "" if raw is None else str(raw)
         if normalized in duplicate_values:
@@ -86,7 +90,6 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
         elif normalized in exact:
             canonical, match_type = exact[normalized]
             mapping = HeaderMapping(sheet_id=sheet.id, physical_column=index, raw_header=raw_text, normalized_header=normalized, canonical_field=canonical, match_type=match_type, confidence=100, status="matched")
-            canonical_columns[canonical] = index
         elif normalized:
             match = process.extractOne(normalized, choices, scorer=fuzz.ratio, score_cutoff=sheet.header.fuzzy_suggestion_threshold)
             if match:
@@ -97,6 +100,25 @@ def map_headers(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[list[HeaderM
         else:
             mapping = HeaderMapping(sheet_id=sheet.id, physical_column=index, raw_header=raw_text, normalized_header=normalized, match_type="unmatched", status="extra")
         mappings.append(mapping)
+    matched_by_canonical: dict[str, list[int]] = defaultdict(list)
+    for mapping_index, mapping in enumerate(mappings):
+        if mapping.status == "matched" and mapping.canonical_field:
+            matched_by_canonical[mapping.canonical_field].append(mapping_index)
+    semantic_duplicates = {
+        canonical: indexes
+        for canonical, indexes in matched_by_canonical.items()
+        if len(indexes) > 1
+    }
+    for canonical, indexes in semantic_duplicates.items():
+        for mapping_index in indexes:
+            mappings[mapping_index] = mappings[mapping_index].model_copy(
+                update={"status": "duplicate", "canonical_field": canonical}
+            )
+    canonical_columns = {
+        mapping.canonical_field: mapping.physical_column
+        for mapping in mappings
+        if mapping.status == "matched" and mapping.canonical_field
+    }
     return mappings, canonical_columns
 
 
@@ -129,23 +151,55 @@ def compare_workbook(
     manual_review_reasons: list[str] = []
     join_backends: list[str] = []
     storage_backends: list[str] = []
+    matched_records_by_sheet: dict[str, int] = {}
+    validated_records_by_sheet: dict[str, int] = {}
+    resolved_header_rows_by_sheet: dict[str, int] = {}
+    data_start_rows_by_sheet: dict[str, int] = {}
+    formula_rows_by_sheet: dict[str, list[int]] = {}
     consumed_sheets: set[str] = set()
     for sheet_rule in rules.sheets:
-        actual_name = next((name for name in [sheet_rule.name, *sheet_rule.aliases] if name in workbook.sheets), None)
+        configured_names = {name.casefold() for name in [sheet_rule.name, *sheet_rule.aliases]}
+        matching_names = [name for name in workbook.sheets if name.casefold() in configured_names]
+        if len(matching_names) > 1:
+            consumed_sheets.update(matching_names)
+            differences.append(_difference(
+                DifferenceType.AMBIGUOUS_SHEET,
+                sheet_rule,
+                f"工作表规则同时匹配到多个物理工作表：{matching_names}",
+                severity="error",
+                render_action="report_only",
+            ))
+            manual_review_reasons.append(
+                f"{sheet_rule.id}: ambiguous_sheet:{'|'.join(matching_names)}"
+            )
+            continue
+        actual_name = matching_names[0] if matching_names else None
         if actual_name is None:
             if sheet_rule.required:
                 differences.append(_difference(DifferenceType.MISSING_SHEET, sheet_rule, f"缺少必需工作表：{sheet_rule.name}"))
             continue
         consumed_sheets.add(actual_name)
         snapshot = workbook.sheets[actual_name]
-        header_row, header_problem = _locate_header_row(sheet_rule, snapshot)
+        header_row, header_problem = locate_header_row(sheet_rule, snapshot)
         if header_problem:
             differences.append(_difference(DifferenceType.HEADER_NOT_FOUND, sheet_rule, header_problem, sheet_name=actual_name, severity="error"))
             manual_review_reasons.append(f"{actual_name}: header_not_found_or_ambiguous")
             continue
+        if sheet_rule.data_region.start_row is not None and sheet_rule.data_region.start_row <= header_row:
+            differences.append(_difference(
+                DifferenceType.HEADER_NOT_FOUND,
+                sheet_rule,
+                f"数据起始行 {sheet_rule.data_region.start_row} 必须晚于定位表头行 {header_row}",
+                sheet_name=actual_name,
+                severity="error",
+            ))
+            manual_review_reasons.append(f"{actual_name}: data_region_overlaps_header")
+            continue
         # Keep the stable rule id, but carry the physical worksheet name through
         # every difference and render operation when a configured alias matched.
         actual_sheet_rule = sheet_rule.model_copy(update={"name": actual_name, "header": sheet_rule.header.model_copy(update={"row": header_row})})
+        resolved_header_rows_by_sheet[sheet_rule.id] = header_row
+        data_start_rows_by_sheet[sheet_rule.id] = sheet_rule.data_region.start_row or header_row + 1
         mappings, canonical_columns = map_headers(actual_sheet_rule, snapshot)
         all_mappings.extend(mappings)
         differences.extend(_header_differences(actual_sheet_rule, mappings, canonical_columns, repairs))
@@ -154,21 +208,50 @@ def compare_workbook(
         ):
             continue
         sheet_standard = standard.get(sheet_rule.id, standard.get(sheet_rule.name, []))
-        join_backend, record_storage = _compare_records(actual_sheet_rule, snapshot, canonical_columns, sheet_standard, differences, repairs, summary)
+        join_backend, record_storage, matched_count, validated_count, formula_rows = _compare_records(
+            actual_sheet_rule,
+            snapshot,
+            canonical_columns,
+            sheet_standard,
+            differences,
+            repairs,
+            summary,
+            workbook.excel_epoch,
+        )
         join_backends.append(join_backend)
         storage_backends.append(record_storage)
+        matched_records_by_sheet[sheet_rule.id] = matched_count
+        validated_records_by_sheet[sheet_rule.id] = validated_count
+        formula_rows_by_sheet[sheet_rule.id] = formula_rows
     for extra_name in set(workbook.sheets) - consumed_sheets:
         pseudo = rules.sheets[0]
         differences.append(_difference(DifferenceType.EXTRA_SHEET, pseudo, f"存在规则未声明的工作表：{extra_name}", sheet_name=extra_name, severity="warning"))
     summary.differences = len(differences)
-    summary.mismatched_cells = sum(item.type == DifferenceType.VALUE_MISMATCH for item in differences)
-    summary.validation_errors = sum(item.type in {DifferenceType.INVALID_VALUE, DifferenceType.VALIDATION_ERROR} for item in differences)
-    summary.repairs_planned = sum(item.repair_status == "planned" for item in differences)
-    manual_review_reasons.extend(sorted({
-        f"{item.sheet_name}: fuzzy_value_suggestion:{item.canonical_field}"
-        for item in differences
-        if item.rule_id and item.rule_id.endswith(".fuzzy_suggestion")
-    }))
+    review_reason_groups: list[set[str]] = [set() for _index in range(7)]
+    for item in differences:
+        if item.type == DifferenceType.VALUE_MISMATCH:
+            summary.mismatched_cells += 1
+        if item.type in {DifferenceType.INVALID_VALUE, DifferenceType.VALIDATION_ERROR}:
+            summary.validation_errors += 1
+        if item.repair_status == "planned":
+            summary.repairs_planned += 1
+        rule_id = item.rule_id or ""
+        if rule_id.endswith(".fuzzy_suggestion"):
+            review_reason_groups[0].add(f"{item.sheet_name}: fuzzy_value_suggestion:{item.canonical_field}")
+        if rule_id.endswith(".formula_primary_key"):
+            review_reason_groups[1].add(f"{item.sheet_name}: formula_primary_key:{item.canonical_field}")
+        if rule_id == "missing_record.formula_template_required":
+            review_reason_groups[2].add(f"{item.sheet_name}: formula_append_requires_trusted_template")
+        if rule_id.endswith(".formula_template_mismatch"):
+            review_reason_groups[3].add(f"{item.sheet_name}: formula_template_mismatch:{item.canonical_field}")
+        if rule_id.endswith(".excel_write_precision"):
+            review_reason_groups[4].add(f"{item.sheet_name}: excel_numeric_write_precision:{item.canonical_field}")
+        if rule_id.endswith(".excel_write_timezone"):
+            review_reason_groups[5].add(f"{item.sheet_name}: excel_datetime_write_timezone:{item.canonical_field}")
+        if rule_id.endswith(".formula_cached_write_blocked"):
+            review_reason_groups[6].add(f"{item.sheet_name}: formula_cached_value_write_blocked:{item.canonical_field}")
+    for reason_group in review_reason_groups:
+        manual_review_reasons.extend(sorted(reason_group))
     spilled = (
         isinstance(differences, SpillableSequence) and differences.spilled
     ) or (
@@ -184,6 +267,11 @@ def compare_workbook(
         join_backends,
         report_only=spilled,
         storage_backends=sorted(set(storage_backends)),
+        matched_records_by_sheet=matched_records_by_sheet,
+        validated_records_by_sheet=validated_records_by_sheet,
+        resolved_header_rows_by_sheet=resolved_header_rows_by_sheet,
+        data_start_rows_by_sheet=data_start_rows_by_sheet,
+        formula_rows_by_sheet=formula_rows_by_sheet,
     )
 
 
@@ -226,6 +314,7 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
                 sheet,
                 f"缺少表头：{column.title}",
                 canonical_field=name,
+                standard_raw_value=column.title,
                 rule_id=f"{name}.missing_column",
                 render_action=action,
                 repair_status="planned" if action == "insert_and_mark_green" else "not_requested",
@@ -233,43 +322,40 @@ def _header_differences(sheet: SheetRule, mappings: list[HeaderMapping], canonic
     return result
 
 
-def _locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, str | None]:
-    if not sheet.header.auto_detect:
-        if sheet.header.row > len(snapshot.rows):
-            return sheet.header.row, f"指定表头行 {sheet.header.row} 超出工作表范围"
-        return sheet.header.row, None
-    exact: dict[str, str] = {}
-    for column in sheet.columns:
-        for candidate in [column.name, column.title, *column.aliases]:
-            exact[normalize_header(candidate)] = column.name
-    candidates: list[tuple[int, int]] = []
-    for row_number, values in snapshot.rows[:50]:
-        matched = {exact[value] for value in map(normalize_header, values) if value in exact}
-        if (sheet.primary_key_mode == "fields" and set(sheet.primary_key) <= matched) or (
-            sheet.primary_key_mode == "row_number" and matched
-        ):
-            candidates.append((len(matched), row_number))
-    if not candidates:
-        return sheet.header.row, "未找到包含完整主键的候选表头行"
-    best_score = max(score for score, _row in candidates)
-    best_rows = [row for score, row in candidates if score == best_score]
-    if len(best_rows) != 1:
-        return best_rows[0], f"表头自动定位存在并列候选行：{best_rows}"
-    return best_rows[0], None
-
-
-def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary) -> tuple[str, str]:
+def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], standard_rows: Sequence[dict[str, Any]], differences: list[Difference], repairs: list[RepairOperation], summary: ReportSummary, excel_epoch: Any) -> tuple[str, str, int, int, list[int]]:
     rules_by_name = {column.name: column for column in sheet.columns}
     start_row = sheet.data_region.start_row or sheet.header.row + 1
     excel_records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
     excel_duplicates: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+    formula_target_rows: list[int] = []
     for row_number, values in snapshot.rows[start_row - 1 :]:
         if row_number in snapshot.hidden_rows and not sheet.data_region.include_hidden_rows:
             continue
         record = {name: values[index - 1] for name, index in columns.items() if index <= len(values) and values[index - 1] not in {None, ""}}
         if all(value is None or value == "" for value in record.values()):
             continue
-        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number)
+        formula_target_rows.append(row_number)
+        formula_key_fields = [
+            name
+            for name in sheet.primary_key
+            if isinstance(record.get(name), str) and record[name].startswith("=")
+        ]
+        if formula_key_fields:
+            for name in formula_key_fields:
+                col = columns.get(name)
+                differences.append(_difference(
+                    DifferenceType.UNSUPPORTED_FEATURE,
+                    sheet,
+                    "Primary-key formulas are not evaluated and cannot participate in automatic record matching",
+                    cell=f"{get_column_letter(col)}{row_number}" if col else None,
+                    excel_row=row_number,
+                    canonical_field=name,
+                    excel_raw_value=_safe_value(record.get(name), rules_by_name[name]),
+                    rule_id=f"{name}.formula_primary_key",
+                    render_action="mark_purple",
+                ))
+            continue
+        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number, excel_epoch=excel_epoch)
         if not key_valid:
             if sheet.empty_primary_key_action == "skip_row":
                 continue
@@ -280,7 +366,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             key_fields = sheet.primary_key or [sheet.row_number_field]
             for name in key_fields:
                 col = columns.get(name)
-                differences.append(_difference(DifferenceType.EMPTY_PRIMARY_KEY, sheet, "主键为空或无法解析", cell=f"{get_column_letter(col)}{row_number}" if col else None, excel_row=row_number, canonical_field=name, excel_raw_value=record.get(name), render_action=key_action))
+                differences.append(_difference(DifferenceType.EMPTY_PRIMARY_KEY, sheet, "主键为空或无法解析", cell=f"{get_column_letter(col)}{row_number}" if col else None, excel_row=row_number, canonical_field=name, excel_raw_value=_safe_value(record.get(name), rules_by_name[name]), render_action=key_action))
             continue
         if key in excel_records:
             excel_duplicates[key].extend([excel_records[key][0], row_number])
@@ -291,7 +377,15 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         for row_number in sorted(set(rows)):
             duplicate_action = "mark_row_purple" if sheet.actions.duplicate_key == "mark_purple" else "report_only"
             differences.append(_difference(DifferenceType.DUPLICATE_PRIMARY_KEY, sheet, "Excel 中主键重复，不参与自动匹配", excel_row=row_number, business_key=_business_key(key, sheet), render_action=duplicate_action))
-    _validate_excel_records(sheet, snapshot, columns, excel_records, rules_by_name, differences)
+    validated_record_count = _validate_excel_records(
+        sheet,
+        snapshot,
+        columns,
+        rules_by_name,
+        differences,
+        repairs,
+        excel_epoch,
+    )
     join_threshold = int(os.environ.get("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD", "50000"))
     if join_threshold < 1:
         raise ValueError("EXCEL_AUDITOR_POLARS_JOIN_THRESHOLD must be positive")
@@ -351,9 +445,13 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
         differences.append(_difference(DifferenceType.EXTRA_RECORD, sheet, "仅 Excel 存在的记录", excel_row=row_number, business_key=_business_key(key, sheet), render_action=extra_action))
         for name, col_index in columns.items():
             rule = rules_by_name[name]
-            parsed = parse_value(record.get(name), rule)
+            parsed = parse_excel_value(record.get(name), rule, excel_epoch)
             if parsed.valid and parsed.normalized is None and rule.fill_static_default:
                 cell = f"{get_column_letter(col_index)}{row_number}"
+                default = parse_value(rule.static_default, rule)
+                if not _excel_write_safe(default, rule):
+                    _append_excel_write_safety_difference(differences, sheet, rule, default, row_number=row_number, cell=cell, key=key)
+                    continue
                 difference = _difference(
                     DifferenceType.NORMALIZED_MATCH,
                     sheet,
@@ -370,7 +468,8 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
+                default_value = _excel_write_value(default, rule)
+                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     append_row = snapshot.max_row + 1
     for standard_reference in standard_only:
         summary.missing_records += 1
@@ -384,21 +483,88 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             key = standard_reference
             record = standard_records[key]
         duplicate_in_excel = key in excel_duplicates
-        append = sheet.actions.missing_record == "append_and_mark_green" and not duplicate_in_excel
+        requested_row = key[0][1] if sheet.primary_key_mode == "row_number" else append_row
+        append_requested = sheet.actions.missing_record == "append_and_mark_green"
+        unsafe_formula_fields: list[str] = []
+        parsed_record: dict[str, ParsedValue] = {}
+        unsafe_write_fields: list[str] = []
+        unsafe_datetime_fields: list[str] = []
+        if append_requested:
+            unsafe_formula_fields = [
+                name
+                for name, rule in rules_by_name.items()
+                if rule.compare.formula_mode == "formula"
+                and is_formula_text(record.get(name))
+                and (
+                    rule.formula_template is None
+                    or rule.formula_template.replace("{row}", str(append_row)) != record.get(name)
+                )
+            ]
+            parsed_record = {
+                name: parse_value(record.get(name), rule)
+                for name, rule in rules_by_name.items()
+            }
+            unsafe_write_fields = [
+                name for name, rule in rules_by_name.items()
+                if not _excel_write_safe(parsed_record[name], rule)
+            ]
+            unsafe_datetime_fields = [
+                name for name in unsafe_write_fields
+                if rules_by_name[name].type.value == "datetime"
+            ]
+        formula_append_blocked = bool(unsafe_formula_fields)
+        write_append_blocked = bool(unsafe_write_fields)
+        if write_append_blocked:
+            for name in unsafe_write_fields:
+                _append_excel_write_safety_difference(differences, sheet, rules_by_name[name], parsed_record[name], key=key)
+        append = (
+            append_requested
+            and not duplicate_in_excel
+            and requested_row == append_row
+            and not formula_append_blocked
+            and not write_append_blocked
+        )
+        row_number_mismatch = sheet.primary_key_mode == "row_number" and requested_row != append_row
+        if row_number_mismatch:
+            missing_message = "标准数据行号与可追加物理行不一致，禁止自动追加"
+        elif duplicate_in_excel:
+            missing_message = "标准数据存在但 Excel 主键重复，禁止自动追加"
+        elif formula_append_blocked:
+            missing_message = f"标准记录包含无法由受信任模板重建的公式字段 {unsafe_formula_fields}，禁止自动追加"
+        elif write_append_blocked:
+            missing_message = f"标准记录包含无法由 Excel 数值或日期单元格无损保存的字段 {unsafe_write_fields}，禁止自动追加"
+        else:
+            missing_message = "标准数据存在但 Excel 缺失的记录"
+        if append:
+            missing_rule_id = "missing_record.append"
+        elif formula_append_blocked:
+            missing_rule_id = "missing_record.formula_template_required"
+        elif write_append_blocked:
+            missing_rule_id = (
+                "missing_record.datetime_write_blocked"
+                if unsafe_datetime_fields
+                else "missing_record.numeric_write_blocked"
+            )
+        else:
+            missing_rule_id = None
         difference = _difference(
             DifferenceType.MISSING_RECORD,
             sheet,
-            "标准数据存在但 Excel 主键重复，禁止自动追加" if duplicate_in_excel else "标准数据存在但 Excel 缺失的记录",
+            missing_message,
             excel_row=append_row if append else None,
             business_key=_business_key(key, sheet),
             standard_raw_value=_safe_record(record, rules_by_name),
-            rule_id="missing_record.append" if append else None,
+            rule_id=missing_rule_id,
             render_action="append_row_green" if append else "report_only",
             repair_status="planned" if append else "not_requested",
         )
         differences.append(difference)
         if append:
-            repairs.append(RepairOperation("append_record", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, excel_row=append_row, values=record))
+            write_record = {
+                name: _excel_write_value(parsed_record[name], rule)
+                for name, rule in rules_by_name.items()
+            }
+            repairs.append(RepairOperation("append_record", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, excel_row=append_row, values=write_record))
             append_row += 1
     for key in matched_keys:
         summary.matched_records += 1
@@ -409,13 +575,38 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
             if col_index is None:
                 if not _should_insert_missing(sheet, rule):
                     continue
+                if rule.formula_template is not None:
+                    if name in standard_record:
+                        expected_formula = rule.formula_template.replace("{row}", str(row_number))
+                        if standard_record.get(name) != expected_formula:
+                            differences.append(_difference(
+                                DifferenceType.VALUE_MISMATCH,
+                                sheet,
+                                "标准公式与受信任公式模板在目标行展开后的文本不一致",
+                                excel_row=row_number,
+                                canonical_field=name,
+                                business_key=_business_key(key, sheet),
+                                standard_raw_value=_safe_value(standard_record.get(name), rule),
+                                standard_normalized_value=_safe_value(expected_formula, rule),
+                                rule_id=f"{name}.formula_template_mismatch",
+                                render_action="report_only",
+                            ))
+                    continue
                 right = parse_value(standard_record.get(name), rule)
                 repair_value = None
+                write_value = None
                 repair_rule = None
                 if sheet.actions.fill_empty_from_standard and right.valid and right.normalized is not None:
-                    repair_value, repair_rule = right.raw, f"{name}.fill_empty_from_standard"
+                    if not _excel_write_safe(right, rule):
+                        _append_excel_write_safety_difference(differences, sheet, rule, right, row_number=row_number, key=key)
+                    else:
+                        repair_value, write_value, repair_rule = right.raw, _excel_write_value(right, rule), f"{name}.fill_empty_from_standard"
                 elif rule.fill_static_default:
-                    repair_value, repair_rule = rule.static_default, f"{name}.fill_static_default"
+                    default = parse_value(rule.static_default, rule)
+                    if not _excel_write_safe(default, rule):
+                        _append_excel_write_safety_difference(differences, sheet, rule, default, row_number=row_number, key=key)
+                    else:
+                        repair_value, write_value, repair_rule = rule.static_default, _excel_write_value(default, rule), f"{name}.fill_static_default"
                 if repair_rule is not None:
                     difference = _difference(
                         DifferenceType.NORMALIZED_MATCH,
@@ -431,35 +622,45 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                         repair_status="planned",
                     )
                     differences.append(difference)
-                    repairs.append(RepairOperation("set_field", sheet.id, sheet.name, repair_rule, difference.difference_id, excel_row=row_number, canonical_field=name, value=repair_value))
+                    repairs.append(RepairOperation("set_field", sheet.id, sheet.name, repair_rule, difference.difference_id, excel_row=row_number, canonical_field=name, value=write_value))
                 continue
             rule = rules_by_name[name]
             left_raw = excel_record.get(name)
+            excel_cell_raw = left_raw
             right_raw = standard_record.get(name)
             cell = f"{get_column_letter(col_index)}{row_number}"
-            if isinstance(left_raw, str) and left_raw.startswith("="):
+            # An omitted optional standard field means the source supplied no
+            # authoritative value. Preserve the distinction from an explicit
+            # null/empty value so overwrite_mismatch cannot silently clear data.
+            if name not in standard_record and not (
+                (left_raw is None or left_raw == "") and rule.fill_static_default
+            ):
+                continue
+            left_is_formula = is_formula_text(left_raw)
+            right_is_formula = is_formula_text(right_raw)
+            if rule.compare.formula_mode == "formula" and (left_is_formula or right_is_formula):
+                if not (left_is_formula and right_is_formula and left_raw == right_raw):
+                    differences.append(_difference(
+                        DifferenceType.VALUE_MISMATCH,
+                        sheet,
+                        "公式存在性或公式文本与标准不一致；系统未执行公式",
+                        cell=cell,
+                        excel_row=row_number,
+                        canonical_field=name,
+                        business_key=_business_key(key, sheet),
+                        excel_raw_value=_safe_value(left_raw, rule),
+                        standard_raw_value=_safe_value(right_raw, rule),
+                        rule_id=f"{name}.formula_text",
+                        render_action=sheet.actions.mismatched_value,
+                    ))
+                continue
+            if left_is_formula:
                 if rule.compare.formula_mode == "reject":
-                    continue
-                if rule.compare.formula_mode == "formula":
-                    if left_raw != right_raw:
-                        differences.append(_difference(
-                            DifferenceType.VALUE_MISMATCH,
-                            sheet,
-                            "公式文本与标准公式不一致；系统未执行公式",
-                            cell=cell,
-                            excel_row=row_number,
-                            canonical_field=name,
-                            business_key=_business_key(key, sheet),
-                            excel_raw_value=_safe_value(left_raw, rule),
-                            standard_raw_value=_safe_value(right_raw, rule),
-                            rule_id=f"{name}.formula_text",
-                            render_action=sheet.actions.mismatched_value,
-                        ))
                     continue
                 left_raw = snapshot.cached_values.get(cell)
             if (left_raw is None or left_raw == "") and (right_raw is None or right_raw == "") and not rule.fill_static_default:
                 continue
-            left = parse_value(left_raw, rule)
+            left = parse_excel_value(left_raw, rule, excel_epoch)
             right = parse_value(right_raw, rule)
             if not left.valid:
                 continue
@@ -488,6 +689,22 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 can_fill = left.normalized is None and right.normalized is not None and sheet.actions.fill_empty_from_standard
                 can_overwrite = sheet.actions.overwrite_mismatch
                 repair = can_fill or can_overwrite
+                if repair and left_is_formula:
+                    _append_formula_cached_write_blocked(
+                        differences,
+                        sheet,
+                        rule,
+                        formula_raw=excel_cell_raw,
+                        cached=left,
+                        standard=right,
+                        row_number=row_number,
+                        cell=cell,
+                        key=key,
+                    )
+                    repair = False
+                elif repair and not _excel_write_safe(right, rule):
+                    _append_excel_write_safety_difference(differences, sheet, rule, right, row_number=row_number, cell=cell, key=key)
+                    repair = False
                 repair_rule = f"{name}.fill_empty_from_standard" if can_fill else f"{name}.overwrite_mismatch"
                 difference = _difference(
                     DifferenceType.VALUE_MISMATCH,
@@ -497,7 +714,7 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     excel_row=row_number,
                     canonical_field=name,
                     business_key=_business_key(key, sheet),
-                    excel_raw_value=_safe_value(left.raw, rule),
+                    excel_raw_value=_safe_value(excel_cell_raw, rule),
                     excel_normalized_value=_safe_value(left.normalized, rule),
                     standard_raw_value=_safe_value(right.raw, rule),
                     standard_normalized_value=_safe_value(right.normalized, rule),
@@ -507,8 +724,25 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                 )
                 differences.append(difference)
                 if repair:
-                    repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=right.raw))
+                    repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, repair_rule, difference.difference_id, cell=cell, canonical_field=name, value=_excel_write_value(right, rule)))
             elif left.normalized is None and rule.fill_static_default:
+                default = parse_value(rule.static_default, rule)
+                if left_is_formula:
+                    _append_formula_cached_write_blocked(
+                        differences,
+                        sheet,
+                        rule,
+                        formula_raw=excel_cell_raw,
+                        cached=left,
+                        standard=default,
+                        row_number=row_number,
+                        cell=cell,
+                        key=key,
+                    )
+                    continue
+                if not _excel_write_safe(default, rule):
+                    _append_excel_write_safety_difference(differences, sheet, rule, default, row_number=row_number, cell=cell, key=key)
+                    continue
                 difference = _difference(
                     DifferenceType.NORMALIZED_MATCH,
                     sheet,
@@ -524,13 +758,28 @@ def _compare_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[st
                     repair_status="planned",
                 )
                 differences.append(difference)
-                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=rule.static_default))
+                default_value = _excel_write_value(default, rule)
+                repairs.append(RepairOperation("set_cell", sheet.id, sheet.name, difference.rule_id or "", difference.difference_id, cell=cell, canonical_field=name, value=default_value))
     if isinstance(standard_records, DiskBackedRecordMap):
         standard_records.close()
-    return join_backend, "disk_standard_records" if use_disk_records else "memory_standard_records"
+    return (
+        join_backend,
+        "disk_standard_records" if use_disk_records else "memory_standard_records",
+        len(matched_keys),
+        validated_record_count,
+        formula_target_rows,
+    )
 
 
-def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: dict[str, int], records: dict[tuple[Any, ...], tuple[int, dict[str, Any]]], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:
+def _validate_excel_records(
+    sheet: SheetRule,
+    snapshot: SheetSnapshot,
+    columns: dict[str, int],
+    rules_by_name: dict[str, Any],
+    differences: list[Difference],
+    repairs: list[RepairOperation],
+    excel_epoch: Any,
+) -> int:
     unique_values: dict[str, dict[Any, list[tuple[int, tuple[Any, ...]]]]] = defaultdict(lambda: defaultdict(list))
     cross_fields = {
         value
@@ -538,15 +787,44 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
         for key, value in cross_rule.params.items()
         if key.endswith("_field") and isinstance(value, str)
     }
-    for key, (row_number, record) in records.items():
+    validated_records = 0
+    start_row = sheet.data_region.start_row or sheet.header.row + 1
+    for row_number, values in snapshot.rows[start_row - 1 :]:
+        if row_number in snapshot.hidden_rows and not sheet.data_region.include_hidden_rows:
+            continue
+        record = {
+            name: values[index - 1]
+            for name, index in columns.items()
+            if index <= len(values) and values[index - 1] not in {None, ""}
+        }
+        if not record:
+            continue
+        key, key_valid = _key(record, sheet, rules_by_name, row_number=row_number, excel_epoch=excel_epoch)
+        primary_key_invalid = not key_valid
+        if primary_key_invalid and sheet.empty_primary_key_action == "skip_row":
+            continue
+        validated_records += 1
+        if primary_key_invalid and sheet.empty_primary_key_action == "use_row_number":
+            key = (("row_number_fallback", row_number - start_row + 1),)
+        elif primary_key_invalid:
+            key = tuple()
         parsed_record: dict[str, ParsedValue] = {}
         for name, col_index in columns.items():
+            if primary_key_invalid and name in sheet.primary_key:
+                # EMPTY_PRIMARY_KEY/formula_primary_key already owns the key
+                # failure. Continue validating every non-key field without
+                # emitting a redundant required/parse error for the key cell.
+                continue
             rule = rules_by_name[name]
             raw = record.get(name)
             cell = f"{get_column_letter(col_index)}{row_number}"
             if isinstance(raw, str) and raw.startswith("="):
                 if rule.compare.formula_mode == "formula":
                     parsed_record[name] = ParsedValue(raw, raw, True)
+                    _append_display_format_repair(
+                        sheet, snapshot, rule, differences, repairs,
+                        row_number=row_number, cell=cell, key=key,
+                    )
                     continue
                 if rule.compare.formula_mode == "cached_value":
                     raw = snapshot.cached_values.get(cell)
@@ -557,16 +835,20 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
                 if name in cross_fields:
                     parsed_record[name] = ParsedValue(raw, None, True)
                 continue
-            parsed = parse_value(raw, rule)
+            parsed = parse_excel_value(raw, rule, excel_epoch)
             parsed_record[name] = parsed
             if not parsed.valid:
                 differences.append(_difference(DifferenceType.INVALID_VALUE, sheet, f"Excel 值无法按 {rule.type.value} 解析：{parsed.error}", cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), rule_id=f"{name}.parse", render_action=sheet.actions.invalid_value))
                 continue
+            _append_display_format_repair(
+                sheet, snapshot, rule, differences, repairs,
+                row_number=row_number, cell=cell, key=key,
+            )
             validation_message = _validate(parsed, rule)
             if validation_message:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, validation_message, cell=cell, excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), excel_raw_value=_safe_value(parsed.raw, rule), excel_normalized_value=_safe_value(parsed.normalized, rule), rule_id=f"{name}.validation", render_action=sheet.actions.invalid_value))
             if rule.validation.unique and parsed.normalized is not None:
-                unique_values[name][parsed.normalized].append((row_number, key))
+                unique_values[name][normalized_uniqueness_key(parsed, rule)].append((row_number, key))
         _validate_cross_fields(sheet, columns, row_number, key, parsed_record, rules_by_name, differences)
     for name, values in unique_values.items():
         for _value, occurrences in values.items():
@@ -574,6 +856,51 @@ def _validate_excel_records(sheet: SheetRule, snapshot: SheetSnapshot, columns: 
                 continue
             for row_number, key in occurrences:
                 differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, "字段值不唯一", cell=f"{get_column_letter(columns[name])}{row_number}", excel_row=row_number, canonical_field=name, business_key=_business_key(key, sheet), rule_id=f"{name}.unique", render_action=sheet.actions.invalid_value))
+    return validated_records
+
+
+def _append_display_format_repair(
+    sheet: SheetRule,
+    snapshot: SheetSnapshot,
+    rule: Any,
+    differences: list[Difference],
+    repairs: list[RepairOperation],
+    *,
+    row_number: int,
+    cell: str,
+    key: tuple[Any, ...],
+) -> None:
+    actual_format = snapshot.format_mismatches.get(cell)
+    if actual_format is None or not rule.normalize_display_format or rule.format is None:
+        return
+    difference = _difference(
+        DifferenceType.NORMALIZED_MATCH,
+        sheet,
+        "已授权规范化 Excel 单元格显示格式",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet),
+        excel_raw_value=actual_format,
+        standard_raw_value=rule.format,
+        rule_id=f"{rule.name}.normalize_display_format",
+        severity="info",
+        render_action="set_number_format",
+        repair_status="planned",
+    )
+    differences.append(difference)
+    repairs.append(
+        RepairOperation(
+            "set_number_format",
+            sheet.id,
+            sheet.name,
+            difference.rule_id or "",
+            difference.difference_id,
+            cell=cell,
+            canonical_field=rule.name,
+            value=rule.format,
+        )
+    )
 
 
 def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number: int, key: tuple[Any, ...], parsed: dict[str, ParsedValue], rules_by_name: dict[str, Any], differences: list[Difference]) -> None:
@@ -588,16 +915,20 @@ def _validate_cross_fields(sheet: SheetRule, columns: dict[str, int], row_number
             differences.append(_difference(DifferenceType.VALIDATION_ERROR, sheet, message, cell=f"{get_column_letter(columns[target])}{row_number}", excel_row=row_number, canonical_field=target, business_key=_business_key(key, sheet), rule_id=rule.rule_id, severity=rule.severity, render_action=sheet.actions.invalid_value))
 
 
-def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any], row_number: Any = None) -> tuple[tuple[Any, ...], bool]:
+def _key(record: dict[str, Any], sheet: SheetRule, rules_by_name: dict[str, Any], row_number: Any = None, excel_epoch: Any = None) -> tuple[tuple[Any, ...], bool]:
     if sheet.primary_key_mode == "row_number":
         try:
-            parsed_row = int(row_number)
+            parsed_row = parse_row_number(row_number)
         except (TypeError, ValueError):
             return tuple(), False
-        return (("row_number", parsed_row),), parsed_row >= 1
+        return (("row_number", parsed_row),), True
     values: list[Any] = []
     for name in sheet.primary_key:
-        parsed = parse_value(record.get(name), rules_by_name[name])
+        parsed = (
+            parse_excel_value(record.get(name), rules_by_name[name], excel_epoch)
+            if excel_epoch is not None
+            else parse_value(record.get(name), rules_by_name[name])
+        )
         if not parsed.valid or parsed.normalized is None or parsed.normalized == "":
             return tuple(values), False
         values.append((rules_by_name[name].type.value, parsed.normalized))
@@ -622,6 +953,107 @@ def _safe_value(value: Any, rule: Any) -> Any:
 
 def _safe_record(record: dict[str, Any], rules_by_name: dict[str, Any]) -> dict[str, Any]:
     return {name: _safe_value(value, rules_by_name[name]) if name in rules_by_name else value for name, value in record.items()}
+
+
+def _excel_write_safe(parsed: ParsedValue, rule: Any) -> bool:
+    """Return whether Excel can round-trip the normalized repair value exactly.
+
+    Excel stores numeric cells as IEEE-754 doubles and documents 15 significant
+    decimal digits. Its datetime serial also omits UTC offset and DST fold.
+    Comparison can retain richer semantics, but an authorized repair must not
+    silently round a number, change it to text, or collapse two distinct instants.
+    """
+    if not parsed.valid or parsed.normalized is None:
+        return True
+    if rule.type.value == "datetime":
+        return excel_datetime_write_safe(parsed.normalized, rule.compare.timezone)
+    if rule.type.value not in {"integer", "decimal"}:
+        return True
+    # Formula-mode values are never written as numeric cells. Their safety is
+    # governed by the separate trusted formula-template checks.
+    if rule.compare.formula_mode == "formula" and is_formula_text(parsed.normalized):
+        return True
+    return excel_numeric_write_safe(parsed.normalized)
+
+
+def _append_excel_write_safety_difference(
+    differences: list[Difference] | SpillableSequence[Difference],
+    sheet: SheetRule,
+    rule: Any,
+    parsed: ParsedValue,
+    *,
+    row_number: int | None = None,
+    cell: str | None = None,
+    key: tuple[Any, ...] | None = None,
+) -> None:
+    datetime_unsafe = rule.type.value == "datetime"
+    differences.append(_difference(
+        DifferenceType.UNSUPPORTED_FEATURE,
+        sheet,
+        "标准日期时间处于 DST 重复时段，Excel 数值单元格无法保留 UTC offset，禁止自动写回"
+        if datetime_unsafe
+        else "标准数值超出 Excel 数值单元格可安全往返的 15 位有效数字或指数范围，禁止自动写回",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet) if key else None,
+        standard_raw_value=_safe_value(parsed.raw, rule),
+        standard_normalized_value=_safe_value(parsed.normalized, rule),
+        rule_id=f"{rule.name}.excel_write_timezone" if datetime_unsafe else f"{rule.name}.excel_write_precision",
+        render_action="report_only",
+    ))
+
+
+def _append_formula_cached_write_blocked(
+    differences: list[Difference] | SpillableSequence[Difference],
+    sheet: SheetRule,
+    rule: Any,
+    *,
+    formula_raw: Any,
+    cached: ParsedValue,
+    standard: ParsedValue,
+    row_number: int,
+    cell: str,
+    key: tuple[Any, ...],
+) -> None:
+    differences.append(_difference(
+        DifferenceType.UNSUPPORTED_FEATURE,
+        sheet,
+        "字段使用公式缓存值比较；自动写回会破坏原公式，必须人工确认",
+        cell=cell,
+        excel_row=row_number,
+        canonical_field=rule.name,
+        business_key=_business_key(key, sheet),
+        excel_raw_value=_safe_value(formula_raw, rule),
+        excel_normalized_value=_safe_value(cached.normalized, rule),
+        standard_raw_value=_safe_value(standard.raw, rule),
+        standard_normalized_value=_safe_value(standard.normalized, rule),
+        rule_id=f"{rule.name}.formula_cached_write_blocked",
+        render_action="report_only",
+    ))
+
+
+def _excel_write_value(parsed: ParsedValue, rule: Any) -> Any:
+    """Return a deterministic, type-preserving value for the renderer.
+
+    Reports retain ``parsed.raw`` separately. Repairs must use the same typed
+    normalization that comparison used, otherwise aliases, percentages,
+    booleans and timezone-aware datetimes can be written back as different
+    semantics or as plain text.
+    """
+    if not parsed.valid or parsed.normalized is None:
+        return None
+    if rule.type.value == "decimal":
+        return str(parsed.normalized)
+    if rule.type.value in {"date", "datetime"}:
+        return parsed.normalized.isoformat()
+    if rule.type.value == "set":
+        return rule.separator.join(str(value) for value in parsed.normalized)
+    if rule.type.value == "json":
+        return str(parsed.normalized)
+    if rule.type.value in {"integer", "boolean", "enum"}:
+        return parsed.normalized
+    return parsed.raw
 
 
 def _should_insert_missing(sheet: SheetRule, column: Any) -> bool:

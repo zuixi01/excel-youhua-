@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import os
 import socket
 import time
@@ -15,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .models import StandardSourceConfig
 from .observability import metrics
 from .snapshots import SpilledRecords
+from .source_paths import validate_managed_http_path
+from .strict_serialization import load_json_strict
 
 
 class ManagedConnection(BaseModel):
@@ -56,11 +57,16 @@ class ManagedConnection(BaseModel):
             raise ValueError("auth_prefix cannot contain a line break")
         return value
 
+    @field_validator("allowed_paths")
+    @classmethod
+    def validate_allowed_paths(cls, values: list[str]) -> list[str]:
+        return [validate_managed_http_path(value, field_name="allowed_paths entry") for value in values]
+
 
 class ConnectionRegistry:
     def __init__(self, path: Path) -> None:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        connections = payload.get("connections", payload)
+        payload = load_json_strict(path.read_text(encoding="utf-8"), context="connection registry JSON")
+        connections = payload.get("connections", payload) if isinstance(payload, dict) else payload
         if not isinstance(connections, list):
             raise ValueError("connection registry must contain a connections array")
         parsed = [ManagedConnection.model_validate(item) for item in connections]
@@ -186,7 +192,7 @@ class ManagedHttpSource:
                 metrics.increment("standard_http_response_bytes_total", amount=len(response.content), connection_id=config.connection_id)
                 if len(response.content) > connection.max_response_bytes or total_response_bytes > connection.max_response_bytes:
                     raise ValueError("STANDARD_SOURCE_FAILED: response exceeds configured size")
-                payload = response.json()
+                payload = _strict_json_loads(response.content)
                 page_records = _json_path(payload, config.data_json_path)
                 if isinstance(page_records, dict) and not config.pagination and all(isinstance(items, list) and all(isinstance(item, dict) for item in items) for items in page_records.values()):
                     workbook_records = {str(sheet): items for sheet, items in page_records.items()}
@@ -241,6 +247,21 @@ def _load_secret(reference: str) -> str:
     return secret
 
 
+def _strict_json_loads(content: bytes) -> Any:
+    try:
+        return load_json_strict(
+            content,
+            context="STANDARD_SOURCE_FAILED: response JSON",
+            preserve_decimal=True,
+        )
+    except ValueError as exc:
+        if "duplicate key" in str(exc):
+            raise ValueError("STANDARD_SOURCE_FAILED: response JSON has a duplicate object key") from exc
+        if "non-finite number" in str(exc):
+            raise ValueError(str(exc)) from exc
+        raise ValueError("STANDARD_SOURCE_FAILED: response JSON is malformed") from exc
+
+
 def _request(client: httpx.Client, method: str, url: str, parameters: dict[str, Any], max_bytes: int, sni_hostname: str | None = None) -> tuple[httpx.Response, int]:
     last_error: Exception | None = None
     attempts = 3 if method == "GET" else 1
@@ -272,6 +293,7 @@ def _request(client: httpx.Client, method: str, url: str, parameters: dict[str, 
 
 
 def _validate_target(connection: ManagedConnection, path: str, resolver: Callable[[str], list[str]]) -> list[str]:
+    validate_managed_http_path(path, field_name="standard source path")
     if not any(path == allowed or path.startswith(allowed.rstrip("/") + "/") for allowed in connection.allowed_paths):
         raise ValueError("STANDARD_SOURCE_FAILED: path is not allowed")
     parsed = urlparse(connection.base_url)

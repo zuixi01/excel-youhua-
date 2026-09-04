@@ -1,0 +1,22 @@
+{
+  "category_sheet": {
+    "name": "手机",
+    "headers": ["商品ID", "平台类目ID", "商家类目", "品牌", "颜色", "内部备注"],
+    "rows": [["P-1", "cat-phone", "手机", "某品牌", "黑色、白色", "保留"]],
+    "header_colors": ["DDEBF7", "DDEBF7", "DDEBF7", "E2F0D9", "FFF2CC", "D9D9D9"],
+    "freeze_panes": "A2",
+    "auto_filter": "A1:F2"
+  },
+  "sku_sheet": {
+    "name": "手机-SKU",
+    "headers": ["商品ID", "平台类目ID", "商家类目", "颜色"],
+    "rows": [["P-1", "cat-phone", "手机", "黑色"], ["P-1", "cat-phone", "手机", "白色"]],
+    "header_colors": ["DDEBF7", "DDEBF7", "DDEBF7", "FFF2CC"],
+    "freeze_panes": "A2",
+    "auto_filter": "A1:D3"
+  },
+  "metadata_sheet": {
+    "name": "__ExcelAuditorMetadata",
+    "state": "veryHidden"
+  }
+}

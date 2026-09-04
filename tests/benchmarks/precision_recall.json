@@ -5,50 +5,95 @@
     {"headers": ["编号", "姓名", "手机号"], "expected": {"1": "id", "2": "name", "3": "phone"}},
     {"headers": ["id", "name", "phone"], "expected": {"1": "id", "2": "name", "3": "phone"}},
     {"headers": ["编号", "姓 名", "手机号码"], "expected": {"1": "id"}},
-    {"headers": ["未知字段", "备注"], "expected": {}}
+    {"headers": ["未知字段", "备注"], "expected": {}},
+    {"headers": ["　编号\n", "员工姓名", "手机号"], "expected": {"1": "id", "2": "name", "3": "phone"}},
+    {"headers": ["编号", "id", "姓名", "手机号"], "expected": {"3": "name", "4": "phone"}},
+    {"headers": ["ｉｄ", "name", "phone"], "expected": {"1": "id", "2": "name", "3": "phone"}},
+    {"headers": ["编号", "员工姓名", "手机号", "手机号"], "expected": {"1": "id", "2": "name"}},
+    {"headers": ["编号", "员工 姓名", "手机号"], "expected": {"1": "id", "3": "phone"}}
   ],
-  "record_field_repair_case": {
-    "rule": {
-      "schema_id": "precision-records",
-      "schema_version": "1.0.0",
-      "name": "Manually annotated record benchmark",
-      "sheets": [{
-        "id": "data",
-        "name": "Data",
-        "primary_key": ["id"],
-        "actions": {"overwrite_mismatch": true, "missing_record": "append_and_mark_green"},
-        "columns": [
-          {"name": "id", "title": "ID", "required": true},
-          {"name": "name", "title": "Name"},
-          {"name": "amount", "title": "Amount", "type": "decimal", "compare": {"mode": "numeric"}}
-        ]
-      }]
-    },
-    "excel": {
-      "headers": ["ID", "Name", "Amount"],
-      "rows": [
-        ["E001", "Alice", 10],
-        ["E002", "Bob", 19],
-        ["E003", "Extra", 5]
-      ]
-    },
-    "standard": {
-      "data": [
+  "record_field_repair_cases": [
+    {
+      "name": "basic-record-and-repair",
+      "rule": {
+        "schema_id": "precision-records",
+        "schema_version": "1.0.0",
+        "name": "Manually annotated record benchmark",
+        "sheets": [{
+          "id": "data",
+          "name": "Data",
+          "primary_key": ["id"],
+          "actions": {"overwrite_mismatch": true, "missing_record": "append_and_mark_green"},
+          "columns": [
+            {"name": "id", "title": "ID", "required": true},
+            {"name": "name", "title": "Name"},
+            {"name": "amount", "title": "Amount", "type": "decimal", "compare": {"mode": "numeric"}}
+          ]
+        }]
+      },
+      "excel": {
+        "headers": ["ID", "Name", "Amount"],
+        "rows": [["E001", "Alice", 10], ["E002", "Bob", 19], ["E003", "Extra", 5]]
+      },
+      "standard": {"data": [
         {"id": "E001", "name": "Alice", "amount": 10},
         {"id": "E002", "name": "Bob", "amount": 20},
         {"id": "E004", "name": "Missing", "amount": 30}
-      ]
+      ]},
+      "expected_record_labels": [["EXTRA_RECORD", "E003"], ["MISSING_RECORD", "E004"]],
+      "expected_field_labels": [["VALUE_MISMATCH", "E002", "amount"]],
+      "expected_repair_labels": [["set_cell", "E002", "amount"], ["append_record", "E004", null]]
     },
-    "expected_record_labels": [
-      ["EXTRA_RECORD", "E003"],
-      ["MISSING_RECORD", "E004"]
-    ],
-    "expected_field_labels": [
-      ["VALUE_MISMATCH", "E002", "amount"]
-    ],
-    "expected_repair_labels": [
-      ["set_cell", "E002", "amount"],
-      ["append_record", "E004", null]
-    ]
-  }
+    {
+      "name": "typed-adversarial-values",
+      "rule": {
+        "schema_id": "precision-typed",
+        "schema_version": "1.0.0",
+        "name": "Manually annotated typed benchmark",
+        "sheets": [{
+          "id": "data",
+          "name": "Data",
+          "primary_key": ["id"],
+          "actions": {"overwrite_mismatch": true},
+          "columns": [
+            {"name": "id", "title": "ID", "required": true},
+            {"name": "code", "title": "Code", "normalize": ["trim", "unicode_nfkc", "uppercase"]},
+            {"name": "amount", "title": "Amount", "type": "decimal", "normalize": ["trim", "remove_group_separator", "remove_currency_symbol"], "compare": {"mode": "numeric", "absolute_tolerance": "0.01"}},
+            {"name": "business_date", "title": "Date", "type": "date", "compare": {"mode": "date"}},
+            {"name": "event_time", "title": "Time", "type": "datetime", "compare": {"mode": "datetime", "timezone": "Asia/Shanghai", "precision": "minute"}},
+            {"name": "enabled", "title": "Enabled", "type": "boolean"},
+            {"name": "status", "title": "Status", "type": "enum", "enum_values": ["Active", "Disabled"], "compare": {"mode": "ignore_case"}},
+            {"name": "tags", "title": "Tags", "type": "set", "compare": {"mode": "set"}},
+            {"name": "payload", "title": "Payload", "type": "json", "compare": {"mode": "json"}}
+          ]
+        }]
+      },
+      "excel": {
+        "headers": ["ID", "Code", "Amount", "Date", "Time", "Enabled", "Status", "Tags", "Payload"],
+        "rows": [
+          ["E001", "  ａｂｃ ", "$1,000.004", "2026/08/29", "2026-08-29T10:30:59+08:00", "YES", "active", " B,A,A ", "{\"b\":2,\"a\":1}"],
+          ["E002", "XYZ", "10", "not-a-date", "2026-08-29T10:30:00+08:00", "yes", "unknown", "A,B", "{\"a\":1}"]
+        ]
+      },
+      "standard": {"data": [
+        {"id": "E001", "code": "ABC", "amount": "1000.00", "business_date": "2026-08-29", "event_time": "2026-08-29T02:30:01Z", "enabled": true, "status": "Active", "tags": "A,B", "payload": {"a": 1, "b": 2}},
+        {"id": "E002", "code": "XYZ", "amount": "12", "business_date": "2026-08-29", "event_time": "2026-08-29T02:30:01Z", "enabled": false, "status": "Active", "tags": "A,C", "payload": {"a": 2}}
+      ]},
+      "expected_record_labels": [],
+      "expected_field_labels": [
+        ["VALUE_MISMATCH", "E002", "amount"],
+        ["INVALID_VALUE", "E002", "business_date"],
+        ["VALUE_MISMATCH", "E002", "enabled"],
+        ["INVALID_VALUE", "E002", "status"],
+        ["VALUE_MISMATCH", "E002", "tags"],
+        ["VALUE_MISMATCH", "E002", "payload"]
+      ],
+      "expected_repair_labels": [
+        ["set_cell", "E002", "amount"],
+        ["set_cell", "E002", "enabled"],
+        ["set_cell", "E002", "tags"],
+        ["set_cell", "E002", "payload"]
+      ]
+    }
+  ]
 }

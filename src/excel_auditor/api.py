@@ -7,6 +7,7 @@ import uuid
 import tempfile
 import yaml
 from pathlib import Path
+from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -16,7 +17,7 @@ from pydantic import BaseModel, ValidationError
 from .models import DifferenceType, RuleSet
 from .engine import compare_workbook
 from .workbook import inspect_workbook
-from .rules import DraftRegistry, RuleRegistry
+from .rules import DraftRegistry, RuleRegistry, parse_rule_document
 from .service import AuditService
 from .standard_sources import ConnectionRegistry, ManagedHttpSource
 from .persistence import DatabaseRepository
@@ -24,6 +25,9 @@ from .queueing import RedisJobQueue
 from .storage import S3ArtifactStore
 from .rendering import DotNetOpenXmlRenderer
 from .observability import configure_logging, metrics
+from .strict_serialization import dump_json_exact, load_json_strict
+from .product_workflow import ManagedHttpCatalogAdapter, ProductReviewDecision
+from .product_workflow.service import ProductWorkflowService
 
 
 DATA_ROOT = Path(os.environ.get("EXCEL_AUDITOR_DATA", "var")).resolve()
@@ -35,6 +39,7 @@ database = DatabaseRepository(database_url, create_schema=os.environ.get("EXCEL_
 s3_bucket = os.environ.get("S3_BUCKET")
 artifact_store = S3ArtifactStore(s3_bucket, os.environ.get("S3_ENDPOINT_URL"), os.environ.get("AWS_REGION"), os.environ.get("S3_SERVER_SIDE_ENCRYPTION", "AES256")) if s3_bucket else None
 service = AuditService(DATA_ROOT, managed_http=managed_http, database=database, artifact_store=artifact_store)
+product_service = ProductWorkflowService(service, database)
 redis_url = os.environ.get("REDIS_URL")
 task_queue = RedisJobQueue(redis_url) if redis_url else None
 app = FastAPI(title="Excel Standard Auditor", version="0.1.0")
@@ -166,7 +171,7 @@ async def precheck_workbook(
         try:
             comparison = compare_workbook(workbook, {sheet.id: [] for sheet in rules.sheets}, rules)
             header_types = {
-                DifferenceType.MISSING_SHEET, DifferenceType.EXTRA_SHEET, DifferenceType.HEADER_NOT_FOUND,
+                DifferenceType.MISSING_SHEET, DifferenceType.EXTRA_SHEET, DifferenceType.AMBIGUOUS_SHEET, DifferenceType.HEADER_NOT_FOUND,
                 DifferenceType.MISSING_HEADER, DifferenceType.EXTRA_HEADER, DifferenceType.DUPLICATE_HEADER,
                 DifferenceType.AMBIGUOUS_HEADER, DifferenceType.HEADER_ORDER_MISMATCH,
             }
@@ -203,14 +208,11 @@ async def import_schema(request: Request, file: UploadFile = File(...)) -> dict:
         raise HTTPException(413, "RULE_CONFIG_INVALID: import exceeds 1 MiB")
     suffix = Path(file.filename or "rules.json").suffix.lower()
     try:
-        if suffix in {".yaml", ".yml"}:
-            payload = yaml.safe_load(content.decode("utf-8-sig"))
-        elif suffix == ".json":
-            payload = json.loads(content.decode("utf-8-sig"))
-        else:
+        if suffix not in {".yaml", ".yml", ".json"}:
             raise HTTPException(415, "RULE_CONFIG_INVALID: only JSON and YAML are supported")
+        payload = parse_rule_document(content.decode("utf-8-sig"), suffix)
         rules = RuleSet.model_validate(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError, ValidationError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
         raise HTTPException(422, "RULE_CONFIG_INVALID: uploaded rule document is invalid") from exc
     return _draft_registry(request).create(rules.schema_id, rules.model_dump(mode="json"))
 
@@ -348,10 +350,10 @@ async def create_comparison(
     if len(excel_content) > excel_limit:
         raise HTTPException(413, "FILE_LIMIT_EXCEEDED")
     try:
-        parsed_parameters = json.loads(parameters)
+        parsed_parameters = load_json_strict(parameters, context="task parameters JSON")
         if not isinstance(parsed_parameters, dict):
             raise ValueError
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise HTTPException(422, "parameters must be a JSON object") from exc
     excel_suffix = Path(excel_file.filename or "input.xlsx").suffix.lower()
     if excel_suffix not in {".xlsx", ".xlsm"}:
@@ -372,12 +374,23 @@ async def create_comparison(
         if len(encoded) > rules.workbook.max_standard_upload_mib * 1024 * 1024:
             raise HTTPException(413, "STANDARD_DATA_INVALID: payload too large")
         try:
-            inline_payload = json.loads(standard_json)
-        except json.JSONDecodeError as exc:
+            inline_payload = load_json_strict(
+                standard_json,
+                context="inline standard JSON",
+                preserve_decimal=True,
+            )
+        except ValueError as exc:
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json is not valid JSON") from exc
         if not isinstance(inline_payload, (dict, list)):
             raise HTTPException(422, "STANDARD_DATA_INVALID: standard_json root must be an object or array")
-        standard_content = json.dumps(inline_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        # Canonicalize the inline payload for idempotency while retaining exact
+        # Decimal text. The staged JSON parser accepts decimal strings, and the
+        # immutable snapshot uses the same representation.
+        standard_content = dump_json_exact(
+            inline_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
         standard_suffix = ".json"
     elif rules.standard_source.type != "managed_http":
         raise HTTPException(422, "standard_data is required for upload-based rules")
@@ -424,6 +437,214 @@ async def create_comparison(
     finally:
         if staged_standard_path is not None:
             staged_standard_path.unlink(missing_ok=True)
+
+
+@app.post("/api/v1/product-normalizations", status_code=202)
+async def create_product_normalization(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    excel_file: UploadFile = File(...),
+    schema_id: str = Form(...),
+    schema_version: str = Form(...),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        rules = _get_rule(request, schema_id, schema_version)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if rules.product_workflow is None:
+        raise HTTPException(422, "RULE_CONFIG_INVALID: product_workflow is not configured")
+    _validate_connection_reference(rules)
+    if managed_http is None:
+        raise HTTPException(422, "RULE_CONFIG_INVALID: managed connection registry is unavailable")
+    suffix = Path(excel_file.filename or "input.xlsx").suffix.lower()
+    if suffix.lstrip(".") not in rules.workbook.allowed_extensions:
+        raise HTTPException(415, "FILE_UNSUPPORTED_FORMAT")
+    limit = rules.workbook.max_upload_mib * 1024 * 1024
+    content = await excel_file.read(limit + 1)
+    if len(content) > limit:
+        raise HTTPException(413, "FILE_LIMIT_EXCEEDED")
+    fingerprint = hashlib.sha256()
+    fingerprint.update(b"product-normalization\0")
+    fingerprint.update(rules.content_sha256.encode("ascii"))
+    fingerprint.update(suffix.encode("ascii"))
+    fingerprint.update(content)
+    try:
+        job_id, replayed = service.create_or_get_job(
+            idempotency_key,
+            fingerprint.hexdigest(),
+            request.state.tenant_id,
+            request.state.user_id,
+            request.state.trace_id,
+        )
+        if replayed:
+            return JSONResponse(status_code=200, content={**service.status(job_id), "idempotent_replay": True})
+        directory = service.job_directory(job_id)
+        service.record_input_metadata(job_id, excel_file.filename or f"upload{suffix}", len(content))
+        path = directory / f"product-input{suffix}"
+        path.write_bytes(content)
+        adapter = ManagedHttpCatalogAdapter(managed_http, rules.product_workflow)
+        if task_queue:
+            try:
+                task_queue.enqueue_product(
+                    DATA_ROOT,
+                    job_id,
+                    path,
+                    rules,
+                    request.state.tenant_id,
+                    request.state.user_id,
+                )
+            except Exception as exc:
+                raise HTTPException(503, "task queue is unavailable") from exc
+        else:
+            background_tasks.add_task(
+                product_service.run,
+                job_id,
+                path,
+                rules,
+                adapter,
+                tenant_id=request.state.tenant_id,
+                actor_id=request.state.user_id,
+            )
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "workflow": "product_normalization",
+            "schema_id": schema_id,
+            "schema_version": schema_version,
+        }
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(429 if "TENANT_QUOTA_EXCEEDED" in str(exc) else 422, str(exc)) from exc
+
+
+@app.get("/api/v1/product-normalizations/{job_id}/reviews")
+def list_product_reviews(
+    job_id: str,
+    request: Request,
+    status: str | None = Query(default=None, pattern="^(pending|resolved)$"),
+) -> dict[str, Any]:
+    _authorize_job(request, job_id)
+    try:
+        items = product_service.list_reviews(
+            job_id,
+            tenant_id=request.state.tenant_id,
+            status=status,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/v1/product-normalizations/{job_id}/issues")
+def list_product_issues(
+    job_id: str,
+    request: Request,
+    issue_type: str | None = None,
+    category_id: str | None = None,
+    field_id: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    _authorize_job(request, job_id)
+    try:
+        path = service.artifact(job_id, "product_issues")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    start = (page - 1) * page_size
+    stop = start + page_size
+    total = 0
+    items: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if issue_type and item.get("issue_type") != issue_type:
+                continue
+            if category_id and item.get("category_id") != category_id:
+                continue
+            if field_id and item.get("field_id") != field_id:
+                continue
+            if start <= total < stop:
+                items.append(item)
+            total += 1
+    return {"items": items, "page": page, "page_size": page_size, "total": total}
+
+
+@app.post("/api/v1/product-normalizations/{job_id}/reviews/{review_id}/decision")
+def decide_product_review(
+    job_id: str,
+    review_id: str,
+    payload: ProductReviewDecision,
+    request: Request,
+) -> dict[str, Any]:
+    _authorize_job(request, job_id)
+    try:
+        return product_service.decide_review(
+            job_id,
+            review_id,
+            payload,
+            tenant_id=request.state.tenant_id,
+            actor_id=request.state.user_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/v1/product-normalizations/{job_id}/revisions", status_code=202)
+def create_product_revision(
+    job_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    current = _authorize_job(request, job_id)
+    if current.get("workflow") != "product_normalization":
+        raise HTTPException(409, "job is not a product-normalization workflow")
+    if current.get("status") != "review_resolved":
+        raise HTTPException(409, "product revision is not ready to be queued")
+    try:
+        reviews = product_service.list_reviews(job_id, tenant_id=request.state.tenant_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if any(review.get("status") != "resolved" for review in reviews):
+        raise HTTPException(409, "all review items must be resolved before creating a revision")
+    if any((review.get("decision") or {}).get("action") == "reject" for review in reviews):
+        raise HTTPException(409, "rejected review items must be corrected before creating a revision")
+    try:
+        rules = _get_rule(request, str(current["schema_id"]), str(current["schema_version"]))
+    except (KeyError, FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "the workflow rule version is unavailable") from exc
+    service._write_status(job_id, {**current, "status": "revision_queued", "progress": 0})
+    if task_queue:
+        try:
+            task_queue.enqueue_product_revision(
+                DATA_ROOT,
+                job_id,
+                rules,
+                request.state.tenant_id,
+                request.state.user_id,
+                int(current.get("revision_number", 0)),
+            )
+        except Exception as exc:
+            service._write_status(job_id, current)
+            raise HTTPException(503, "task queue is unavailable") from exc
+    else:
+        background_tasks.add_task(
+            product_service.rerun_after_reviews_safe,
+            job_id,
+            rules,
+            tenant_id=request.state.tenant_id,
+            actor_id=request.state.user_id,
+        )
+    return {
+        "job_id": job_id,
+        "status": "revision_queued",
+        "parent_revision_id": current.get("revision_id"),
+    }
 
 
 @app.post("/api/v1/comparisons/{job_id}/cancel", status_code=202)
@@ -515,7 +736,7 @@ def get_artifact(job_id: str, artifact: str, request: Request):
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     excel_media = "application/vnd.ms-excel.sheet.macroEnabled.12" if path.suffix.lower() == ".xlsm" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    media = {"excel": excel_media, "json": "application/json", "differences_jsonl": "application/x-ndjson", "html": "text/html", "manifest": "application/json"}[artifact]
+    media = {"excel": excel_media, "json": "application/json", "differences_jsonl": "application/x-ndjson", "html": "text/html", "manifest": "application/json", "product_result": "application/json", "product_excel": excel_media, "product_manifest": "application/json"}[artifact]
     if database:
         database.audit("comparison.artifact_downloaded", "comparison_job", job_id, request.state.user_id, {"artifact": artifact}, request.state.tenant_id)
     return FileResponse(path, media_type=media, filename=path.name)
@@ -601,14 +822,20 @@ def _get_rule(request: Request, schema_id: str, version: str) -> RuleSet:
 
 def _validate_connection_reference(rules: RuleSet) -> None:
     source = rules.standard_source
-    if source.type != "managed_http":
+    required_ids = []
+    if source.type == "managed_http":
+        required_ids.append(source.connection_id or "")
+    if rules.product_workflow is not None:
+        required_ids.append(rules.product_workflow.catalog_connection_id)
+    if not required_ids:
         return
     if managed_http is None:
         raise HTTPException(422, "RULE_CONFIG_INVALID: managed connection registry is unavailable")
-    try:
-        managed_http.registry.get(source.connection_id or "")
-    except KeyError as exc:
-        raise HTTPException(422, f"RULE_CONFIG_INVALID: {exc}") from exc
+    for connection_id in required_ids:
+        try:
+            managed_http.registry.get(connection_id)
+        except KeyError as exc:
+            raise HTTPException(422, f"RULE_CONFIG_INVALID: {exc}") from exc
 
 
 def run() -> None:

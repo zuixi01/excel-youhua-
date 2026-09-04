@@ -6,14 +6,17 @@ import re
 import tempfile
 import zipfile
 from array import array
+from collections import Counter
+from datetime import datetime
 from xml.parsers import expat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, overload
 
 from openpyxl import load_workbook
+from openpyxl.utils.datetime import WINDOWS_EPOCH
 
-from .models import RuleSet
+from .models import RuleSet, SheetRule, normalize_header
 
 
 UNSUPPORTED_PACKAGE_FEATURES = frozenset(
@@ -40,6 +43,8 @@ UNSUPPORTED_SHEET_FEATURES = frozenset(
         "large_mode_hidden_row_filter_unavailable",
     }
 )
+
+AUTO_HEADER_SCAN_ROWS = 50
 
 
 class WorkbookSafetyError(ValueError):
@@ -88,6 +93,7 @@ class SheetSnapshot:
     hidden_rows: set[int] = field(default_factory=set)
     risky_features: list[str] = field(default_factory=list)
     cached_values: dict[str, Any] = field(default_factory=dict)
+    format_mismatches: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,12 +105,39 @@ class WorkbookSnapshot:
     manual_review_reasons: list[str] = field(default_factory=list)
     large_mode: bool = False
     report_only: bool = False
+    excel_epoch: datetime = WINDOWS_EPOCH
 
     def close(self) -> None:
         for sheet in self.sheets.values():
             close = getattr(sheet.rows, "close", None)
             if close is not None:
                 close()
+
+
+def locate_header_row(sheet: SheetRule, snapshot: SheetSnapshot) -> tuple[int, str | None]:
+    """Resolve one header row for both safety inspection and comparison."""
+    if not sheet.header.auto_detect:
+        if sheet.header.row > len(snapshot.rows):
+            return sheet.header.row, f"指定表头行 {sheet.header.row} 超出工作表范围"
+        return sheet.header.row, None
+    exact: dict[str, str] = {}
+    for column in sheet.columns:
+        for candidate in [column.name, column.title, *column.aliases]:
+            exact[normalize_header(candidate)] = column.name
+    candidates: list[tuple[int, int]] = []
+    for row_number, values in snapshot.rows[:AUTO_HEADER_SCAN_ROWS]:
+        matched = {exact[value] for value in map(normalize_header, values) if value in exact}
+        if (sheet.primary_key_mode == "fields" and set(sheet.primary_key) <= matched) or (
+            sheet.primary_key_mode == "row_number" and matched
+        ):
+            candidates.append((len(matched), row_number))
+    if not candidates:
+        return sheet.header.row, "未找到包含完整主键的候选表头行"
+    best_score = max(score for score, _row in candidates)
+    best_rows = [row for score, row in candidates if score == best_score]
+    if len(best_rows) != 1:
+        return best_rows[0], f"表头自动定位存在并列候选行：{best_rows}"
+    return best_rows[0], None
 
 
 def sha256_file(path: Path) -> str:
@@ -126,6 +159,7 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         raise WorkbookSafetyError("FILE_CORRUPTED")
     package_warnings: list[str] = []
     package_sheet_features: set[str] = set()
+    package_sheet_bounds: dict[str, tuple[int, int]] = {}
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         if len(infos) > 10_000:
@@ -151,7 +185,10 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             "external_links": any(name.startswith("xl/externallinks/") for name in names),
             "external_connections": "xl/connections.xml" in names,
             "pivot_tables": any(name.startswith("xl/pivottables/") for name in names),
-            "drawings": any(name.startswith("xl/drawings/") for name in names),
+            # Legacy VML Note drawings are the storage mechanism for ordinary
+            # cell comments and are assessed separately by legacy_controls.
+            # Only DrawingML worksheet drawing parts are unsafe here.
+            "drawings": any(name.startswith("xl/drawings/") and name.endswith(".xml") for name in names),
             "embedded_objects": any(name.startswith("xl/embeddings/") for name in names),
             "activex_controls": any(name.startswith("xl/activex/") for name in names),
             "legacy_controls": any(name.endswith(".vml") and _vml_has_controls(archive, info) for name, info in ((item.filename.lower(), item) for item in infos)),
@@ -168,15 +205,33 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             if info.filename.lower().endswith((".xml", ".rels")):
                 _validate_xml_part(archive, info)
             if info.filename.lower().startswith("xl/worksheets/") and info.filename.lower().endswith(".xml"):
-                package_sheet_features.update(_detect_sheet_xml_features(archive, info))
+                features, bounds = _inspect_sheet_xml_structure(archive, info)
+                package_sheet_features.update(features)
+                package_sheet_bounds[info.filename.replace("\\", "/").casefold()] = bounds
     try:
         probe = load_workbook(path, read_only=True, data_only=False, keep_links=False, keep_vba=path.suffix.lower() == ".xlsm")
-        large_mode = any(
-            sheet.max_row is None
-            or sheet.max_column is None
-            or sheet.max_row * sheet.max_column > max_in_memory_cells
-            for sheet in probe.worksheets
+        effective_bounds: list[tuple[int | None, int | None]] = []
+        for sheet in probe.worksheets:
+            worksheet_path = str(getattr(sheet, "_worksheet_path", "")).replace("\\", "/").casefold()
+            observed = package_sheet_bounds.get(worksheet_path)
+            effective_bounds.append((
+                sheet.max_row if sheet.max_row is not None else (observed[0] if observed is not None else None),
+                sheet.max_column if sheet.max_column is not None else (observed[1] if observed is not None else None),
+            ))
+        # Never call ReadOnlyWorksheet.calculate_dimension here: it performs a
+        # complete first parse and small workbooks are then parsed a second time
+        # by the normal loader.  The package scan above already obtains actual
+        # sparse bounds while inventorying structural features.
+        has_unknown_bounds = any(
+            row_count is None or column_count is None
+            for row_count, column_count in effective_bounds
         )
+        total_cells = sum(
+            row_count * column_count
+            for row_count, column_count in effective_bounds
+            if row_count is not None and column_count is not None
+        )
+        large_mode = has_unknown_bounds or total_cells > max_in_memory_cells
         if large_mode and rules.workbook.large_file_action == "reject":
             probe.close()
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED: workbook requires large-file report mode")
@@ -198,11 +253,21 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
     if len(book.worksheets) > rules.workbook.max_worksheets:
         book.close()
         raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED: workbook has more than 50 worksheets")
-    if rules.workbook.reject_protected and book.security.lockStructure:
+    if rules.workbook.reject_protected and getattr(getattr(book, "security", None), "lockStructure", False):
         raise WorkbookSafetyError("WORKBOOK_PROTECTED")
     for sheet in book.worksheets:
         matching_rule = sheet_rule_for_name(rules, sheet.title)
-        row_limit = rules.workbook.max_rows_per_sheet + matching_rule.header.row
+        configured_data_start = matching_rule.data_region.start_row
+        if configured_data_start is not None:
+            preliminary_data_start = configured_data_start
+        elif matching_rule.header.auto_detect:
+            # Header discovery is bounded to the first 50 rows. Permit that
+            # bounded prefix while reading, then enforce the exact limit once
+            # the physical header row has been resolved below.
+            preliminary_data_start = AUTO_HEADER_SCAN_ROWS + 1
+        else:
+            preliminary_data_start = matching_rule.header.row + 1
+        row_limit = rules.workbook.max_rows_per_sheet + preliminary_data_start - 1
         max_row, max_column = sheet.max_row, sheet.max_column
         if (max_row is not None and max_row > row_limit) or (max_column is not None and max_column > rules.workbook.max_columns_per_sheet):
             raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")
@@ -219,11 +284,6 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             risky.append("protected_sheet")
         if not large_mode and sheet.merged_cells.ranges:
             risky.append("merged_cells")
-            if any(
-                merged.min_row <= matching_rule.header.row <= merged.max_row
-                for merged in sheet.merged_cells.ranges
-            ):
-                risky.append("merged_header")
         if not large_mode and sheet.tables:
             risky.append("excel_tables")
         if not large_mode and sheet.data_validations.count:
@@ -259,13 +319,44 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
             rows.append((row_index, values))
         max_row = len(rows)
         max_column = observed_max_column if rows else 0
+        inspection_snapshot = SheetSnapshot(sheet.title, max_row, max_column, rows, set(), risky)
+        resolved_header_row, _header_problem = locate_header_row(matching_rule, inspection_snapshot)
+        actual_data_start = configured_data_start or resolved_header_row + 1
+        actual_row_limit = rules.workbook.max_rows_per_sheet + actual_data_start - 1
+        if max_row > actual_row_limit:
+            close_rows = getattr(rows, "close", None)
+            if close_rows is not None:
+                close_rows()
+            for existing_snapshot in snapshots.values():
+                close_existing_rows = getattr(existing_snapshot.rows, "close", None)
+                if close_existing_rows is not None:
+                    close_existing_rows()
+            book.close()
+            raise WorkbookSafetyError("FILE_LIMIT_EXCEEDED")
+        format_mismatches: dict[str, str] = {}
+        format_targets = _format_normalization_targets(
+            matching_rule,
+            rows[resolved_header_row - 1][1] if len(rows) >= resolved_header_row else [],
+        )
+        if large_mode and format_targets:
+            warnings.append(f"{sheet.title}: format_normalization_skipped_large_mode")
+        elif format_targets:
+            for row_index in range(actual_data_start, max_row + 1):
+                for column_index, expected_format in format_targets.items():
+                    cell = sheet.cell(row_index, column_index)
+                    if cell.value not in {None, ""} and cell.number_format != expected_format:
+                        format_mismatches[cell.coordinate] = cell.number_format
+        if not large_mode and sheet.merged_cells.ranges and any(
+            merged.min_row <= resolved_header_row <= merged.max_row
+            for merged in sheet.merged_cells.ranges
+        ):
+            risky.append("merged_header")
         if has_comments:
             risky.append("existing_comments")
         if has_formulas:
             warnings.append(f"{sheet.title}: formulas_present_not_calculated")
-            header_values = rows[matching_rule.header.row - 1][1] if len(rows) >= matching_rule.header.row else []
+            header_values = rows[resolved_header_row - 1][1] if len(rows) >= resolved_header_row else []
             rule_by_header: dict[str, Any] = {}
-            from .models import normalize_header
 
             for column_rule in matching_rule.columns:
                 for candidate in [column_rule.name, column_rule.title, *column_rule.aliases]:
@@ -283,13 +374,22 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         hidden_rows = set() if large_mode else {index for index, dimension in sheet.row_dimensions.items() if dimension.hidden}
         if large_mode and not matching_rule.data_region.include_hidden_rows:
             risky.append("large_mode_hidden_row_filter_unavailable")
-        snapshots[sheet.title] = SheetSnapshot(sheet.title, max_row, max_column, rows, hidden_rows, risky)
+        snapshots[sheet.title] = SheetSnapshot(
+            sheet.title,
+            max_row,
+            max_column,
+            rows,
+            hidden_rows,
+            risky,
+            format_mismatches=format_mismatches,
+        )
         warnings.extend(f"{sheet.title}: {feature}" for feature in risky)
         manual_review_reasons.extend(
             f"{sheet.title}: {feature}"
             for feature in risky
             if feature in UNSUPPORTED_SHEET_FEATURES
         )
+    excel_epoch = book.epoch
     book.close()
     if cached_value_requests:
         cached_book = load_workbook(path, read_only=True, data_only=True, keep_links=False, keep_vba=path.suffix.lower() == ".xlsm")
@@ -311,46 +411,178 @@ def inspect_workbook(path: Path, rules: RuleSet, max_size: int | None = None, ma
         cached_book.close()
     if large_mode:
         warnings.append("workbook: large_file_report_only")
-    return WorkbookSnapshot(path, sha256_file(path), snapshots, warnings, manual_review_reasons, large_mode, large_mode)
+    return WorkbookSnapshot(
+        path,
+        sha256_file(path),
+        snapshots,
+        warnings,
+        manual_review_reasons,
+        large_mode,
+        large_mode,
+        excel_epoch,
+    )
 
 
 def sheet_rule_for_name(rules: RuleSet, name: str) -> Any:
-    return next((sheet for sheet in rules.sheets if name in {sheet.name, *sheet.aliases}), rules.sheets[0])
+    folded_name = name.casefold()
+    return next(
+        (sheet for sheet in rules.sheets if folded_name in {candidate.casefold() for candidate in [sheet.name, *sheet.aliases]}),
+        rules.sheets[0],
+    )
 
 
-def _detect_sheet_xml_features(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> set[str]:
-    markers = {
-        b"<mergecells": "merged_cells",
-        b"<datavalidations": "data_validations",
-        b"<autofilter": "auto_filter",
-        b"<sheetprotection": "protected_sheet",
-        b"<conditionalformatting": "conditional_formatting",
-        b"<f t=\"shared\"": "shared_formulas",
-        b"<f t=\"array\"": "array_formulas",
-        b"<hyperlink": "internal_or_external_hyperlinks",
-        b"<sortstate": "sort_state",
-        b"<filtercolumn": "filter_columns",
+def _format_normalization_targets(sheet: SheetRule, header_values: list[Any]) -> dict[int, str]:
+    """Return unambiguous physical columns explicitly authorized for style repair."""
+    normalized_values = [normalize_header(value) for value in header_values]
+    duplicate_headers = {
+        value
+        for value, count in Counter(value for value in normalized_values if value).items()
+        if count > 1
+    }
+    exact: dict[str, Any] = {}
+    for column in sheet.columns:
+        for candidate in [column.name, column.title, *column.aliases]:
+            exact.setdefault(normalize_header(candidate), column)
+    candidates: list[tuple[int, Any]] = []
+    for index, normalized in enumerate(normalized_values, start=1):
+        column = exact.get(normalized)
+        if (
+            normalized
+            and normalized not in duplicate_headers
+            and column is not None
+            and column.normalize_display_format
+            and column.format is not None
+        ):
+            candidates.append((index, column))
+    canonical_counts = Counter(column.name for _index, column in candidates)
+    return {
+        index: str(column.format)
+        for index, column in candidates
+        if canonical_counts[column.name] == 1
+    }
+
+
+def _inspect_sheet_xml_structure(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+) -> tuple[set[str], tuple[int, int]]:
+    """Inventory structural tags and actual sparse bounds in one streaming pass."""
+    element_features = {
+        "mergecells": "merged_cells",
+        "datavalidations": "data_validations",
+        "autofilter": "auto_filter",
+        "sheetprotection": "protected_sheet",
+        "conditionalformatting": "conditional_formatting",
+        "hyperlink": "internal_or_external_hyperlinks",
+        "sortstate": "sort_state",
+        "filtercolumn": "filter_columns",
     }
     found: set[str] = set()
-    tail = b""
-    with archive.open(info) as handle:
-        while chunk := handle.read(256 * 1024):
-            data = (tail + chunk).lower()
-            for marker, feature in markers.items():
-                if marker in data:
-                    found.add(feature)
-            tail = data[-64:]
-            if len(found) == len(markers):
-                break
-    return found
+    max_row = 0
+    max_column = 0
+    current_row = 0
+    current_column = 0
+
+    def local_name(name: str) -> str:
+        return name.rsplit("}", 1)[-1].rsplit(":", 1)[-1].casefold()
+
+    def local_attributes(attributes: dict[str, str]) -> dict[str, str]:
+        return {local_name(key): value for key, value in attributes.items()}
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal current_row, current_column, max_row, max_column
+        element = local_name(name)
+        feature = element_features.get(element)
+        if feature is not None:
+            found.add(feature)
+        attrs = local_attributes(attributes)
+        if element == "f":
+            formula_type = attrs.get("t", "").casefold()
+            if formula_type == "shared":
+                found.add("shared_formulas")
+            elif formula_type == "array":
+                found.add("array_formulas")
+        elif element == "row":
+            try:
+                current_row = int(attrs.get("r", ""))
+            except ValueError:
+                current_row += 1
+            current_column = 0
+            max_row = max(max_row, current_row)
+        elif element == "c":
+            reference = attrs.get("r", "")
+            match = re.fullmatch(r"([A-Za-z]{1,3})([1-9][0-9]*)", reference)
+            if match is not None:
+                column_number = _column_number(match.group(1))
+                row_number = int(match.group(2))
+                current_column = column_number
+                current_row = row_number
+            else:
+                current_column += 1
+                row_number = current_row
+                column_number = current_column
+            max_row = max(max_row, row_number)
+            max_column = max(max_column, column_number)
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.StartElementHandler = start_element
+    parser.ExternalEntityRefHandler = lambda *_arguments: 0
+    try:
+        with archive.open(info) as handle:
+            while chunk := handle.read(256 * 1024):
+                parser.Parse(chunk, False)
+            parser.Parse(b"", True)
+    except expat.ExpatError as exc:
+        raise WorkbookSafetyError(f"FILE_CORRUPTED: invalid XML part {info.filename}") from exc
+    return found, (max_row, max_column)
+
+
+def _column_number(letters: str) -> int:
+    result = 0
+    for character in letters.upper():
+        result = result * 26 + ord(character) - 64
+    return result
 
 
 def _vml_has_controls(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+    shape_count = 0
+    note_count = 0
+    unsafe = False
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal shape_count, note_count, unsafe
+        local_name = name.rsplit(":", 1)[-1].casefold()
+        if local_name == "shape":
+            shape_count += 1
+        elif local_name == "macro":
+            unsafe = True
+        elif local_name == "clientdata":
+            object_type = next(
+                (value for key, value in attributes.items() if key.rsplit(":", 1)[-1].casefold() == "objecttype"),
+                None,
+            )
+            if object_type is not None and object_type.casefold() == "note":
+                note_count += 1
+            else:
+                unsafe = True
+
+    def reject_declaration(*_arguments: Any) -> None:
+        raise ValueError("VML declarations are not safe to inspect")
+
     try:
+        parser = expat.ParserCreate()
+        parser.StartElementHandler = start_element
+        parser.StartDoctypeDeclHandler = reject_declaration
+        parser.EntityDeclHandler = reject_declaration
+        parser.ExternalEntityRefHandler = lambda *_arguments: 0
         with archive.open(info) as handle:
-            text = handle.read(min(info.file_size, 2 * 1024 * 1024)).lower()
-        return any(marker in text for marker in (b'objecttype="button"', b'objecttype="checkbox"', b'objecttype="drop"', b'<x:macro'))
-    except OSError:
+            while chunk := handle.read(256 * 1024):
+                parser.Parse(chunk, False)
+            parser.Parse(b"", True)
+        # Comment VML has one Note ClientData element per shape. Any other
+        # shape would be destroyed by rebuilding the comment drawing.
+        return unsafe or shape_count != note_count
+    except (OSError, ValueError, expat.ExpatError):
         return True
 
 

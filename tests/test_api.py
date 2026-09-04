@@ -87,13 +87,43 @@ def test_publish_create_and_download_api(tmp_path, monkeypatch):
         data={
             "schema_id": "employee-roster",
             "schema_version": "1.0.0",
-            "standard_json": json.dumps({"employees": [{"employee_id": "E001", "employee_name": "张三", "salary": "100", "department": "技术部"}]}),
+            "standard_json": '{"employees":[{"employee_id":"E001","employee_name":"张三","salary":100.1234567890123456789,"department":"技术部"}]}',
         },
         files={"excel_file": ("input.xlsx", workbook_path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     )
     assert inline.status_code == 202, inline.text
     inline_job = inline.json()["job_id"]
     assert client.get(f"/api/v1/comparisons/{inline_job}").json()["status"] == "completed"
+    inline_report = client.get(f"/api/v1/comparisons/{inline_job}/artifacts/json").json()
+    salary_mismatch = next(
+        item
+        for item in inline_report["differences"]
+        if item["canonical_field"] == "salary" and item["type"] == "VALUE_MISMATCH"
+    )
+    assert salary_mismatch["standard_raw_value"] == "100.1234567890123456789"
+    duplicate_inline = client.post(
+        "/api/v1/comparisons",
+        data={
+            "schema_id": "employee-roster",
+            "schema_version": "1.0.0",
+            "standard_json": '{"employees":[],"employees":[]}',
+        },
+        files={"excel_file": ("input.xlsx", workbook_path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert duplicate_inline.status_code == 422
+    assert "standard_json is not valid JSON" in duplicate_inline.json()["detail"]
+    duplicate_parameters = client.post(
+        "/api/v1/comparisons",
+        data={
+            "schema_id": "employee-roster",
+            "schema_version": "1.0.0",
+            "parameters": '{"department":"D1","department":"D2"}',
+            "standard_json": '{"employees":[]}',
+        },
+        files={"excel_file": ("input.xlsx", workbook_path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert duplicate_parameters.status_code == 422
+    assert duplicate_parameters.json()["detail"] == "parameters must be a JSON object"
     deleted = client.delete(f"/api/v1/comparisons/{inline_job}")
     assert deleted.status_code == 202 and deleted.json()["deleted_at"]
     assert client.get(f"/api/v1/comparisons/{inline_job}").status_code == 404
@@ -259,6 +289,27 @@ def test_draft_validate_mapping_publish_and_version_list(tmp_path, monkeypatch):
     assert immutable.status_code == 409
 
 
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("rules.json", b'{"schema_id":"first","schema_id":"second"}'),
+        ("rules.yaml", b"schema_id: first\nschema_id: second\n"),
+    ],
+)
+def test_rule_import_rejects_duplicate_keys(tmp_path, monkeypatch, filename, content):
+    monkeypatch.setenv("EXCEL_AUDITOR_DATA", str(tmp_path / "duplicate-rule-api"))
+    monkeypatch.delenv("EXCEL_AUDITOR_API_TOKEN", raising=False)
+    import importlib
+    import excel_auditor.api as api_module
+
+    api_module = importlib.reload(api_module)
+    client = TestClient(api_module.app)
+    response = client.post("/api/v1/schemas/import", files={"file": (filename, content, "application/octet-stream")})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "RULE_CONFIG_INVALID: uploaded rule document is invalid"
+
+
 def test_cancel_request_moves_job_to_cancelled_at_safe_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setenv("EXCEL_AUDITOR_DATA", str(tmp_path / "cancel-api"))
     monkeypatch.delenv("EXCEL_AUDITOR_API_TOKEN", raising=False)
@@ -275,3 +326,39 @@ def test_cancel_request_moves_job_to_cancelled_at_safe_checkpoint(tmp_path, monk
     assert api_module.service.status(job_id)["status"] == "cancelled"
     terminal = client.post(f"/api/v1/comparisons/{job_id}/cancel")
     assert terminal.status_code == 409
+
+
+def test_product_issue_api_filters_paginated_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXCEL_AUDITOR_DATA", str(tmp_path / "product-issues-api"))
+    monkeypatch.delenv("EXCEL_AUDITOR_API_TOKEN", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    import importlib
+    import excel_auditor.api as api_module
+
+    api_module = importlib.reload(api_module)
+    client = TestClient(api_module.app)
+    job_id = api_module.service.create_job()
+    directory = api_module.service.job_directory(job_id)
+    issues = [
+        {"issue_type": "invalid_value", "excel_row": 2, "category_id": "phone", "field_id": "price", "message": "bad", "color": "F9CB9C"},
+        {"issue_type": "required_missing", "excel_row": 3, "category_id": "phone", "field_id": "brand", "message": "missing", "color": "F4CCCC"},
+    ]
+    (directory / "product-issues.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in issues),
+        encoding="utf-8",
+    )
+    current = api_module.service.status(job_id)
+    api_module.service._write_status(job_id, {
+        **current,
+        "workflow": "product_normalization",
+        "status": "manual_review",
+        "artifacts": {"product_issues": "product-issues.jsonl"},
+    })
+
+    response = client.get(
+        f"/api/v1/product-normalizations/{job_id}/issues",
+        params={"issue_type": "required_missing", "page_size": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["field_id"] == "brand"

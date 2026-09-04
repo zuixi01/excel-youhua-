@@ -21,6 +21,14 @@ from excel_auditor.snapshots import SpilledRecords, create_snapshot
 from excel_auditor.standard_files import load_standard_file
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
 from excel_auditor.workbook import inspect_workbook
+from excel_auditor.workbook import SheetSnapshot, WorkbookSnapshot
+from excel_auditor.product_workflow import (
+    CatalogFieldDefinition,
+    CatalogFieldSource,
+    CategoryDefinition,
+    InMemoryCatalogAdapter,
+    normalize_product_workbook,
+)
 
 
 def _python_cpu_calibration_seconds() -> float:
@@ -32,6 +40,114 @@ def _python_cpu_calibration_seconds() -> float:
     elapsed = time.process_time() - started
     assert value == 4_094_895_424 and elapsed > 0
     return elapsed
+
+
+@pytest.mark.performance
+def test_product_normalization_baseline():
+    if os.environ.get("RUN_PRODUCT_PERFORMANCE") != "1":
+        pytest.skip("set RUN_PRODUCT_PERFORMANCE=1 to execute product normalization baseline")
+    record_count = int(os.environ.get("PRODUCT_PERF_ROWS", "10000"))
+    attribute_count = int(os.environ.get("PRODUCT_PERF_ATTRIBUTES", "20"))
+    assert record_count >= 1 and attribute_count >= 1
+    platform_fields = [
+        CatalogFieldDefinition(
+            field_id=f"attribute_{index}",
+            title=f"平台属性{index}",
+            source=CatalogFieldSource.PLATFORM_ATTRIBUTE,
+            category_id="phone",
+            attribute_id=f"attribute_{index}",
+            display_order=index,
+        )
+        for index in range(attribute_count)
+    ]
+    rules = RuleSet.model_validate({
+        "schema_id": "product-performance",
+        "schema_version": "1.0.0",
+        "name": "Product performance",
+        "workbook": {
+            "max_rows_per_sheet": max(100_000, record_count),
+            "max_in_memory_cells": int(os.environ.get("PRODUCT_PERF_MAX_IN_MEMORY_CELLS", "500000")),
+        },
+        "sheets": [{
+            "id": "products",
+            "name": "Products",
+            "primary_key": ["product_id"],
+            "columns": [
+                {"name": "product_id", "title": "商品ID", "required": True},
+                {"name": "platform_category_id", "title": "平台类目ID"},
+                {"name": "merchant_category", "title": "商家类目", "required": True},
+            ],
+        }],
+        "product_workflow": {
+            "sheet_id": "products",
+            "catalog_connection_id": "performance",
+            "category": {
+                "attributes": {"path_template": "/catalog/{category_id}/attributes"},
+                "specifications": {"path_template": "/catalog/{category_id}/specifications"},
+            },
+        },
+    })
+    headers = ["商品ID", "平台类目ID", "商家类目", *[field.title for field in platform_fields], "商家备注"]
+    rows = [(1, headers)] + [
+        (
+            index + 2,
+            [f"P{index:06d}", "phone", "手机", *[f"V{index}-{field_index}" for field_index in range(attribute_count)], f"备注{index}"],
+        )
+        for index in range(record_count)
+    ]
+    snapshot = WorkbookSnapshot(
+        Path("product-performance.xlsx"),
+        "0" * 64,
+        {"Products": SheetSnapshot("Products", record_count + 1, len(headers), rows)},
+    )
+    catalog = InMemoryCatalogAdapter(
+        [CategoryDefinition(category_id="phone", name="手机")],
+        {"phone": platform_fields},
+    )
+    process = psutil.Process()
+    baseline_rss = process.memory_info().rss
+    peak_rss = [baseline_rss]
+    stopped = threading.Event()
+
+    def sample_memory():
+        while not stopped.wait(0.02):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
+    cpu_calibration_seconds = _python_cpu_calibration_seconds()
+    started = time.perf_counter()
+    cpu_started = time.process_time()
+    result = normalize_product_workbook(snapshot, rules, catalog)
+    serialized_row_count = len(result.model_dump(mode="json")["category_sheets"][0]["rows"])
+    elapsed = time.perf_counter() - started
+    cpu_seconds = time.process_time() - cpu_started
+    stopped.set()
+    sampler.join()
+    rss_delta_mib = (peak_rss[0] - baseline_rss) / 1024 / 1024
+    metrics = {
+        "benchmark_version": 2,
+        "rows": record_count,
+        "platform_attributes": attribute_count,
+        "cpu_calibration_seconds": round(cpu_calibration_seconds, 6),
+        "cpu_seconds": round(cpu_seconds, 3),
+        "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3),
+        "elapsed_seconds": round(elapsed, 3),
+        "peak_rss_delta_mib": round(rss_delta_mib, 2),
+        "issues": len(result.issues),
+        "reviews": len(result.review_items),
+    }
+    print(metrics)
+    if output := os.environ.get("PRODUCT_PERF_RESULT_PATH"):
+        Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    assert len(result.category_sheets) == 1
+    assert len(result.category_sheets[0].rows) == record_count
+    assert serialized_row_count == record_count
+    assert result.category_sheets[0].rows[-1][f"attribute_{attribute_count - 1}"]
+    assert not result.requires_manual_review and not result.issues
+    assert elapsed <= float(os.environ.get("PRODUCT_PERF_MAX_SECONDS", "60"))
+    assert rss_delta_mib <= float(os.environ.get("PRODUCT_PERF_MAX_RSS_MIB", "512"))
+    result.close()
 
 
 @pytest.mark.performance
@@ -96,7 +212,7 @@ def test_configured_workbook_baseline(tmp_path):
     elapsed = time.perf_counter() - started
     cpu_seconds = time.process_time() - cpu_started
     stopped.set(); sampler.join()
-    metrics = {"benchmark_version": 4, "rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "cpu_calibration_seconds": round(cpu_calibration_seconds, 6), "cpu_seconds": round(cpu_seconds, 3), "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
+    metrics = {"benchmark_version": 5, "rows": rows, "columns": fields, "sheets": sheet_count, "density": density, "difference_rate": difference_rate, "large_mode": snapshot.large_mode, "join_backends": sorted(set(result.join_backends or [])), "inspect_seconds": round(inspected - started, 3), "compare_and_report_seconds": round(elapsed - (inspected - started), 3), "cpu_calibration_seconds": round(cpu_calibration_seconds, 6), "cpu_seconds": round(cpu_seconds, 3), "normalized_cpu_units": round(cpu_seconds / cpu_calibration_seconds, 3), "elapsed_seconds": round(elapsed, 3), "peak_rss_delta_mib": round((peak_rss[0] - baseline_rss) / 1024 / 1024, 2), "report_bytes": report_path.stat().st_size}
     print(metrics)
     if output := os.environ.get("PERF_RESULT_PATH"):
         Path(output).write_text(json.dumps(metrics, indent=2), encoding="utf-8")

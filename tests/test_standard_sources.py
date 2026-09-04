@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -7,7 +8,7 @@ from openpyxl import Workbook
 from excel_auditor.models import StandardSourceConfig
 from excel_auditor.snapshots import SpilledRecords
 from excel_auditor.standard_sources import ConnectionRegistry, ManagedHttpSource
-from excel_auditor.service import AuditService
+from excel_auditor.service import AuditService, _canonicalize_standard
 from excel_auditor.models import RuleSet
 
 
@@ -59,6 +60,28 @@ def test_managed_http_spills_paginated_records_and_transfers_ownership(tmp_path)
         assert metadata["record_storage"] == "disk_spill"
     finally:
         records.close()
+
+
+def test_managed_http_preserves_high_precision_decimal_tokens(tmp_path):
+    content = b'{"data":[{"id":"1","amount":1234567890.1234567890123456789}]}'
+    source = ManagedHttpSource(
+        _registry(tmp_path),
+        httpx.MockTransport(lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=content,
+        )),
+        resolver=lambda _host: ["93.184.216.34"],
+    )
+    config = StandardSourceConfig(
+        type="managed_http",
+        connection_id="hr",
+        path="/employees",
+        data_json_path="$.data",
+    )
+
+    records = source.fetch(config)
+    assert records[0]["amount"] == Decimal("1234567890.1234567890123456789")
 
 
 def test_managed_http_closes_spill_when_record_limit_aborts(tmp_path, monkeypatch):
@@ -114,6 +137,33 @@ def test_managed_connection_rejects_unknown_or_unsafe_configuration(tmp_path):
         _registry(tmp_path, unknown_option=True)
     with pytest.raises(ValueError, match="string_pattern_mismatch"):
         _registry(tmp_path, auth_secret_ref="../escape")
+    with pytest.raises(ValueError, match="dot segments"):
+        _registry(tmp_path, allowed_paths=["/employees/../admin"])
+
+    duplicate = tmp_path / "duplicate-connections.json"
+    duplicate.write_text(
+        '{"connections":[{"id":"hr","base_url":"https://first.example/","base_url":"https://second.example/","allowed_paths":["/employees"]}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate key"):
+        ConnectionRegistry(duplicate)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/employees/../admin",
+        "/employees/%2e%2e/admin",
+        "/employees/%252e%252e/admin",
+        "/employees\\..\\admin",
+        "//example.com/employees",
+        "/employees?admin=true",
+        "/employees//admin",
+    ],
+)
+def test_managed_source_rejects_non_normalized_or_allowlist_bypass_paths(path):
+    with pytest.raises(ValueError, match="path|dot segments|slashes"):
+        StandardSourceConfig(type="managed_http", connection_id="hr", path=path)
 
 
 def test_managed_http_only_maps_declared_task_parameters(tmp_path):
@@ -149,6 +199,26 @@ def test_managed_http_stream_aborts_at_response_limit(tmp_path):
         source.fetch(config)
 
 
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (b'{"data":[{"id":"E1","id":"E2"}]}', "duplicate object key"),
+        (b'{"data":[', "response JSON is malformed"),
+        (b'{"data":[{"id":"E1","amount":NaN}]}', "non-finite number"),
+    ],
+)
+def test_managed_http_rejects_ambiguous_or_malformed_json(content, message, tmp_path):
+    source = ManagedHttpSource(
+        _registry(tmp_path),
+        httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, content=content)),
+        resolver=lambda _host: ["93.184.216.34"],
+    )
+    config = StandardSourceConfig(type="managed_http", connection_id="hr", path="/employees")
+
+    with pytest.raises(ValueError, match=message):
+        source.fetch(config)
+
+
 def test_managed_http_is_snapshotted_by_service(tmp_path):
     transport = httpx.MockTransport(lambda _request: httpx.Response(200, headers={"content-type": "application/json"}, json={"data": [{"id": "E001", "name": "张三"}, {"id": "E002", "name": "李四"}]}))
     source = ManagedHttpSource(_registry(tmp_path), transport, resolver=lambda _host: ["93.184.216.34"], spill_after_records=1)
@@ -174,3 +244,41 @@ def test_managed_http_is_snapshotted_by_service(tmp_path):
     assert status["status"] == "completed"
     assert status["summary"]["matched_records"] == 2
     assert list(service.job_directory(job_id).glob("std_*.jsonl"))
+
+
+def test_managed_http_canonicalization_rejects_conflicting_aliases():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "人员", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "编号", "aliases": ["工号"], "required": True}
+        ]}],
+    })
+
+    with pytest.raises(ValueError, match=r"STANDARD_DATA_INVALID: people\.id has conflicting field representations at record 1"):
+        _canonicalize_standard({"people": [{"id": "E001", "工号": "E002"}]}, rules)
+
+
+def test_managed_http_canonicalization_rejects_duplicate_sheet_mapping():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "人员", "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "编号", "required": True}
+        ]}],
+    })
+
+    with pytest.raises(ValueError, match="STANDARD_DATA_INVALID: duplicate sheet mapping: people"):
+        _canonicalize_standard({"people": [{"id": "E001"}], "人员": [{"id": "E002"}]}, rules)
+
+
+def test_standard_sheet_name_and_alias_matching_is_case_insensitive_and_collision_safe():
+    rules = RuleSet.model_validate({
+        "schema_id": "managed", "schema_version": "1.0.0", "name": "Managed",
+        "sheets": [{"id": "people", "name": "People", "aliases": ["Roster"], "primary_key": ["id"], "columns": [
+            {"name": "id", "title": "ID", "required": True}
+        ]}],
+    })
+
+    assert _canonicalize_standard({"PEOPLE": [{"id": "E001"}]}, rules) == {"people": [{"id": "E001"}]}
+    assert _canonicalize_standard({"rOsTeR": [{"id": "E002"}]}, rules) == {"people": [{"id": "E002"}]}
+    with pytest.raises(ValueError, match="STANDARD_DATA_INVALID: duplicate sheet mapping: people"):
+        _canonicalize_standard({"PEOPLE": [{"id": "E001"}], "roster": [{"id": "E002"}]}, rules)

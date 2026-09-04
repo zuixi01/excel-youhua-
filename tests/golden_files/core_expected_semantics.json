@@ -6,21 +6,21 @@
   },
   "missing_first_column": {
     "differences": [
-      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "id", "business_key": null, "excel_raw_value": null, "standard_raw_value": null, "render_action": "insert_and_mark_green", "repair_status": "planned"}
+      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "id", "business_key": null, "excel_raw_value": null, "standard_raw_value": "编号", "render_action": "insert_and_mark_green", "repair_status": "planned"}
     ],
     "rendered_headers": ["编号", "姓名", "手机号"],
     "fills": {"A1": "D9EAD3"}
   },
   "missing_middle_column": {
     "differences": [
-      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "name", "business_key": null, "excel_raw_value": null, "standard_raw_value": null, "render_action": "insert_and_mark_green", "repair_status": "planned"}
+      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "name", "business_key": null, "excel_raw_value": null, "standard_raw_value": "姓名", "render_action": "insert_and_mark_green", "repair_status": "planned"}
     ],
     "rendered_headers": ["编号", "姓名", "手机号"],
     "fills": {"B1": "D9EAD3"}
   },
   "missing_last_column": {
     "differences": [
-      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "phone", "business_key": null, "excel_raw_value": null, "standard_raw_value": null, "render_action": "insert_and_mark_green", "repair_status": "planned"}
+      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "phone", "business_key": null, "excel_raw_value": null, "standard_raw_value": "手机号", "render_action": "insert_and_mark_green", "repair_status": "planned"}
     ],
     "rendered_headers": ["编号", "姓名", "手机号"],
     "fills": {"C1": "D9EAD3"}
@@ -28,7 +28,7 @@
   "missing_and_extra_header": {
     "differences": [
       {"type": "EXTRA_HEADER", "cell": "C1", "excel_row": null, "canonical_field": null, "business_key": null, "excel_raw_value": "备注", "standard_raw_value": null, "render_action": "mark_red", "repair_status": "not_requested"},
-      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "phone", "business_key": null, "excel_raw_value": null, "standard_raw_value": null, "render_action": "insert_and_mark_green", "repair_status": "planned"}
+      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "phone", "business_key": null, "excel_raw_value": null, "standard_raw_value": "手机号", "render_action": "insert_and_mark_green", "repair_status": "planned"}
     ],
     "rendered_headers": ["编号", "姓名", "手机号", "备注"],
     "fills": {"C1": "D9EAD3", "D1": "F4CCCC"}
@@ -80,7 +80,7 @@
     "differences": [
       {"type": "DUPLICATE_HEADER", "cell": "B1", "excel_row": null, "canonical_field": null, "business_key": null, "excel_raw_value": "姓名", "standard_raw_value": null, "render_action": "mark_purple", "repair_status": "not_requested"},
       {"type": "DUPLICATE_HEADER", "cell": "C1", "excel_row": null, "canonical_field": null, "business_key": null, "excel_raw_value": "姓名", "standard_raw_value": null, "render_action": "mark_purple", "repair_status": "not_requested"},
-      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "name", "business_key": null, "excel_raw_value": null, "standard_raw_value": null, "render_action": "insert_and_mark_green", "repair_status": "planned"}
+      {"type": "MISSING_HEADER", "cell": null, "excel_row": null, "canonical_field": "name", "business_key": null, "excel_raw_value": null, "standard_raw_value": "姓名", "render_action": "insert_and_mark_green", "repair_status": "planned"}
     ],
     "rendered_headers": ["编号", "姓名", "姓名", "姓名", "手机号"],
     "fills": {"B1": "D9EAD3", "C1": "D9D2E9", "D1": "D9D2E9"}

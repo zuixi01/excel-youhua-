@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apk upgrade --no-cache \
-    && apk add --no-cache libstdc++ \
+    && apk add --no-cache icu-libs libstdc++ \
     && addgroup -S auditor \
     && adduser -S -G auditor -h /home/auditor auditor
 WORKDIR /app

@@ -29,5 +29,50 @@ class RedisJobQueue:
             failure_ttl=86400,
         )
 
+    def enqueue_product(
+        self,
+        data_root: Path,
+        job_id: str,
+        excel_path: Path,
+        rules: RuleSet,
+        tenant_id: str,
+        actor_id: str,
+    ) -> None:
+        self.queue.enqueue(
+            "excel_auditor.worker.run_product_job",
+            str(data_root),
+            job_id,
+            str(excel_path),
+            rules.model_dump(mode="json"),
+            tenant_id,
+            actor_id,
+            job_id="rq_product_" + job_id,
+            job_timeout=rules.workbook.processing_timeout_seconds,
+            result_ttl=3600,
+            failure_ttl=86400,
+        )
+
+    def enqueue_product_revision(
+        self,
+        data_root: Path,
+        job_id: str,
+        rules: RuleSet,
+        tenant_id: str,
+        actor_id: str,
+        parent_revision_number: int,
+    ) -> None:
+        self.queue.enqueue(
+            "excel_auditor.worker.run_product_revision",
+            str(data_root),
+            job_id,
+            rules.model_dump(mode="json"),
+            tenant_id,
+            actor_id,
+            job_id=f"rq_product_revision_{job_id}_{parent_revision_number}",
+            job_timeout=rules.workbook.processing_timeout_seconds,
+            result_ttl=3600,
+            failure_ttl=86400,
+        )
+
     def ping(self) -> None:
         self.connection.ping()

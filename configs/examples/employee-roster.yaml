@@ -51,6 +51,7 @@ sheets:
         validation:
           min: '0'
         format: '#,##0.00'
+        normalize_display_format: false
         missing_column_action: insert
       - name: hire_date
         title: 入职日期
